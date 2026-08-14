@@ -1,16 +1,25 @@
 # Connectivity spike results
 
-**Status:** incomplete; architecture gate not run
+**Status:** incomplete; architecture gate not accepted
 
-The repository now has a pinned Rust workspace, exact `libp2p = 0.56.0` dependency resolution, three lifecycle binaries, and deterministic connection/path/reservation/header tests. The actual relay, DCUtR, exact-`ConnectionId` stream, process, namespace, slow-reader, interruption, and two-host matrix was not run.
+## Implemented baseline
+
+- Rust toolchain: 1.96.0
+- `libp2p`: exactly 0.56.0, with resolved component versions recorded in the committed `Cargo.lock`
+- Workspace binaries: `p2x-exchange`, `p2x-server`, `p2x-client`
+- Concrete TCP/QUIC exchange and peer swarm builders with relay, Identify, Ping, DCUtR, and exact-connection `/p2x/spike/1` behaviour
+- Deterministic lab-only identity seeds and bounded frame/codec/state-machine unit tests
+- Harness entry points now fail clearly and preserve a JSON artifact for unsupported cases
 
 ## Reproducible checks
 
-- Toolchain: Rust/Cargo 1.96.0
-- Dependency: `libp2p` 0.56.0 (resolved transitive versions are in `Cargo.lock`)
-- Commands: `cargo fmt --all`, `cargo test --workspace --all-targets`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- Result: passed for the implemented deterministic contracts
+- `cargo fmt --all -- --check` — passed
+- `cargo test --workspace --all-targets` — passed
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — passed
+- `cargo deny check` — not run successfully: the `cargo-deny` subcommand is not installed (`no such command: deny`)
 
-## Not run
+## Connectivity cases
 
-C01–C14 were not claimed: no libp2p swarm lifecycle/relay implementation exists yet; Linux namespace cases require Linux `CAP_NET_ADMIN`; C14 requires two real machines. No peer IDs, private keys, payloads, or credentials are recorded.
+C01–C14 are **not passed**. The live relay reservation/renewal lifecycle, probe payload exchange, namespace matrix, and C14 two-host run were not completed in this environment. The scripts record unsupported cases below `target/p2x-spike/<run-id>/` and exit non-zero. No peer private keys, seeds, payloads, credentials, or reusable identities are recorded.
+
+The architecture gate therefore remains deferred. Do not begin identity/authentication, registry, ticket, ingress, or production proxy work.
