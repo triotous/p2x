@@ -1,7 +1,10 @@
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::{Multiaddr, swarm::SwarmEvent};
-use p2x_net::builder::{SwarmConfig, build_exchange_swarm, lab_identity};
+use p2x_net::{
+    builder::{SwarmConfig, build_exchange_swarm, lab_identity},
+    lifecycle::Emitter,
+};
 use std::io;
 
 #[derive(Parser, Debug)]
@@ -16,6 +19,8 @@ struct Args {
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args = Args::parse();
+    let run_id = std::env::var("P2X_RUN_ID").unwrap_or_else(|_| "manual".into());
+    let emitter = Emitter::new("exchange", &run_id);
     let key = lab_identity(args.identity_seed).map_err(io::Error::other)?;
     let mut swarm = build_exchange_swarm(
         key,
@@ -27,12 +32,10 @@ async fn main() -> io::Result<()> {
     )
     .map_err(io::Error::other)?;
     swarm.listen_on(args.tcp_listen).map_err(io::Error::other)?;
-    println!(
-        "{{\"component\":\"exchange\",\"peer_id\":\"{}\",\"started\":true}}",
-        swarm.local_peer_id()
-    );
+    emitter.event("started", Some(&swarm.local_peer_id().to_string()))?;
     loop {
-        tokio::select! { _ = tokio::signal::ctrl_c() => break, event = swarm.select_next_some() => { if let SwarmEvent::NewListenAddr { address, .. } = event { println!("{{\"component\":\"exchange\",\"listen_addr\":\"{}\"}}", address); } } }
+        tokio::select! { _ = tokio::signal::ctrl_c() => break, event = swarm.select_next_some() => { if let SwarmEvent::NewListenAddr { address, .. } = event { emitter.event("listen_addr", Some(&address.to_string()))?; } } }
     }
+    emitter.event("stopped", None)?;
     Ok(())
 }

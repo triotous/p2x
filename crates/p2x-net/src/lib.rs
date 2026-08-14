@@ -1,5 +1,6 @@
 pub mod builder;
 pub mod connection_book;
+pub mod lifecycle;
 pub mod path_selector;
 pub mod probe;
 pub mod probe_stream;

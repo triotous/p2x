@@ -20,7 +20,7 @@ summary="$artifact_dir/$case_id.json"
   echo "run_id=$run_id"
   echo "platform=$(uname -s)"
   echo "status=unsupported"
-  echo "reason=live relay reservation and probe lifecycle are not yet complete"
+  echo "reason=live connectivity lifecycle is not yet complete"
 } >"$log"
 printf '{"case":"%s","run_id":"%s","passed":false,"terminal_code":"unsupported","artifact":"%s"}\n' "$case_id" "$run_id" "$log" >"$summary"
 echo "case $case_id is unsupported; artifacts: $artifact_dir" >&2

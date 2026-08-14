@@ -36,6 +36,9 @@ pub enum PathState {
         relay_id: Option<ConnectionId>,
         relay_fallback_used: bool,
     },
+    StreamReady {
+        decision: PathDecision,
+    },
     Streaming {
         decision: PathDecision,
     },
@@ -45,11 +48,21 @@ pub enum PathState {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PathEventKind {
+    Begin {
+        relay: Option<ConnectionId>,
+        direct: Option<ConnectionId>,
+    },
     RelayReady(ConnectionId),
     DirectReady(ConnectionId),
     DirectDeadlineElapsed,
-    ExactOpenSucceeded,
-    ExactOpenFailed,
+    ExactOpenSucceeded {
+        request_id: u64,
+        connection: ConnectionId,
+    },
+    ExactOpenFailed {
+        request_id: u64,
+        connection: ConnectionId,
+    },
     PayloadAccepted,
     SelectedConnectionClosed,
     RelayLost,
@@ -79,6 +92,13 @@ pub struct PathAttempt {
     next_request_id: u64,
     relay_connection: Option<ConnectionId>,
 }
+impl PathDecision {
+    fn connection(self) -> ConnectionId {
+        match self {
+            Self::Direct(id) | Self::Relay(id) => id,
+        }
+    }
+}
 impl PathAttempt {
     pub fn new(now: Instant) -> Self {
         Self::with_id(AttemptId(0), now)
@@ -106,6 +126,18 @@ impl PathAttempt {
             return self.fail(PathFailure::SetupExpired);
         }
         match event.kind {
+            PathEventKind::Begin { relay, direct } => {
+                if let Some(direct) = direct {
+                    self.commit(PathDecision::Direct(direct));
+                    self.open_committed().into_iter().collect()
+                } else if let Some(relay) = relay {
+                    self.relay_connection = Some(relay);
+                    self.state = PathState::RelayDialing;
+                    vec![PathAction::DialRelay]
+                } else {
+                    self.fail(PathFailure::DirectOpenFailed)
+                }
+            }
             PathEventKind::RelayReady(relay)
                 if matches!(self.state, PathState::Absent | PathState::RelayDialing) =>
             {
@@ -139,28 +171,41 @@ impl PathAttempt {
                 }
                 _ => vec![],
             },
-            PathEventKind::ExactOpenSucceeded => match self.state {
-                PathState::StreamOpening { decision, .. } => {
-                    self.state = PathState::Streaming { decision };
+            PathEventKind::ExactOpenSucceeded {
+                request_id,
+                connection,
+            } => match self.state {
+                PathState::StreamOpening {
+                    decision,
+                    request_id: expected,
+                    ..
+                } if request_id == expected && decision.connection() == connection => {
+                    self.state = PathState::StreamReady { decision };
                     vec![]
                 }
                 _ => vec![],
             },
-            PathEventKind::ExactOpenFailed => match self.state {
+            PathEventKind::ExactOpenFailed {
+                request_id,
+                connection,
+            } => match self.state {
                 PathState::StreamOpening {
                     decision: PathDecision::Direct(_),
-                    request_id,
+                    request_id: expected,
                     relay_id: Some(_),
                     relay_fallback_used: false,
-                } => {
+                } if request_id == expected
+                    && matches!(self.state, PathState::StreamOpening { decision: PathDecision::Direct(id), .. } if id == connection) =>
+                {
                     let relay = match self.state {
                         PathState::StreamOpening { relay_id, .. } => relay_id,
                         _ => None,
                     };
                     if let Some(relay) = relay {
+                        self.next_request_id += 1;
                         self.state = PathState::StreamOpening {
                             decision: PathDecision::Relay(relay),
-                            request_id,
+                            request_id: self.next_request_id,
                             relay_id: Some(relay),
                             relay_fallback_used: true,
                         };
@@ -173,20 +218,29 @@ impl PathAttempt {
                 _ => vec![],
             },
             PathEventKind::PayloadAccepted => match self.state {
-                PathState::StreamOpening { decision, .. } => {
+                PathState::StreamReady { decision } => {
                     self.state = PathState::Streaming { decision };
                     vec![]
                 }
                 _ => vec![],
             },
             PathEventKind::SelectedConnectionClosed => match self.state {
-                PathState::Streaming { .. } | PathState::StreamOpening { .. } => {
-                    self.fail(PathFailure::ConnectionClosed)
-                }
+                PathState::Streaming { .. }
+                | PathState::StreamReady { .. }
+                | PathState::StreamOpening { .. } => self.fail(PathFailure::ConnectionClosed),
                 _ => vec![],
             },
             PathEventKind::RelayLost => match self.state {
-                PathState::Streaming { .. } => self.fail(PathFailure::RelayLost),
+                PathState::Streaming {
+                    decision: PathDecision::Relay(_),
+                }
+                | PathState::StreamReady {
+                    decision: PathDecision::Relay(_),
+                }
+                | PathState::StreamOpening {
+                    decision: PathDecision::Relay(_),
+                    ..
+                } => self.fail(PathFailure::RelayLost),
                 _ => vec![],
             },
             PathEventKind::Cancelled => self.fail(PathFailure::Cancelled),
@@ -272,8 +326,16 @@ mod tests {
             matches!(a.open_committed(), Some(PathAction::OpenExact { connection }) if connection == id(2))
         );
         assert!(
-            matches!(a.apply(event(a.id, now + Duration::from_millis(2), PathEventKind::ExactOpenFailed))[..], [PathAction::OpenExact { connection }] if connection == id(1))
+            matches!(a.apply(event(a.id, now + Duration::from_millis(2), PathEventKind::ExactOpenFailed { request_id: 1, connection: id(2) }))[..], [PathAction::OpenExact { connection }] if connection == id(1))
         );
+        a.apply(event(
+            a.id,
+            now + Duration::from_millis(3),
+            PathEventKind::ExactOpenSucceeded {
+                request_id: 2,
+                connection: id(1),
+            },
+        ));
         a.apply(event(
             a.id,
             now + Duration::from_millis(3),
@@ -283,7 +345,10 @@ mod tests {
             a.apply(event(
                 a.id,
                 now + Duration::from_millis(4),
-                PathEventKind::ExactOpenFailed
+                PathEventKind::ExactOpenFailed {
+                    request_id: 2,
+                    connection: id(1)
+                }
             ))
             .is_empty()
         );
