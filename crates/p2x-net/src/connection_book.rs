@@ -1,6 +1,6 @@
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol, swarm::ConnectionId as Libp2pConnectionId};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     time::{Duration, Instant},
 };
 
@@ -38,7 +38,7 @@ pub struct ConnectionBook {
     next_sequence: u64,
     records: HashMap<(PeerId, ConnectionId), ConnectionRecord>,
     pending_dcutr: HashMap<(PeerId, ConnectionId), Instant>,
-    tombstones: HashSet<(PeerId, ConnectionId)>,
+    tombstones: HashMap<(PeerId, ConnectionId), Instant>,
 }
 impl ConnectionBook {
     pub fn on_connection_established(
@@ -49,8 +49,9 @@ impl ConnectionBook {
         now: Instant,
     ) {
         self.expire_pending(now);
+        self.expire_tombstones(now);
         let key = (peer_id, connection_id);
-        if self.tombstones.contains(&key) {
+        if self.tombstones.contains_key(&key) {
             return;
         }
         if let Some(record) = self.records.get_mut(&key) {
@@ -80,8 +81,9 @@ impl ConnectionBook {
         now: Instant,
     ) {
         self.expire_pending(now);
+        self.expire_tombstones(now);
         let key = (peer_id, connection_id);
-        if self.tombstones.contains(&key) {
+        if self.tombstones.contains_key(&key) {
             return;
         }
         if let Some(record) = self.records.get_mut(&key) {
@@ -96,10 +98,20 @@ impl ConnectionBook {
         }
     }
     pub fn on_connection_closed(&mut self, peer_id: PeerId, connection_id: ConnectionId) {
+        self.on_connection_closed_at(peer_id, connection_id, Instant::now());
+    }
+    pub fn on_connection_closed_at(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        now: Instant,
+    ) {
         let key = (peer_id, connection_id);
         self.records.remove(&key);
         self.pending_dcutr.remove(&key);
-        self.tombstones.insert(key);
+        if self.tombstones.len() < MAX_PENDING_DCUTR {
+            self.tombstones.insert(key, now + Duration::from_secs(20));
+        }
     }
     pub fn mark_ping(&mut self, peer_id: PeerId, connection_id: ConnectionId, now: Instant) {
         if let Some(record) = self.records.get_mut(&(peer_id, connection_id)) {
@@ -136,6 +148,19 @@ impl ConnectionBook {
     }
     fn expire_pending(&mut self, now: Instant) {
         self.pending_dcutr.retain(|_, deadline| *deadline > now);
+    }
+    fn expire_tombstones(&mut self, now: Instant) {
+        self.tombstones.retain(|_, deadline| *deadline > now);
+    }
+    pub fn sweep(&mut self, now: Instant) {
+        self.expire_pending(now);
+        self.expire_tombstones(now);
+    }
+    pub fn pending_count(&self) -> usize {
+        self.pending_dcutr.len()
+    }
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstones.len()
     }
 }
 fn transport_rank(path: &PathKind) -> u8 {
