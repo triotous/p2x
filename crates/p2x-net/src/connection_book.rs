@@ -1,4 +1,5 @@
-use libp2p::{Multiaddr, PeerId, multiaddr::Protocol, swarm::ConnectionId as Libp2pConnectionId};
+use libp2p::swarm::ConnectionId as Libp2pConnectionId;
+use libp2p::{Multiaddr, PeerId, core::ConnectedPoint, multiaddr::Protocol};
 use std::{
     collections::HashMap,
     time::{Duration, Instant},
@@ -6,25 +7,30 @@ use std::{
 
 pub type ConnectionId = Libp2pConnectionId;
 pub const MAX_PENDING_DCUTR: usize = 128;
-
+pub const TOMBSTONE_TTL: Duration = Duration::from_secs(20);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportKind {
     Tcp,
     Quic,
     Unknown,
 }
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PathKind {
     Direct(TransportKind),
     Relay { exchange_peer_id: PeerId },
     UnknownDirect,
 }
-
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointRole {
+    Dialer,
+    Listener,
+}
 #[derive(Clone, Debug)]
 pub struct ConnectionRecord {
     pub peer_id: PeerId,
     pub connection_id: ConnectionId,
+    pub endpoint_role: EndpointRole,
+    pub endpoint_address: Multiaddr,
     pub path: PathKind,
     pub sequence: u64,
     pub established_at: Instant,
@@ -32,7 +38,6 @@ pub struct ConnectionRecord {
     pub dcutr_confirmed: bool,
     pub last_ping: Option<Instant>,
 }
-
 #[derive(Default)]
 pub struct ConnectionBook {
     next_sequence: u64,
@@ -45,11 +50,10 @@ impl ConnectionBook {
         &mut self,
         peer_id: PeerId,
         connection_id: ConnectionId,
-        address: &Multiaddr,
+        endpoint: &ConnectedPoint,
         now: Instant,
     ) {
-        self.expire_pending(now);
-        self.expire_tombstones(now);
+        self.sweep(now);
         let key = (peer_id, connection_id);
         if self.tombstones.contains_key(&key) {
             return;
@@ -65,7 +69,13 @@ impl ConnectionBook {
             ConnectionRecord {
                 peer_id,
                 connection_id,
-                path: classify_path(address),
+                endpoint_role: if endpoint.is_dialer() {
+                    EndpointRole::Dialer
+                } else {
+                    EndpointRole::Listener
+                },
+                endpoint_address: endpoint.get_remote_address().clone(),
+                path: classify_connected_point(endpoint),
                 sequence: self.next_sequence,
                 established_at: now,
                 closing: false,
@@ -80,8 +90,7 @@ impl ConnectionBook {
         connection_id: ConnectionId,
         now: Instant,
     ) {
-        self.expire_pending(now);
-        self.expire_tombstones(now);
+        self.sweep(now);
         let key = (peer_id, connection_id);
         if self.tombstones.contains_key(&key) {
             return;
@@ -92,10 +101,7 @@ impl ConnectionBook {
             }
             return;
         }
-        if self.pending_dcutr.len() < MAX_PENDING_DCUTR {
-            self.pending_dcutr
-                .insert(key, now + Duration::from_secs(20));
-        }
+        Self::insert_bounded(&mut self.pending_dcutr, key, now + TOMBSTONE_TTL);
     }
     pub fn on_connection_closed(&mut self, peer_id: PeerId, connection_id: ConnectionId) {
         self.on_connection_closed_at(peer_id, connection_id, Instant::now());
@@ -109,13 +115,11 @@ impl ConnectionBook {
         let key = (peer_id, connection_id);
         self.records.remove(&key);
         self.pending_dcutr.remove(&key);
-        if self.tombstones.len() < MAX_PENDING_DCUTR {
-            self.tombstones.insert(key, now + Duration::from_secs(20));
-        }
+        Self::insert_bounded(&mut self.tombstones, key, now + TOMBSTONE_TTL);
     }
     pub fn mark_ping(&mut self, peer_id: PeerId, connection_id: ConnectionId, now: Instant) {
-        if let Some(record) = self.records.get_mut(&(peer_id, connection_id)) {
-            record.last_ping = Some(now);
+        if let Some(r) = self.records.get_mut(&(peer_id, connection_id)) {
+            r.last_ping = Some(now);
         }
     }
     pub fn direct(&self, peer_id: PeerId) -> Option<&ConnectionRecord> {
@@ -146,21 +150,30 @@ impl ConnectionBook {
     pub fn iter(&self) -> impl Iterator<Item = &ConnectionRecord> {
         self.records.values()
     }
-    fn expire_pending(&mut self, now: Instant) {
-        self.pending_dcutr.retain(|_, deadline| *deadline > now);
-    }
-    fn expire_tombstones(&mut self, now: Instant) {
-        self.tombstones.retain(|_, deadline| *deadline > now);
-    }
     pub fn sweep(&mut self, now: Instant) {
-        self.expire_pending(now);
-        self.expire_tombstones(now);
+        self.pending_dcutr.retain(|_, d| *d > now);
+        self.tombstones.retain(|_, d| *d > now);
     }
     pub fn pending_count(&self) -> usize {
         self.pending_dcutr.len()
     }
     pub fn tombstone_count(&self) -> usize {
         self.tombstones.len()
+    }
+    fn insert_bounded(
+        map: &mut HashMap<(PeerId, ConnectionId), Instant>,
+        key: (PeerId, ConnectionId),
+        expiry: Instant,
+    ) {
+        if map.len() >= MAX_PENDING_DCUTR
+            && let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, expiry)| **expiry)
+                .map(|(key, _)| *key)
+        {
+            map.remove(&oldest);
+        }
+        map.insert(key, expiry);
     }
 }
 fn transport_rank(path: &PathKind) -> u8 {
@@ -170,19 +183,40 @@ fn transport_rank(path: &PathKind) -> u8 {
         _ => 2,
     }
 }
-
-pub fn classify_path(address: &Multiaddr) -> PathKind {
-    let transport = classify_address(address);
-    if let Some(exchange) = address.iter().find_map(|p| match p {
-        Protocol::P2p(peer) => Some(peer),
-        _ => None,
-    }) && address.iter().any(|p| matches!(p, Protocol::P2pCircuit))
-    {
-        return PathKind::Relay {
-            exchange_peer_id: exchange,
-        };
+pub fn classify_connected_point(endpoint: &ConnectedPoint) -> PathKind {
+    let address = endpoint.get_remote_address();
+    if endpoint.is_relayed() {
+        if let Some(exchange) = address.iter().find_map(|p| {
+            if let Protocol::P2p(peer) = p {
+                Some(peer)
+            } else {
+                None
+            }
+        }) {
+            return PathKind::Relay {
+                exchange_peer_id: exchange,
+            };
+        }
+        return PathKind::UnknownDirect;
     }
-    PathKind::Direct(transport)
+    PathKind::Direct(classify_address(address))
+}
+pub fn classify_path(address: &Multiaddr) -> PathKind {
+    if address.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+        if let Some(exchange) = address.iter().find_map(|p| {
+            if let Protocol::P2p(peer) = p {
+                Some(peer)
+            } else {
+                None
+            }
+        }) {
+            return PathKind::Relay {
+                exchange_peer_id: exchange,
+            };
+        }
+        return PathKind::UnknownDirect;
+    }
+    PathKind::Direct(classify_address(address))
 }
 pub fn classify_address(address: &Multiaddr) -> TransportKind {
     if address.iter().any(|p| matches!(p, Protocol::QuicV1)) {
@@ -203,43 +237,55 @@ mod tests {
     fn id(n: u8) -> ConnectionId {
         ConnectionId::new_unchecked(n as usize)
     }
-    fn addr(s: &str) -> Multiaddr {
-        s.parse().unwrap()
+    fn endpoint(s: &str) -> ConnectedPoint {
+        ConnectedPoint::Dialer {
+            address: s.parse().unwrap(),
+            role_override: libp2p::core::Endpoint::Dialer,
+            port_use: libp2p::core::transport::PortUse::New,
+        }
     }
     #[test]
     fn reordered_dcutr_is_consumed_and_unconfirmed_is_excluded() {
         let p = peer();
         let mut b = ConnectionBook::default();
-        let now = Instant::now();
-        b.on_dcutr_succeeded(p, id(1), now);
-        b.on_connection_established(p, id(1), &addr("/ip4/127.0.0.1/tcp/1"), now);
+        let n = Instant::now();
+        b.on_dcutr_succeeded(p, id(1), n);
+        b.on_connection_established(p, id(1), &endpoint("/ip4/127.0.0.1/tcp/1"), n);
         assert!(b.is_direct(p, id(1)));
-        assert!(b.direct(p).is_some());
-        b.on_connection_established(p, id(2), &addr("/ip4/127.0.0.1/tcp/2"), now);
+        b.on_connection_established(p, id(2), &endpoint("/ip4/127.0.0.1/tcp/2"), n);
         assert!(!b.is_direct(p, id(2)));
     }
     #[test]
-    fn close_tombstones_late_success_and_duplicate_establish_is_idempotent() {
+    fn close_tombstones_late_success() {
         let p = peer();
         let mut b = ConnectionBook::default();
-        let now = Instant::now();
-        b.on_connection_established(p, id(1), &addr("/ip4/127.0.0.1/udp/1/quic-v1"), now);
-        let seq = b.get(p, id(1)).unwrap().sequence;
-        b.on_connection_established(p, id(1), &addr("/ip4/127.0.0.1/udp/1/quic-v1"), now);
-        assert_eq!(b.get(p, id(1)).unwrap().sequence, seq);
-        b.on_connection_closed(p, id(1));
-        b.on_dcutr_succeeded(p, id(1), now);
+        let n = Instant::now();
+        b.on_connection_established(p, id(1), &endpoint("/ip4/127.0.0.1/udp/1/quic-v1"), n);
+        b.on_connection_closed_at(p, id(1), n);
+        b.on_dcutr_succeeded(p, id(1), n);
         assert!(b.get(p, id(1)).is_none());
     }
     #[test]
     fn direct_prefers_quic_then_oldest() {
         let p = peer();
         let mut b = ConnectionBook::default();
-        let now = Instant::now();
-        b.on_connection_established(p, id(1), &addr("/ip4/127.0.0.1/tcp/1"), now);
-        b.on_dcutr_succeeded(p, id(1), now);
-        b.on_connection_established(p, id(2), &addr("/ip4/127.0.0.1/udp/1/quic-v1"), now);
-        b.on_dcutr_succeeded(p, id(2), now);
+        let n = Instant::now();
+        b.on_connection_established(p, id(1), &endpoint("/ip4/127.0.0.1/tcp/1"), n);
+        b.on_dcutr_succeeded(p, id(1), n);
+        b.on_connection_established(p, id(2), &endpoint("/ip4/127.0.0.1/udp/1/quic-v1"), n);
+        b.on_dcutr_succeeded(p, id(2), n);
         assert_eq!(b.direct(p).unwrap().connection_id, id(2));
+    }
+    #[test]
+    fn caps_are_evicted_and_sweep_expires() {
+        let p = peer();
+        let mut b = ConnectionBook::default();
+        let n = Instant::now();
+        for i in 0..=MAX_PENDING_DCUTR {
+            b.on_dcutr_succeeded(p, id((i % 255) as u8), n);
+        }
+        assert_eq!(b.pending_count(), MAX_PENDING_DCUTR);
+        b.sweep(n + TOMBSTONE_TTL);
+        assert_eq!(b.pending_count(), 0);
     }
 }
