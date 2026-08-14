@@ -1,0 +1,12 @@
+[package]
+name = "p2x-exchange"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+libp2p.workspace = true
+p2x-net = { path = "../../crates/p2x-net" }
+tokio.workspace = true
+tracing-subscriber.workspace = true
