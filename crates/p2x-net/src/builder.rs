@@ -21,11 +21,25 @@ pub enum RelayProfile {
 }
 impl RelayProfile {
     pub fn config(self) -> relay::Config {
-        let mut c = relay::Config::default();
-        if matches!(self, Self::LimitTest) {
-            c.max_circuits = 8;
+        let limit = matches!(self, Self::LimitTest);
+        relay::Config {
+            max_reservations: if limit { 2 } else { 64 },
+            max_reservations_per_peer: if limit { 1 } else { 2 },
+            reservation_duration: Duration::from_secs(60),
+            max_circuits: if limit { 2 } else { 128 },
+            max_circuits_per_peer: if limit { 1 } else { 4 },
+            max_circuit_duration: if limit {
+                Duration::from_secs(300)
+            } else {
+                Duration::from_secs(3600)
+            },
+            max_circuit_bytes: if limit {
+                16 * 1024 * 1024
+            } else {
+                1024 * 1024 * 1024
+            },
+            ..relay::Config::default()
         }
-        c
     }
 }
 
@@ -211,7 +225,11 @@ pub fn build_peer_swarm(
         )
         .map_err(|e| BuildError::Builder(e.to_string()))?
         .with_quic()
-        .with_relay_client(noise::Config::new, yamux::Config::default)
+        .with_relay_client(noise::Config::new, || {
+            let mut config = yamux::Config::default();
+            config.set_max_num_streams(MAX_STREAMS);
+            config
+        })
         .map_err(|e| BuildError::Builder(e.to_string()))?
         .with_behaviour(|_, relay_client| PeerBehaviour {
             relay_client,

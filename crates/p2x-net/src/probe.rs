@@ -3,7 +3,8 @@ use std::io::{Read, Write};
 use thiserror::Error;
 
 pub const MAX_HEADER: usize = 4096;
-pub const MAX_TRANSFER: u64 = 16 * 1024 * 1024;
+pub const MAX_TRANSFER: u64 = 256 * 1024 * 1024;
+pub const SCHEMA_VERSION: u16 = 1;
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeTerminal {
@@ -14,10 +15,12 @@ pub enum ProbeTerminal {
     Io,
 }
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProbeAck {
+    pub schema_version: u16,
     pub nonce: u64,
     pub request_id: u64,
-    pub path: String,
+    pub path: ProbePath,
     pub connection_id_hash: u64,
     pub bytes_read: u64,
     pub bytes_written: u64,
@@ -28,16 +31,29 @@ pub struct ProbeAck {
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ProbePath {
+    Direct,
+    Relay,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ProbeMode {
     NonceEcho,
     HalfClose,
     SlowReader,
 }
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProbeHeader {
+    pub schema_version: u16,
+    pub request_id: u64,
     pub mode: ProbeMode,
     pub nonce: u64,
     pub length: u64,
+    #[serde(default)]
+    pub slow_delay_ms: u32,
+    #[serde(default)]
+    pub slow_chunk_size: u32,
 }
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ProbeError {
@@ -55,10 +71,25 @@ pub fn decode_header(bytes: &[u8]) -> Result<ProbeHeader, ProbeError> {
     }
     let header: ProbeHeader =
         serde_json::from_slice(bytes).map_err(|e| ProbeError::Invalid(e.to_string()))?;
+    if header.schema_version != SCHEMA_VERSION {
+        return Err(ProbeError::Invalid("unsupported schema version".into()));
+    }
     if header.length > MAX_TRANSFER {
         return Err(ProbeError::Invalid(
             "length exceeds configured transfer limit".into(),
         ));
+    }
+    if header.mode != ProbeMode::SlowReader
+        && (header.slow_delay_ms != 0 || header.slow_chunk_size != 0)
+    {
+        return Err(ProbeError::Invalid(
+            "slow-reader options require slow_reader mode".into(),
+        ));
+    }
+    if header.mode == ProbeMode::SlowReader
+        && (header.slow_chunk_size == 0 || header.slow_chunk_size > 32 * 1024)
+    {
+        return Err(ProbeError::Invalid("invalid slow-reader chunk size".into()));
     }
     Ok(header)
 }
@@ -123,9 +154,13 @@ mod tests {
     #[test]
     fn rejects_transfer_above_configured_limit() {
         let body = serde_json::to_vec(&ProbeHeader {
+            schema_version: SCHEMA_VERSION,
+            request_id: 1,
             mode: ProbeMode::NonceEcho,
             nonce: 1,
             length: MAX_TRANSFER + 1,
+            slow_delay_ms: 0,
+            slow_chunk_size: 0,
         })
         .unwrap();
         assert!(matches!(decode_header(&body), Err(ProbeError::Invalid(_))));
@@ -133,9 +168,10 @@ mod tests {
     #[test]
     fn ack_round_trips_with_stable_terminal_code() {
         let ack = ProbeAck {
+            schema_version: SCHEMA_VERSION,
             nonce: 1,
             request_id: 2,
-            path: "direct".into(),
+            path: ProbePath::Direct,
             connection_id_hash: 3,
             bytes_read: 4,
             bytes_written: 5,
