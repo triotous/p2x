@@ -46,10 +46,12 @@ pub struct ProbeStreamBehaviour {
     commands: VecDeque<(PeerId, ConnectionId, OpenProbe)>,
     events: VecDeque<ProbeOutput>,
 }
+#[derive(Clone)]
 struct PendingOpen {
     peer_id: PeerId,
     connection_id: ConnectionId,
     deadline: Instant,
+    terminal: bool,
 }
 impl ProbeStreamBehaviour {
     pub fn open_on(
@@ -82,6 +84,7 @@ impl ProbeStreamBehaviour {
                 peer_id,
                 connection_id,
                 deadline: Instant::now() + OPEN_DEADLINE,
+                terminal: false,
             },
         );
         self.commands.push_back((
@@ -119,7 +122,11 @@ impl ProbeStreamBehaviour {
         self.commands.clear();
     }
     fn fail(&mut self, request_id: RequestId, code: &'static str) -> bool {
-        if let Some(p) = self.pending.remove(&request_id) {
+        if let Some(p) = self.pending.get_mut(&request_id) {
+            if p.terminal {
+                return false;
+            }
+            p.terminal = true;
             self.events.push_back(ProbeOutput::OutboundFailed {
                 request_id,
                 peer_id: p.peer_id,
@@ -178,7 +185,7 @@ impl NetworkBehaviour for ProbeStreamBehaviour {
     ) {
         match event {
             ProbeEvent::OutboundOpened { request_id, stream } => {
-                if let Some(pending) = self.pending.remove(&request_id) {
+                if let Some(pending) = self.pending.get(&request_id).cloned() {
                     if pending.peer_id != peer || pending.connection_id != id {
                         self.events.push_back(ProbeOutput::OutboundFailed {
                             request_id,
@@ -197,7 +204,7 @@ impl NetworkBehaviour for ProbeStreamBehaviour {
                 }
             }
             ProbeEvent::OutboundFailed { request_id, code } => {
-                if let Some(pending) = self.pending.remove(&request_id) {
+                if let Some(pending) = self.pending.get(&request_id).cloned() {
                     if pending.peer_id != peer || pending.connection_id != id {
                         self.events.push_back(ProbeOutput::OutboundFailed {
                             request_id,
@@ -226,6 +233,13 @@ impl NetworkBehaviour for ProbeStreamBehaviour {
     }
     fn poll(&mut self, _: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         if let Some(event) = self.events.pop_front() {
+            if let Some(request_id) = match &event {
+                ProbeOutput::OutboundOpened { request_id, .. }
+                | ProbeOutput::OutboundFailed { request_id, .. } => Some(*request_id),
+                ProbeOutput::InboundOpened { .. } => None,
+            } {
+                self.pending.remove(&request_id);
+            }
             return Poll::Ready(ToSwarm::GenerateEvent(event));
         }
         if let Some((peer_id, connection_id, event)) = self.commands.pop_front() {
