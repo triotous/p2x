@@ -54,6 +54,11 @@ impl ConnectionBook {
             r.dcutr_confirmed = true;
         }
     }
+
+    pub fn is_direct(&self, peer_id: PeerId, connection_id: ConnectionId) -> bool {
+        self.get(peer_id, connection_id)
+            .is_some_and(|r| matches!(r.path, PathKind::Direct(_)) && !r.closing)
+    }
     pub fn close(&mut self, peer_id: PeerId, connection_id: ConnectionId) {
         self.records.remove(&(peer_id, connection_id));
     }
@@ -71,6 +76,10 @@ impl ConnectionBook {
     }
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ConnectionRecord> {
+        self.records.values()
     }
 }
 fn transport_rank(path: &PathKind) -> u8 {

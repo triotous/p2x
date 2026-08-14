@@ -23,19 +23,17 @@ pub fn transition(state: ReservationState, event: ReservationEvent) -> Reservati
     match event {
         ReservationEvent::ExchangeConnected => ReservationState::ExchangeConnected,
         ReservationEvent::ReservationRequested => ReservationState::ReservationRequested,
-        ReservationEvent::ReservationAccepted { .. } => ReservationState::ReservationAccepted,
-        ReservationEvent::RelayAddressConfirmed
-            if matches!(
-                state,
-                ReservationState::ReservationAccepted | ReservationState::RelayAddressConfirmed
-            ) =>
-        {
-            ReservationState::Ready
-        }
+        ReservationEvent::ReservationAccepted { .. } => match state {
+            ReservationState::RelayAddressConfirmed => ReservationState::Ready,
+            _ => ReservationState::ReservationAccepted,
+        },
+        ReservationEvent::RelayAddressConfirmed => match state {
+            ReservationState::ReservationAccepted => ReservationState::Ready,
+            _ => ReservationState::RelayAddressConfirmed,
+        },
         ReservationEvent::ExchangeLost
         | ReservationEvent::RelayAddressLost
         | ReservationEvent::ListenerClosed => ReservationState::Degraded,
-        _ => state,
     }
 }
 #[cfg(test)]
@@ -49,6 +47,14 @@ mod tests {
         );
         assert_eq!(
             transition(s, ReservationEvent::RelayAddressConfirmed),
+            ReservationState::Ready
+        );
+        let s = transition(
+            ReservationState::Disconnected,
+            ReservationEvent::RelayAddressConfirmed,
+        );
+        assert_eq!(
+            transition(s, ReservationEvent::ReservationAccepted { renewal: false }),
             ReservationState::Ready
         );
     }
