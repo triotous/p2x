@@ -1,4 +1,4 @@
-use libp2p::{Multiaddr, PeerId, swarm::ConnectionId};
+use libp2p::{Multiaddr, PeerId, core::transport::ListenerId, swarm::ConnectionId};
 use std::time::{Duration, Instant};
 
 pub const INITIAL_RETRY: Duration = Duration::from_millis(250);
@@ -26,7 +26,7 @@ pub enum ReservationEvent {
     },
     ReservationAccepted {
         generation: u64,
-        listener_id: u64,
+        listener_id: ListenerId,
         renewal: bool,
     },
     RelayAddressConfirmed {
@@ -39,7 +39,7 @@ pub enum ReservationEvent {
     },
     ListenerClosed {
         generation: u64,
-        listener_id: u64,
+        listener_id: ListenerId,
     },
     RelayAddressLost {
         generation: u64,
@@ -50,7 +50,7 @@ pub struct ReservationContext {
     pub generation: u64,
     pub exchange_peer_id: Option<PeerId>,
     pub exchange_connection_id: Option<ConnectionId>,
-    pub listener_id: Option<u64>,
+    pub listener_id: Option<ListenerId>,
     pub canonical_address: Option<Multiaddr>,
     pub accepted: bool,
     pub address_confirmed: bool,
@@ -107,6 +107,8 @@ impl ReservationContext {
                 self.canonical_address = None;
                 self.accepted = false;
                 self.address_confirmed = false;
+                self.last_acceptance = None;
+                self.renewal_count = 0;
                 self.degraded = false;
                 self.retry_attempt = 0;
                 self.retry_deadline = None;
@@ -131,8 +133,10 @@ impl ReservationContext {
                 self.canonical_address = Some(address);
                 self.address_confirmed = true;
                 self.degraded = false;
-                self.retry_attempt = 0;
-                self.retry_deadline = None;
+                if self.accepted {
+                    self.retry_attempt = 0;
+                    self.retry_deadline = None;
+                }
             }
             ReservationEvent::ExchangeLost {
                 generation,
@@ -189,7 +193,7 @@ mod tests {
         });
         c.apply(ReservationEvent::ReservationAccepted {
             generation: 1,
-            listener_id: 2,
+            listener_id: ListenerId::next(),
             renewal: false,
         });
         c.apply(ReservationEvent::RelayAddressConfirmed {
