@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use thiserror::Error;
 
 pub const MAX_HEADER: usize = 4096;
@@ -47,10 +47,14 @@ pub fn read_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, ProbeError> {
         .map_err(|_| ProbeError::Truncated)?;
     Ok(body)
 }
-pub fn write_frame<W: Write>(writer: &mut W, body: &[u8]) -> io::Result<()> {
-    assert!(body.len() <= MAX_HEADER);
-    writer.write_all(&(body.len() as u32).to_be_bytes())?;
-    writer.write_all(body)
+pub fn write_frame<W: Write>(writer: &mut W, body: &[u8]) -> Result<(), ProbeError> {
+    if body.len() > MAX_HEADER {
+        return Err(ProbeError::TooLarge);
+    }
+    writer
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .map_err(|_| ProbeError::Truncated)?;
+    writer.write_all(body).map_err(|_| ProbeError::Truncated)
 }
 pub fn pattern_byte(offset: u64) -> u8 {
     (offset % 251) as u8
