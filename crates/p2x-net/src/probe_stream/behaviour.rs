@@ -10,7 +10,13 @@ use libp2p::{
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
+
+const MAX_PENDING: usize = 128;
+const MAX_PER_PEER: usize = 64;
+const MAX_QUEUE: usize = 128;
+const OPEN_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub enum ProbeOutput {
@@ -36,9 +42,14 @@ pub enum ProbeOutput {
 pub struct ProbeStreamBehaviour {
     next: u64,
     known: HashSet<(PeerId, ConnectionId)>,
-    pending: HashMap<RequestId, (PeerId, ConnectionId)>,
+    pending: HashMap<RequestId, PendingOpen>,
     commands: VecDeque<(PeerId, ConnectionId, OpenProbe)>,
     events: VecDeque<ProbeOutput>,
+}
+struct PendingOpen {
+    peer_id: PeerId,
+    connection_id: ConnectionId,
+    deadline: Instant,
 }
 impl ProbeStreamBehaviour {
     pub fn open_on(
@@ -49,15 +60,30 @@ impl ProbeStreamBehaviour {
         if !self.known.contains(&(peer_id, connection_id)) {
             return Err("connection_unknown");
         }
-        if self.pending.len() >= 128
-            || self.pending.values().filter(|(p, _)| *p == peer_id).count() >= 64
-            || self.commands.len() >= 128
+        if self.pending.len() >= MAX_PENDING
+            || self
+                .pending
+                .values()
+                .filter(|p| p.peer_id == peer_id)
+                .count()
+                >= MAX_PER_PEER
+            || self.commands.len() >= MAX_QUEUE
         {
             return Err("limit.command_queue_full");
         }
-        self.next += 1;
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or("probe.request_id_exhausted")?;
         let request_id = RequestId(self.next);
-        self.pending.insert(request_id, (peer_id, connection_id));
+        self.pending.insert(
+            request_id,
+            PendingOpen {
+                peer_id,
+                connection_id,
+                deadline: Instant::now() + OPEN_DEADLINE,
+            },
+        );
         self.commands.push_back((
             peer_id,
             connection_id,
@@ -68,6 +94,40 @@ impl ProbeStreamBehaviour {
             },
         ));
         Ok(request_id)
+    }
+    pub fn expire(&mut self, now: Instant) {
+        let ids: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.deadline <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.fail(id, "probe.open_timeout");
+        }
+    }
+    pub fn cancel(&mut self, request_id: RequestId) -> bool {
+        self.fail(request_id, "probe.cancelled")
+    }
+    pub fn shutdown(&mut self) {
+        let ids: Vec<_> = self.pending.keys().copied().collect();
+        for id in ids {
+            self.fail(id, "probe.shutdown");
+        }
+        self.commands.clear();
+    }
+    fn fail(&mut self, request_id: RequestId, code: &'static str) -> bool {
+        if let Some(p) = self.pending.remove(&request_id) {
+            self.events.push_back(ProbeOutput::OutboundFailed {
+                request_id,
+                peer_id: p.peer_id,
+                connection_id: p.connection_id,
+                code,
+            });
+            true
+        } else {
+            false
+        }
     }
 }
 impl NetworkBehaviour for ProbeStreamBehaviour {
@@ -100,11 +160,11 @@ impl NetworkBehaviour for ProbeStreamBehaviour {
             let ids: Vec<_> = self
                 .pending
                 .iter()
-                .filter(|(_, v)| **v == (c.peer_id, c.connection_id))
+                .filter(|(_, p)| (p.peer_id, p.connection_id) == (c.peer_id, c.connection_id))
                 .map(|(id, _)| *id)
                 .collect();
             for id in ids {
-                self.pending.remove(&id);
+                self.fail(id, "probe.connection_closed");
             }
         }
     }
@@ -116,7 +176,16 @@ impl NetworkBehaviour for ProbeStreamBehaviour {
     ) {
         match event {
             ProbeEvent::OutboundOpened { request_id, stream } => {
-                if self.pending.remove(&request_id).is_some() {
+                if let Some(pending) = self.pending.remove(&request_id) {
+                    if pending.peer_id != peer || pending.connection_id != id {
+                        self.events.push_back(ProbeOutput::OutboundFailed {
+                            request_id,
+                            peer_id: pending.peer_id,
+                            connection_id: pending.connection_id,
+                            code: "probe.internal_identity_mismatch",
+                        });
+                        return;
+                    }
                     self.events.push_back(ProbeOutput::OutboundOpened {
                         request_id,
                         peer_id: peer,
@@ -126,7 +195,16 @@ impl NetworkBehaviour for ProbeStreamBehaviour {
                 }
             }
             ProbeEvent::OutboundFailed { request_id, code } => {
-                if self.pending.remove(&request_id).is_some() {
+                if let Some(pending) = self.pending.remove(&request_id) {
+                    if pending.peer_id != peer || pending.connection_id != id {
+                        self.events.push_back(ProbeOutput::OutboundFailed {
+                            request_id,
+                            peer_id: pending.peer_id,
+                            connection_id: pending.connection_id,
+                            code: "probe.internal_identity_mismatch",
+                        });
+                        return;
+                    }
                     self.events.push_back(ProbeOutput::OutboundFailed {
                         request_id,
                         peer_id: peer,
