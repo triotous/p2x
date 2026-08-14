@@ -1,5 +1,7 @@
+pub mod builder;
 pub mod connection_book;
 pub mod path_selector;
+pub mod probe;
 pub mod reservation;
 
 pub use connection_book::{
