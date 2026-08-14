@@ -12,6 +12,9 @@ use std::{
     time::Duration,
 };
 
+const MAX_HANDLER_QUEUE: usize = 64;
+const MAX_HANDLER_EVENTS: usize = 64;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -68,27 +71,41 @@ impl ConnectionHandler for ProbeHandler {
         Poll::Pending
     }
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
-        self.queue.push_back(event);
+        if self.queue.len() < MAX_HANDLER_QUEUE {
+            self.queue.push_back(event);
+        } else {
+            self.events.push_back(ProbeEvent::OutboundFailed {
+                request_id: event.request_id,
+                code: "limit.handler_queue_full",
+            });
+        }
     }
     fn on_connection_event(
         &mut self,
         event: ConnectionEvent<Self::InboundProtocol, Self::OutboundProtocol, (), OpenProbe>,
     ) {
         match event {
-            ConnectionEvent::FullyNegotiatedInbound(e) => self
-                .events
-                .push_back(ProbeEvent::InboundOpened { stream: e.protocol }),
+            ConnectionEvent::FullyNegotiatedInbound(e) => {
+                if self.events.len() < MAX_HANDLER_EVENTS {
+                    self.events
+                        .push_back(ProbeEvent::InboundOpened { stream: e.protocol });
+                }
+            }
             ConnectionEvent::FullyNegotiatedOutbound(e) => {
-                self.events.push_back(ProbeEvent::OutboundOpened {
-                    request_id: e.info.request_id,
-                    stream: e.protocol,
-                })
+                if self.events.len() < MAX_HANDLER_EVENTS {
+                    self.events.push_back(ProbeEvent::OutboundOpened {
+                        request_id: e.info.request_id,
+                        stream: e.protocol,
+                    });
+                }
             }
             ConnectionEvent::DialUpgradeError(e) => {
-                self.events.push_back(ProbeEvent::OutboundFailed {
-                    request_id: e.info.request_id,
-                    code: "probe.negotiation_failed",
-                })
+                if self.events.len() < MAX_HANDLER_EVENTS {
+                    self.events.push_back(ProbeEvent::OutboundFailed {
+                        request_id: e.info.request_id,
+                        code: "probe.negotiation_failed",
+                    });
+                }
             }
             ConnectionEvent::AddressChange(_)
             | ConnectionEvent::ListenUpgradeError(_)

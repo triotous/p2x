@@ -107,6 +107,8 @@ impl ProbeStreamBehaviour {
         }
     }
     pub fn cancel(&mut self, request_id: RequestId) -> bool {
+        self.commands
+            .retain(|(_, _, open)| open.request_id != request_id);
         self.fail(request_id, "probe.cancelled")
     }
     pub fn shutdown(&mut self) {
