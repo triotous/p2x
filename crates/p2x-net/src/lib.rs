@@ -8,4 +8,4 @@ pub use connection_book::{
     ConnectionBook, ConnectionId, ConnectionRecord, PathKind, TransportKind,
 };
 pub use path_selector::{FallbackReason, PathAttempt, PathDecision, PathState};
-pub use reservation::{ReservationEvent, ReservationState};
+pub use reservation::{ReservationContext, ReservationEvent, ReservationState};
