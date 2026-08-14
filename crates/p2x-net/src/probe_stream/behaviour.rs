@@ -8,22 +8,35 @@ use libp2p::{
     },
 };
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     task::{Context, Poll},
 };
 
 #[derive(Debug)]
 pub enum ProbeOutput {
-    OutboundOpened(OpenProbe),
-    OutboundFailed(OpenProbe),
+    OutboundOpened {
+        request_id: RequestId,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        stream: libp2p::swarm::Stream,
+    },
+    OutboundFailed {
+        request_id: RequestId,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        code: &'static str,
+    },
+    InboundOpened {
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        stream: libp2p::swarm::Stream,
+    },
 }
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct RequestMarker;
 #[derive(Default)]
 pub struct ProbeStreamBehaviour {
     next: u64,
     known: HashSet<(PeerId, ConnectionId)>,
-    pending: HashSet<RequestId>,
+    pending: HashMap<RequestId, (PeerId, ConnectionId)>,
     commands: VecDeque<(PeerId, ConnectionId, OpenProbe)>,
     events: VecDeque<ProbeOutput>,
 }
@@ -36,17 +49,24 @@ impl ProbeStreamBehaviour {
         if !self.known.contains(&(peer_id, connection_id)) {
             return Err("connection_unknown");
         }
-        if self.pending.len() >= 128 {
-            return Err("limit.command_queue_full");
-        }
-        if self.pending.iter().filter(|_| true).count() >= 64 && self.pending.iter().any(|_| true) {
+        if self.pending.len() >= 128
+            || self.pending.values().filter(|(p, _)| *p == peer_id).count() >= 64
+            || self.commands.len() >= 128
+        {
             return Err("limit.command_queue_full");
         }
         self.next += 1;
         let request_id = RequestId(self.next);
-        self.pending.insert(request_id);
-        let open = OpenProbe { request_id };
-        self.commands.push_back((peer_id, connection_id, open));
+        self.pending.insert(request_id, (peer_id, connection_id));
+        self.commands.push_back((
+            peer_id,
+            connection_id,
+            OpenProbe {
+                request_id,
+                peer_id,
+                connection_id,
+            },
+        ));
         Ok(request_id)
     }
 }
@@ -77,6 +97,15 @@ impl NetworkBehaviour for ProbeStreamBehaviour {
     fn on_swarm_event(&mut self, event: FromSwarm) {
         if let FromSwarm::ConnectionClosed(c) = event {
             self.known.remove(&(c.peer_id, c.connection_id));
+            let ids: Vec<_> = self
+                .pending
+                .iter()
+                .filter(|(_, v)| **v == (c.peer_id, c.connection_id))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in ids {
+                self.pending.remove(&id);
+            }
         }
     }
     fn on_connection_handler_event(
@@ -86,18 +115,34 @@ impl NetworkBehaviour for ProbeStreamBehaviour {
         event: THandlerOutEvent<Self>,
     ) {
         match event {
-            ProbeEvent::Opened(request_id) => {
-                self.pending.remove(&request_id);
-                self.events
-                    .push_back(ProbeOutput::OutboundOpened(OpenProbe { request_id }));
+            ProbeEvent::OutboundOpened { request_id, stream } => {
+                if self.pending.remove(&request_id).is_some() {
+                    self.events.push_back(ProbeOutput::OutboundOpened {
+                        request_id,
+                        peer_id: peer,
+                        connection_id: id,
+                        stream,
+                    });
+                }
             }
-            ProbeEvent::Failed(request_id) => {
-                self.pending.remove(&request_id);
-                self.events
-                    .push_back(ProbeOutput::OutboundFailed(OpenProbe { request_id }));
+            ProbeEvent::OutboundFailed { request_id, code } => {
+                if self.pending.remove(&request_id).is_some() {
+                    self.events.push_back(ProbeOutput::OutboundFailed {
+                        request_id,
+                        peer_id: peer,
+                        connection_id: id,
+                        code,
+                    });
+                }
             }
-        };
-        self.known.insert((peer, id));
+            ProbeEvent::InboundOpened { stream } => {
+                self.events.push_back(ProbeOutput::InboundOpened {
+                    peer_id: peer,
+                    connection_id: id,
+                    stream,
+                })
+            }
+        }
     }
     fn poll(&mut self, _: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         if let Some(event) = self.events.pop_front() {

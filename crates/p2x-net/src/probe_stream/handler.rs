@@ -1,6 +1,10 @@
 use super::upgrade::ProbeUpgrade;
-use libp2p::swarm::{
-    ConnectionHandler, ConnectionHandlerEvent, SubstreamProtocol, handler::ConnectionEvent,
+use libp2p::{
+    Stream,
+    swarm::{
+        ConnectionHandler, ConnectionHandlerEvent, ConnectionId, SubstreamProtocol,
+        handler::ConnectionEvent,
+    },
 };
 use std::{
     collections::VecDeque,
@@ -13,11 +17,22 @@ pub struct RequestId(pub u64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct OpenProbe {
     pub request_id: RequestId,
+    pub peer_id: libp2p::PeerId,
+    pub connection_id: ConnectionId,
 }
 #[derive(Debug)]
 pub enum ProbeEvent {
-    Opened(RequestId),
-    Failed(RequestId),
+    OutboundOpened {
+        request_id: RequestId,
+        stream: Stream,
+    },
+    OutboundFailed {
+        request_id: RequestId,
+        code: &'static str,
+    },
+    InboundOpened {
+        stream: Stream,
+    },
 }
 
 #[derive(Default)]
@@ -60,18 +75,26 @@ impl ConnectionHandler for ProbeHandler {
         event: ConnectionEvent<Self::InboundProtocol, Self::OutboundProtocol, (), OpenProbe>,
     ) {
         match event {
-            ConnectionEvent::FullyNegotiatedInbound(_) => {}
+            ConnectionEvent::FullyNegotiatedInbound(e) => self
+                .events
+                .push_back(ProbeEvent::InboundOpened { stream: e.protocol }),
             ConnectionEvent::FullyNegotiatedOutbound(e) => {
-                self.events.push_back(ProbeEvent::Opened(e.info.request_id))
+                self.events.push_back(ProbeEvent::OutboundOpened {
+                    request_id: e.info.request_id,
+                    stream: e.protocol,
+                })
             }
             ConnectionEvent::DialUpgradeError(e) => {
-                self.events.push_back(ProbeEvent::Failed(e.info.request_id))
+                self.events.push_back(ProbeEvent::OutboundFailed {
+                    request_id: e.info.request_id,
+                    code: "probe.negotiation_failed",
+                })
             }
             ConnectionEvent::AddressChange(_)
             | ConnectionEvent::ListenUpgradeError(_)
             | ConnectionEvent::LocalProtocolsChange(_)
-            | ConnectionEvent::RemoteProtocolsChange(_)
-            | _ => {}
+            | ConnectionEvent::RemoteProtocolsChange(_) => {}
+            _ => {}
         }
     }
 }
