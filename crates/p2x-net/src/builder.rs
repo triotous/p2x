@@ -13,6 +13,24 @@ pub const IDLE_TIMEOUT_SECONDS: u64 = 120;
 pub const PING_INTERVAL_SECONDS: u64 = 15;
 pub const PING_TIMEOUT_SECONDS: u64 = 5;
 
+pub fn lab_identity(seed: Option<u64>) -> Result<libp2p::identity::Keypair, BuildError> {
+    match seed {
+        None => Ok(libp2p::identity::Keypair::generate_ed25519()),
+        Some(seed) => {
+            let mut bytes = [0u8; 32];
+            let mut value = seed;
+            for byte in &mut bytes {
+                value ^= value << 13;
+                value ^= value >> 7;
+                value ^= value << 17;
+                *byte = value as u8;
+            }
+            libp2p::identity::Keypair::ed25519_from_bytes(bytes)
+                .map_err(|e| BuildError::Builder(e.to_string()))
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SwarmConfig {
     pub tcp_listen: Option<libp2p::Multiaddr>,
