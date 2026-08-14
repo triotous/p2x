@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 clap.workspace = true
+futures.workspace = true
 libp2p.workspace = true
 p2x-net = { path = "../../crates/p2x-net" }
 tokio.workspace = true

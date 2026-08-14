@@ -2051,6 +2051,7 @@ name = "p2x-client"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures",
  "libp2p",
  "p2x-net",
  "tokio",
@@ -2062,6 +2063,7 @@ name = "p2x-exchange"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures",
  "libp2p",
  "p2x-net",
  "tokio",
@@ -2084,6 +2086,7 @@ name = "p2x-server"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures",
  "libp2p",
  "p2x-net",
  "tokio",
