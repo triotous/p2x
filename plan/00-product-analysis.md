@@ -1,9 +1,10 @@
 # Plan: P2P Proxy Tunnel Product Analysis and Architecture
 
-- **Document status:** Stage 1 product analysis and architecture direction
+- **Document status:** Stage 1 product analysis and approved architecture baseline
 - **Date:** 2026-08-14
 - **Audience:** product owner, system designer, Rust implementers, security reviewer, and test/operations engineers
 - **Repository state:** new/empty Git repository; no implementation exists yet
+- **Decision status:** the product decisions in §28 were approved on 2026-08-14
 - **Next stage:** turn the decisions and work packages in this document into implementation-ready system-design documents and ADRs before production code is written
 
 ## 1. Executive Summary
@@ -18,7 +19,7 @@ The recommended networking foundation is `rust-libp2p`, specifically authenticat
 
 This differs intentionally from the referenced `peer-gateway` project. That project contains valuable use cases, but it also demonstrates the cost of maintaining custom candidate exchange, NAT classification, punching, path arbitration, framing, encryption, and lifecycle code. The greenfield design should preserve its useful product concepts—domain-to-metadata routing, exact service registration, private upstreams, relay fallback, bounded concurrency, and strong observability—while delegating standard peer connectivity to libp2p wherever possible.
 
-The most important scope decision is the meaning of “stable connection.” The recommended first production scope guarantees persistent registration, automatic control-plane reconnect, continuous relay reachability, bounded direct-to-relay fallback for new proxy streams, multiplexing, backpressure, keepalive, and recovery for subsequent connections. Transparently migrating an already active arbitrary TCP byte stream after its underlying P2P path dies requires a separate resumable logical-stream protocol with sequence/acknowledgement buffers. That feature is valuable but materially larger; it should be an explicit later milestone unless uninterrupted in-flight sessions are a launch requirement.
+The approved v1 stability contract guarantees persistent registration, automatic control-plane reconnect, continuous relay reachability, bounded direct-to-relay fallback for new proxy streams, multiplexing, backpressure, keepalive, and recovery for subsequent connections. An active arbitrary TCP stream resets if its underlying P2P connection dies. Transparent active-stream migration is deferred because it requires a separate resumable logical-stream protocol with sequence/acknowledgement buffers.
 
 ## 2. Inputs and Evidence
 
@@ -70,7 +71,7 @@ These findings are product evidence, not a mandate to reuse the previous code.
 - The official DCUtR example establishes an initial relayed connection, learns observed addresses, and attempts direct TCP/QUIC connectivity.
 - Circuit Relay v2 provides identified, end-to-end encrypted relay connections and resource limits.
 - AutoNAT can classify broad public/private reachability, but its result must not be treated as a per-address or permanent NAT truth.
-- RustDesk demonstrates the operationally proven pattern of persistent rendezvous registration, direct-preferred connection setup, and a relay fallback. RustDesk code is AGPL-licensed; use its architecture and behavior as research unless the P2X licensing decision explicitly permits code reuse.
+- RustDesk demonstrates the operationally proven pattern of persistent rendezvous registration, direct-preferred connection setup, and a relay fallback. P2X accepts AGPL licensing obligations but will use RustDesk as architecture research by default. Copy RustDesk code only when a concrete implementation need justifies it, and then preserve source provenance, copyright notices, license text, and modification records.
 
 ## 3. Product Definition
 
@@ -134,15 +135,17 @@ Given an authorized client route and an online server advertisement, P2X will:
 
 ### 4.2 Initial success measures
 
-Exact production SLO values require expected workload and infrastructure cost inputs. Stage 2 should establish numeric SLOs, but the first validation baseline is:
+The approved launch target is a small, single-exchange deployment. Stage 2 may refine tuning values from measurements, but it must preserve the following validation baseline:
 
 | Measure | Initial validation target |
 | --- | --- |
 | Server online discoverability | Registration becomes resolvable within 5 seconds after process/network availability |
 | Relay fallback availability | A supported client reaches an online server through relay even when all direct traffic is blocked |
-| Connection setup bound | Relay-backed proxy stream available within a configurable target, initially 3 seconds on a healthy exchange |
+| Connection setup bound | Default direct-preference window 1.5 seconds; target p95 at most 5 seconds; configured user-visible hard deadline and p99 at most 20 seconds on a healthy exchange/network |
 | Direct preference | Direct path selected whenever DCUtR succeeds before the configured direct deadline |
-| Registration recovery | Server automatically reconnects, renews reservation, and re-registers without operator action |
+| Registration recovery | Server automatically reconnects, renews reservation, and re-registers without operator action; target recovery within 60 seconds after a healthy single exchange restarts |
+| Initial workload | Up to 16 servers, 32 clients, 4 tenants, 16 services per server, 32 active peer connections, and 64 concurrent proxy streams |
+| Validation headroom | Exercise 32 servers, 64 clients, 8 tenants, 32 services per server, 64 active peer connections, and 128 concurrent proxy streams; these are test targets, not hard product caps |
 | Concurrency isolation | One slow stream does not block heartbeat, registration refresh, connection setup, or unrelated streams |
 | Memory safety | Per-stream, per-peer, and exchange relay buffering remain under configured hard limits |
 | Security | Unauthorized peers cannot resolve services, claim another server's service, or choose an arbitrary upstream |
@@ -175,6 +178,8 @@ Exact production SLO values require expected workload and infrastructure cost in
 8. The exchange can be single-instance during initial delivery. Its availability and scaling limitations must be explicit in health and deployment documentation.
 9. Configuration is validated atomically before networking starts. Unknown fields are errors.
 10. All network protocol messages are versioned and bounded before allocation or deserialization.
+11. Initial enrollment uses a unique fixed high-entropy token per peer. Exchange configuration binds that token to the expected `PeerId`, tenant, role, scopes, and quotas.
+12. Linux and macOS are supported. OCI containers are the primary packaging format; Linux is the reference environment for direct-connect validation, while macOS container runtimes add a VM/NAT layer and may rely on relay even when the native macOS process can connect directly.
 
 ## 6. Primary Use Cases
 
@@ -362,7 +367,7 @@ Exchange sees `upstream_id`, selector, protocol capability, and health/revision.
 
 ## 9. Ingress and Proxy Scope
 
-### 9.1 Recommended v1 adapters
+### 9.1 Approved v1 adapters
 
 The transport core should expose a generic ordered bidirectional byte stream. Ingress adapters determine a route, then hand the byte stream to the common tunnel layer.
 
@@ -381,14 +386,14 @@ The transport core should expose a generic ordered bidirectional byte stream. In
    - A raw protocol has no domain field. Each configured bind address maps directly to a selector.
    - Suitable for databases, SSH-like services, and non-TLS protocols.
 
-### 9.2 Features requiring an explicit Stage 2 decision
+### 9.2 Deferred features
 
 - TLS termination at client followed by plaintext or re-encrypted origin traffic.
 - Full HTTP reverse-proxy semantics: `Forwarded` headers, hop-by-hop removal, retries, path prefix joins, HTTP/2 termination, gRPC trailers, and request-level pooling.
 - HTTP CONNECT as a local explicit proxy.
 - Server-initiated TLS to an upstream when the client-side ingress is plaintext.
 
-The recommended first implementation uses stream-level proxying because it is smaller, preserves protocol behavior, and aligns with libp2p substreams. If application-aware HTTP rewriting is required, it should be a separate adapter above the same service resolution and peer connection layers.
+The approved v1 implementation uses stream-level proxying because it is smaller, preserves protocol behavior, and aligns with libp2p substreams. If application-aware HTTP rewriting is later required, it must be a separate adapter above the same service resolution and peer connection layers.
 
 ## 10. Recommended Technical Architecture
 
@@ -474,7 +479,7 @@ The connectivity plane is libp2p:
 | WebRTC/ICE | Strong NAT traversal but adds SDP/ICE/data-channel concepts and integration complexity for a native Rust service; revisit only if libp2p matrix results are inadequate |
 | Custom QUIC + STUN + TURN-like relay | Maximum control but recreates identity, candidate exchange, synchronization, relay, multiplexing, and security protocol work |
 | TCP-only reverse tunnel | Reliable reachability but all application bytes use exchange; violates direct-preferred cost/latency goal |
-| RustDesk protocol/code fork | Remote-desktop semantics do not match service registry/proxy needs; AGPL licensing and coupling are unnecessary |
+| RustDesk protocol/code fork | Remote-desktop semantics do not match service registry/proxy needs, and importing its protocol stack would create unnecessary coupling; use its behavior as research and copy only a specifically justified portion under the approved AGPL policy |
 
 ## 12. Component Architecture
 
@@ -737,6 +742,8 @@ Any step -> Failed(public_code, internal_cause)
 
 Cancellation must close both sides and release all permits exactly once.
 
+The 20-second connection-setup timer starts when client ingress accepts a route-eligible connection and stops only when server returns `Accepted` after the upstream connection succeeds. Domain parsing, exchange resolution, ticket issuance, relay dialing, the direct-preference window, proxy-stream opening, ticket validation, and upstream dialing all share this one budget. Expiry cancels every losing task and returns `setup_timeout`; an implementation must not stack independent timeouts that can exceed the user-visible deadline.
+
 ## 16. Stability and Recovery Contract
 
 ### 16.1 Included in v1 stability
@@ -773,7 +780,7 @@ Recommendation: ship v1 with explicit active-stream reset semantics and fast rec
 ### 17.1 Trust model
 
 - Peer transport identity authenticates which process is connected.
-- Exchange credentials authorize tenant, role, selector ownership, resolution, and relay quota.
+- A unique fixed token bound to the authenticated `PeerId` authorizes tenant, role, selector ownership, resolution, and relay quota.
 - Exchange-signed tickets authorize one client-to-server service stream.
 - Server-local configuration authorizes the actual upstream destination.
 - Libp2p encryption protects direct and relayed application bytes from passive observers and the relay.
@@ -787,15 +794,17 @@ Recommendation: ship v1 with explicit active-stream reset semantics and fast rec
 4. Support ticket key IDs and overlapping verification windows for rotation.
 5. Bind all ticket fields listed in §14.3 and enforce clock skew/expiry.
 6. Keep a bounded replay cache for one-use ticket IDs, scoped by expiry.
-7. Authenticate before registry lookup details or relay reservation allocation.
-8. Apply per-source/IP pre-auth connection limits and per-identity post-auth quotas.
-9. Never accept a client-supplied upstream address, SNI rewrite target, URL, or DNS name at server.
-10. Validate DNS/metadata Unicode and length to avoid canonicalization confusion.
-11. Redact credentials, private keys, tickets, raw selectors when sensitive, payload, and upstream addresses from logs.
-12. Restrict metrics/admin listeners to operator networks or separate authentication.
-13. Treat relay as non-anonymous: all participants and exchange know peer IDs.
-14. Define credential revocation behavior for existing registrations, tickets, circuits, and streams.
-15. Run dependency, license, and advisory checks in CI.
+7. Generate a separate high-entropy fixed token for every peer; never share one token across client/server instances or tenants.
+8. Store only token digests where practical, compare credentials in constant time, bind a valid token to the transport `PeerId`, and define token rotation/revocation without silently changing identity.
+9. Authenticate before registry lookup details or relay reservation allocation.
+10. Apply per-source/IP pre-auth connection limits and per-identity post-auth quotas.
+11. Never accept a client-supplied upstream address, SNI rewrite target, URL, or DNS name at server.
+12. Validate DNS/metadata Unicode and length to avoid canonicalization confusion.
+13. Redact credentials, private keys, tickets, raw selectors when sensitive, payload, and upstream addresses from logs.
+14. Restrict metrics/admin listeners to operator networks or separate authentication.
+15. Treat relay as non-anonymous: all participants and exchange know peer IDs.
+16. Define credential revocation behavior for existing registrations, tickets, circuits, and streams.
+17. Run dependency, AGPL/source-provenance, license, and advisory checks in CI.
 
 ### 17.3 Threats to cover in Stage 2
 
@@ -897,8 +906,8 @@ relay:
 admin:
   bind: 127.0.0.1:9090
 auth:
-  provider: static_file
-  static_file: /etc/p2x/peers.yaml
+  provider: fixed_token_file
+  fixed_token_file: /etc/p2x/peers.yaml
 ```
 
 ### 20.2 Server example
@@ -963,6 +972,7 @@ network:
     - /ip4/0.0.0.0/tcp/0
     - /ip4/0.0.0.0/udp/0/quic-v1
   direct_preference_ms: 1500
+  connection_setup_timeout_ms: 20000
 ingress:
   http:
     bind: 127.0.0.1:8080
@@ -1077,12 +1087,13 @@ Server:
 
 ### 22.1 Initial topology
 
-- One public `p2x-exchange` host or VM.
+- One public `p2x-exchange` instance on one host or VM. Active-active exchange is not part of v1.
 - Public TCP and UDP/QUIC port 7000 (illustrative), with correct DNS and firewall rules.
 - Operator-only metrics/health listener or protected reverse proxy.
-- Client and server run directly on Linux hosts where possible.
-- Containers use host networking for NAT traversal tests/production only when security policy permits; bridge/user-mode networking must be validated separately.
-- Persist component identity keys on durable volumes.
+- Publish OCI images for Linux and document container-first deployment for all three components.
+- Linux containers are the reference production and CI environment. Use host networking for client/server direct-connect validation where security policy permits; bridge/rootless networking is separately tested and may reduce direct success.
+- Support native macOS client/server binaries. Also support common macOS container runtimes for functional and relay operation, but document that Docker Desktop/Colima-style VM networking adds another NAT layer and cannot promise the same direct-connect rate as native macOS or Linux host networking.
+- Persist component identity keys and fixed-token configuration/secret references on durable, restrictively permissioned volumes.
 - Exchange registry may be in memory in v1; servers repopulate after restart.
 
 ### 22.2 Scaling constraints
@@ -1095,7 +1106,7 @@ A single exchange couples registry and relay availability. Horizontal scaling is
 - existing relay circuits cannot move between processes;
 - connection affinity and graceful drain matter.
 
-Stage 2 should document a single-instance launch boundary. A later multi-exchange design can let servers reserve/register with multiple independent exchanges and clients choose one, avoiding shared live relay state. Do not add distributed consensus before availability requirements justify it.
+Stage 2 must document the approved single-instance launch boundary. A later multi-exchange design can let servers reserve/register with multiple independent exchanges and clients choose one, avoiding shared live relay state. Do not add distributed consensus before availability requirements justify it.
 
 ## 23. Verification Strategy
 
@@ -1148,6 +1159,9 @@ Failure of spike 2 is an architecture gate. If rust-libp2p cannot reliably targe
 | IPv6-capable peers | direct IPv6 preferred when validated |
 | Double NAT/CGNAT | direct best effort; relay works |
 | Rootless/user-mode container network | classified/warned; no false direct success requirement |
+| Linux OCI container with host networking | direct and relay behavior must match the native Linux reference within measurement tolerance |
+| Native macOS client/server | direct and relay paths are supported and included in release testing |
+| macOS VM-backed container runtime | registration, resolution, and relay are required; direct remains best effort and its observed limitations are documented |
 | Exchange UDP blocked | TCP exchange/relay still works; QUIC direct opportunity reduced |
 | High RTT/loss/reordering | no fixed LAN-only confirmation timeout; bounded fallback |
 
@@ -1155,10 +1169,12 @@ Use Linux network namespaces, firewall rules, and traffic shaping for reproducib
 
 ### 23.5 Soak and load tests
 
+- validate the initial workload and 2x headroom envelopes from §4.2;
 - thousands of registry refresh/expiry cycles with no stale owner;
 - repeated 100+ connect/disconnect iterations under direct/relay mix;
-- multi-hour concurrent proxy streams with packet loss and exchange reconnect;
+- multi-hour runs at 64 concurrent proxy streams, plus a 128-stream headroom run, with packet loss and exchange reconnect;
 - relay bandwidth saturation without control-plane starvation;
+- measure relay throughput/bytes/duration by upstream class rather than declaring an unverified fixed bandwidth SLO;
 - slowloris headers/ClientHello and slow relay receivers;
 - process memory, task count, file descriptors, queues, and replay cache return to baseline after cleanup.
 
@@ -1168,8 +1184,7 @@ This is a dependency-ordered product breakdown, not yet a coding plan. Each phas
 
 ### Phase 0 — Decisions, workspace, and connectivity proof
 
-- Resolve launch-scope questions in §28.
-- Record ADRs for libp2p, identity/auth, proxy scope, and stream recovery.
+- Record the approved decisions in §28 as ADR constraints for libp2p, fixed-token authentication, proxy scope, stream recovery, single-instance exchange, AGPL compliance, and platform support.
 - Bootstrap Rust workspace with three binaries and shared crates.
 - Pin toolchain, lint/format/test/security/license CI.
 - Complete all architecture spikes in §23.1.
@@ -1180,7 +1195,7 @@ This is a dependency-ordered product breakdown, not yet a coding plan. Each phas
 ### Phase 1 — Identity, authentication, and bounded protocols
 
 - Persist component identities and pin exchange identity.
-- Define tenant/role credential provider interface and initial static provider.
+- Implement the fixed-token credential provider: one token per peer, token-to-`PeerId`/tenant/role/scope binding, digest-safe storage, constant-time validation, and rotation/revocation behavior.
 - Implement bounded versioned codecs and public error types.
 - Define deterministic ticket claims/signatures/test vectors and key rotation fields.
 - Add secret-redaction tests.
@@ -1286,21 +1301,22 @@ Each Stage 2 document should name concrete crates/modules/types, implementation 
 | Direct success lower than expected in target networks | Higher relay cost/latency | Relay capacity is launch requirement; measure real topology matrix; support TCP+QUIC and IPv6 |
 | Exchange is a single point of failure | New resolutions/relay circuits unavailable | Declare v1 boundary, graceful drain, backups/fast restart; later multiple independent exchanges |
 | Relay abuse or bandwidth exhaustion | Cost and denial of service | Strong auth, per-tenant/peer/global Circuit Relay v2 limits, rate limiting, alerts |
-| Domain/TLS expectations are ambiguous | Wrong ingress semantics or certificate burden | Approve v1 adapters and TLS mode before Stage 2 client design |
-| “Stable” is interpreted as seamless active-stream failover | Major hidden protocol scope | Explicit v1 contract; optional resumable-stream phase with separate design |
+| Deferred features accidentally expand v1 into TLS termination or a full HTTP proxy | Schedule and correctness risk | Enforce the approved fixed TCP + HTTP/1.1 Host + TLS-SNI passthrough scope in Stage 2 designs and acceptance tests |
+| Active-stream reset semantics are mistaken for seamless failover | Incorrect consumer expectations | Document the approved v1 reset contract at API/config/runbook boundaries; keep resumable streams in optional Phase 7 |
 | Selector metadata leaks sensitive business information | Privacy issue | Document non-secret metadata rule; fingerprint/redact telemetry; minimize response data |
 | Stale registry/ticket routes to replaced service | Wrong upstream authorization | Atomic resolve+ticket, short expiry, registration revision binding, one-use replay defense |
 | Server becomes an SSRF/open proxy | Private network compromise | Ticket service ID maps only to validated local config; never accept arbitrary destinations |
 | Identity/key loss or silent regeneration | Peer takeover/outage | Durable restrictive storage, explicit generation, backup/rotation/revocation procedure |
-| Container networking invalidates direct tests | False failures/success claims | Linux host/network namespace lab, real-machine validation, runtime environment warnings |
+| Linux bridge/rootless or macOS VM-backed container networking invalidates direct tests | False failures/success claims | Linux host/network namespace lab, native macOS validation, relay-required macOS-container tests, and runtime environment warnings |
 | Dependency/protocol changes in libp2p | Compatibility/build risk | Pin release after spike, protocol compatibility tests, planned upgrade cadence |
-| RustDesk code copied without license decision | Licensing risk | Use architectural research only until project license and reuse policy are approved |
+| RustDesk code is copied without provenance or notices | AGPL/source-compliance risk | P2X accepts AGPL obligations; default to conceptual reuse, and require explicit source attribution, notices, license text, and modification tracking for copied code |
 
 ## 27. Product Acceptance Criteria
 
 ### 27.1 Functional
 
 - Exactly `p2x-exchange`, `p2x-client`, and `p2x-server` executables are produced.
+- V1 ingress is fixed TCP, HTTP/1.1 exact Host routing, and TLS SNI passthrough; TLS termination and full application-aware HTTP/2/gRPC proxying are absent.
 - Client and server require no configured public endpoint and make outbound exchange connections.
 - One server atomically advertises multiple private services without revealing upstream addresses.
 - Client exact domain/fixed-port routes map to metadata and resolve one current server deterministically.
@@ -1314,9 +1330,11 @@ Each Stage 2 document should name concrete crates/modules/types, implementation 
 - Direct QUIC/TCP is attempted through standard libp2p DCUtR.
 - Direct is selected for new streams when it succeeds within policy.
 - With all direct paths blocked, relay successfully carries the same proxy protocol within the setup bound.
+- The default direct-preference window is 1.5 seconds; user-visible connection setup has a hard 20-second deadline, with a healthy-path target of p95 at most 5 seconds and p99 at most 20 seconds.
 - Direct and relay outcomes are distinguishable in metrics/logs.
 - Server continuously renews reservation and registration and recovers from exchange restart.
 - Transient control disconnect does not terminate unrelated healthy direct streams.
+- Loss of the P2P connection resets its active v1 proxy streams; subsequent connections recover through direct or relay without requiring a component restart.
 
 ### 27.3 Correctness and safety
 
@@ -1334,57 +1352,60 @@ Each Stage 2 document should name concrete crates/modules/types, implementation 
 - Health/readiness accurately distinguish a running process from a usable component.
 - Operators can diagnose route, auth, registry, exchange, relay, direct, peer, and upstream failures from stable codes and correlated telemetry.
 - Deployment documents state public port requirements, persistent key requirements, container networking limitations, relay quotas, single-exchange limitations, drain, backup, and recovery.
+- Linux and native macOS release tests pass. macOS VM-backed containers must pass registration, resolution, proxying, and forced-relay tests; their direct-connect success rate is measured and documented rather than guaranteed.
+- The §4.2 initial workload and validation-headroom envelopes pass without control starvation, unbounded queues, resource leaks, or exceeding the 20-second setup deadline.
 
-## 28. Open Decisions Required Before Stage 2 Is Complete
+## 28. Approved Product Decisions
 
-Recommended defaults are supplied so design can continue without rediscovering the options. These decisions are not blockers to this Stage 1 document.
+The following decisions were approved on 2026-08-14 and are normative inputs to every Stage 2 design. Reversing one requires an ADR that identifies affected protocols, tests, configuration, and delivery phases.
 
 ### 28.1 Launch ingress/protocol scope
 
-**Recommended:** fixed TCP + HTTP/1.1 Host routing + TLS SNI passthrough. Defer TLS termination and application-aware HTTP/2/gRPC proxying.
+**Decision:** fixed TCP + HTTP/1.1 Host routing + TLS SNI passthrough. Defer TLS termination and application-aware HTTP/2/gRPC proxying.
 
 Why it matters: determines proxy framing, certificate ownership, HTTP libraries, and test matrix.
 
 ### 28.2 Stability definition
 
-**Recommended:** v1 automatically restores control/registration/peer connectivity and supports new-stream direct-to-relay fallback; active streams reset if their underlying connection dies. Defer resumable logical streams.
+**Decision:** v1 automatically restores control/registration/peer connectivity and supports new-stream direct-to-relay fallback; active streams reset if their underlying connection dies. Defer resumable logical streams.
 
 Why it matters: transparent active-stream migration is a substantial reliable transport protocol, not a small reconnect feature.
 
 ### 28.3 Authentication/enrollment source
 
-**Recommended:** static exchange-side peer/tenant/role token file for the first deployment, designed behind an interface; peer identity remains the transport identity.
-
-Alternatives: mTLS/PKI, OIDC device enrollment, signed bootstrap tokens, external authorization service.
+**Decision:** use exchange-side fixed tokens for initial enrollment. Each peer has a unique high-entropy token bound to its libp2p `PeerId`, tenant, role, scopes, and quotas. Keep the provider behind an interface so a future enrollment system can replace it without changing registry or proxy authorization semantics.
 
 ### 28.4 Tenant and service ownership model
 
-**Recommended:** tenant-scoped exact selector and one live owner per selector. No replicas/load balancing in v1.
+**Decision:** tenant-scoped exact selector and one live owner per selector. No replicas/load balancing in v1.
 
 Why it matters: affects registry index, credentials, conflict behavior, tickets, and future scaling.
 
 ### 28.5 Exchange availability target
 
-**Recommended:** explicitly single instance for v1 with durable keys, fast restart, server re-registration, and bounded relay drain. Design multiple independent exchanges later.
+**Decision:** one exchange instance in v1, with durable keys, process restart policy, server re-registration, explicit readiness, and bounded relay drain. Design multiple independent exchanges later.
 
 Why it matters: active-active exchange changes reservation addresses, registry consistency, ticket keys, and failure recovery.
 
 ### 28.6 Project license and reference-code policy
 
-**Recommended:** choose a project license before code bootstrap; reuse the local MIT reference only deliberately and treat RustDesk as architecture research unless AGPL compatibility is accepted.
+**Decision:** AGPL obligations are accepted. Do not import RustDesk source by default; use it as a behavioral/architectural reference. If copying becomes necessary, copy only the justified portion and record the exact source revision/file, copyright, license notice, modifications, and corresponding-source obligations. Stage 2 must select the precise SPDX identifier and add repository license/notice files before implementation is distributed.
 
 ### 28.7 Expected scale and SLOs
 
-Required inputs:
+**Decision:** target a small deployment and favor correctness/availability over premature distributed scaling.
 
-- servers, clients, services per server, and tenants;
-- concurrent peer connections and proxy streams;
-- average/peak relay bandwidth and duration;
-- acceptable direct-preference delay and total connection setup p95/p99;
-- availability and recovery objectives;
-- supported operating systems/container environments.
+| Dimension | Approved baseline |
+| --- | --- |
+| Expected deployment | Up to 16 servers, 32 clients, 4 tenants, and 16 services per server; typical servers expose a few to low tens of services |
+| Expected concurrency | Up to 32 active peer connections and approximately 64 concurrent proxy streams |
+| Validation headroom | 32 servers, 64 clients, 8 tenants, 32 services per server, 64 active peer connections, and 128 concurrent proxy streams |
+| Relay bandwidth/duration | No fixed throughput SLO until upstream classes are observed; instrument bytes, rate, duration, saturation, and fallback reason from the first release, with configurable safety quotas |
+| Connection setup | Default 1.5-second direct-preference window; target p95 at most 5 seconds; p99 and configured hard deadline at most 20 seconds |
+| Availability/recovery | Best effort rather than a percentage SLA in v1; automatic reconnect/re-registration, durable identities/keys, readiness, process restart policy, and target recovery within 60 seconds after a healthy exchange restart |
+| Platforms | Linux and macOS; OCI containers are the primary package. Linux is the direct-connect reference. Native macOS supports direct/relay; macOS VM-backed containers require relay functionality while direct is best effort |
 
-These numbers determine defaults, hard limits, relay sizing, load tests, and the single-exchange launch decision.
+These values are engineering baselines, not hard-coded protocol limits. Stage 2 must derive configurable defaults and resource caps, and production telemetry must guide relay sizing.
 
 ## 29. Reference Index
 
