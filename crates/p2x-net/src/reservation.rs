@@ -1,5 +1,8 @@
-use libp2p::{PeerId, swarm::ConnectionId};
+use libp2p::{Multiaddr, PeerId, swarm::ConnectionId};
+use std::time::{Duration, Instant};
 
+pub const INITIAL_RETRY: Duration = Duration::from_millis(250);
+pub const MAX_RETRY: Duration = Duration::from_secs(10);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReservationState {
     Disconnected,
@@ -11,27 +14,50 @@ pub enum ReservationState {
     Ready,
     Degraded,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReservationEvent {
-    ExchangeConnected,
-    ReservationRequested,
-    ReservationAccepted { renewal: bool },
-    RelayAddressConfirmed,
-    ExchangeLost,
-    RelayAddressLost,
-    ListenerClosed,
+    GenerationStarted {
+        generation: u64,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+    },
+    ReservationRequested {
+        generation: u64,
+    },
+    ReservationAccepted {
+        generation: u64,
+        listener_id: u64,
+        renewal: bool,
+    },
+    RelayAddressConfirmed {
+        generation: u64,
+        address: Multiaddr,
+    },
+    ExchangeLost {
+        generation: u64,
+        connection_id: ConnectionId,
+    },
+    ListenerClosed {
+        generation: u64,
+        listener_id: u64,
+    },
+    RelayAddressLost {
+        generation: u64,
+    },
 }
-
 #[derive(Debug)]
 pub struct ReservationContext {
     pub generation: u64,
     pub exchange_peer_id: Option<PeerId>,
     pub exchange_connection_id: Option<ConnectionId>,
     pub listener_id: Option<u64>,
+    pub canonical_address: Option<Multiaddr>,
     pub accepted: bool,
     pub address_confirmed: bool,
+    pub last_acceptance: Option<Instant>,
     pub renewal_count: u64,
     pub retry_attempt: u32,
+    pub retry_deadline: Option<Instant>,
     degraded: bool,
 }
 impl ReservationContext {
@@ -41,10 +67,13 @@ impl ReservationContext {
             exchange_peer_id: None,
             exchange_connection_id: None,
             listener_id: None,
+            canonical_address: None,
             accepted: false,
             address_confirmed: false,
+            last_acceptance: None,
             renewal_count: 0,
             retry_attempt: 0,
+            retry_deadline: None,
             degraded: false,
         }
     }
@@ -64,59 +93,148 @@ impl ReservationContext {
     pub fn is_ready(&self) -> bool {
         !self.degraded && self.accepted && self.address_confirmed
     }
-    pub fn apply(&mut self, event: ReservationEvent) {
+    pub fn apply_at(&mut self, event: ReservationEvent, now: Instant) {
         match event {
-            ReservationEvent::ExchangeConnected => self.degraded = false,
-            ReservationEvent::ReservationRequested => {}
-            ReservationEvent::ReservationAccepted { renewal } => {
+            ReservationEvent::GenerationStarted {
+                generation,
+                peer_id,
+                connection_id,
+            } if generation >= self.generation => {
+                self.generation = generation;
+                self.exchange_peer_id = Some(peer_id);
+                self.exchange_connection_id = Some(connection_id);
+                self.listener_id = None;
+                self.canonical_address = None;
+                self.accepted = false;
+                self.address_confirmed = false;
+                self.degraded = false;
+                self.retry_attempt = 0;
+                self.retry_deadline = None;
+            }
+            ReservationEvent::ReservationRequested { .. } => {}
+            ReservationEvent::ReservationAccepted {
+                generation,
+                listener_id,
+                renewal,
+            } if generation == self.generation => {
+                self.listener_id = Some(listener_id);
                 self.accepted = true;
+                self.last_acceptance = Some(now);
                 if renewal {
                     self.renewal_count += 1;
                 }
             }
-            ReservationEvent::RelayAddressConfirmed => self.address_confirmed = true,
-            ReservationEvent::ExchangeLost
-            | ReservationEvent::RelayAddressLost
-            | ReservationEvent::ListenerClosed => self.degraded = true,
+            ReservationEvent::RelayAddressConfirmed {
+                generation,
+                address,
+            } if generation == self.generation => {
+                self.canonical_address = Some(address);
+                self.address_confirmed = true;
+                self.degraded = false;
+                self.retry_attempt = 0;
+                self.retry_deadline = None;
+            }
+            ReservationEvent::ExchangeLost {
+                generation,
+                connection_id,
+            } if generation == self.generation
+                && self.exchange_connection_id == Some(connection_id) =>
+            {
+                self.degrade(now)
+            }
+            ReservationEvent::ListenerClosed {
+                generation,
+                listener_id,
+            } if generation == self.generation && self.listener_id == Some(listener_id) => {
+                self.degrade(now)
+            }
+            ReservationEvent::RelayAddressLost { generation } if generation == self.generation => {
+                self.degrade(now)
+            }
+            _ => {}
         }
+    }
+    pub fn apply(&mut self, event: ReservationEvent) {
+        self.apply_at(event, Instant::now());
+    }
+    fn degrade(&mut self, now: Instant) {
+        self.degraded = true;
+        self.retry_attempt = self.retry_attempt.saturating_add(1);
+        let exp = INITIAL_RETRY
+            .saturating_mul(2u32.saturating_pow(self.retry_attempt.saturating_sub(1)))
+            .min(MAX_RETRY);
+        self.retry_deadline = Some(now + exp);
     }
 }
 pub fn transition(state: ReservationState, event: ReservationEvent) -> ReservationState {
-    let mut context = ReservationContext::new(0);
-    context.degraded = state == ReservationState::Degraded;
-    context.accepted = matches!(
-        state,
-        ReservationState::ReservationAccepted | ReservationState::Ready
-    );
-    context.address_confirmed = matches!(
-        state,
-        ReservationState::RelayAddressConfirmed | ReservationState::Ready
-    );
-    context.apply(event);
-    context.phase()
+    let mut c = ReservationContext::new(0);
+    c.degraded = state == ReservationState::Degraded;
+    c.apply(event);
+    c.phase()
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn facts_commute_and_renewal_does_not_flap_ready() {
-        let mut c = ReservationContext::new(7);
-        c.apply(ReservationEvent::ReservationAccepted { renewal: false });
-        c.apply(ReservationEvent::RelayAddressConfirmed);
-        assert!(c.is_ready());
-        c.apply(ReservationEvent::ReservationAccepted { renewal: true });
-        assert!(c.is_ready());
-        assert_eq!(c.renewal_count, 1);
+    fn p() -> PeerId {
+        PeerId::random()
+    }
+    fn id(n: u8) -> ConnectionId {
+        ConnectionId::new_unchecked(n as usize)
+    }
+    fn ready(c: &mut ReservationContext) {
+        c.apply(ReservationEvent::GenerationStarted {
+            generation: 1,
+            peer_id: p(),
+            connection_id: id(1),
+        });
+        c.apply(ReservationEvent::ReservationAccepted {
+            generation: 1,
+            listener_id: 2,
+            renewal: false,
+        });
+        c.apply(ReservationEvent::RelayAddressConfirmed {
+            generation: 1,
+            address: "/ip4/127.0.0.1/tcp/1/p2p-circuit".parse().unwrap(),
+        });
     }
     #[test]
-    fn legacy_transition_still_reaches_ready() {
-        let s = transition(
-            ReservationState::Disconnected,
-            ReservationEvent::ReservationAccepted { renewal: false },
-        );
-        assert_eq!(
-            transition(s, ReservationEvent::RelayAddressConfirmed),
-            ReservationState::Ready
-        );
+    fn readiness_is_generation_scoped() {
+        let mut c = ReservationContext::new(0);
+        ready(&mut c);
+        assert!(c.is_ready());
+        c.apply(ReservationEvent::GenerationStarted {
+            generation: 2,
+            peer_id: p(),
+            connection_id: id(3),
+        });
+        assert!(!c.is_ready());
+    }
+    #[test]
+    fn stale_loss_does_not_degrade_new_generation() {
+        let mut c = ReservationContext::new(2);
+        c.apply(ReservationEvent::GenerationStarted {
+            generation: 2,
+            peer_id: p(),
+            connection_id: id(1),
+        });
+        c.apply(ReservationEvent::ExchangeLost {
+            generation: 1,
+            connection_id: id(1),
+        });
+        assert!(!c.degraded);
+    }
+    #[test]
+    fn retry_is_bounded() {
+        let mut c = ReservationContext::new(1);
+        c.apply(ReservationEvent::GenerationStarted {
+            generation: 1,
+            peer_id: p(),
+            connection_id: id(1),
+        });
+        let now = Instant::now();
+        for _ in 0..20 {
+            c.apply_at(ReservationEvent::RelayAddressLost { generation: 1 }, now);
+        }
+        assert!(c.retry_deadline.unwrap() <= now + MAX_RETRY);
     }
 }

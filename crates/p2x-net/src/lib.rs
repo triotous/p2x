@@ -8,5 +8,8 @@ pub mod reservation;
 pub use connection_book::{
     ConnectionBook, ConnectionId, ConnectionRecord, PathKind, TransportKind,
 };
-pub use path_selector::{FallbackReason, PathAttempt, PathDecision, PathState};
+pub use path_selector::{
+    AttemptId, PathAction, PathAttempt, PathDecision, PathEvent, PathEventKind, PathFailure,
+    PathState,
+};
 pub use reservation::{ReservationContext, ReservationEvent, ReservationState};
