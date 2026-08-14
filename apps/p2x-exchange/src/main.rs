@@ -36,6 +36,6 @@ async fn main() -> io::Result<()> {
     loop {
         tokio::select! { _ = tokio::signal::ctrl_c() => break, event = swarm.select_next_some() => { if let SwarmEvent::NewListenAddr { address, .. } = event { emitter.event("listen_addr", Some(&address.to_string()))?; } } }
     }
-    emitter.event("stopped", None)?;
+    emitter.terminal("stopped", "shutdown")?;
     Ok(())
 }
