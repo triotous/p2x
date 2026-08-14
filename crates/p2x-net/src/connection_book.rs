@@ -7,6 +7,7 @@ use std::{
 
 pub type ConnectionId = Libp2pConnectionId;
 pub const MAX_PENDING_DCUTR: usize = 128;
+pub const MAX_CONNECTION_LIFECYCLES: usize = 512;
 pub const TOMBSTONE_TTL: Duration = Duration::from_secs(20);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportKind {
@@ -38,14 +39,28 @@ pub struct ConnectionRecord {
     pub dcutr_confirmed: bool,
     pub last_ping: Option<Instant>,
 }
-#[derive(Default)]
 pub struct ConnectionBook {
+    expected_exchange: Option<PeerId>,
     next_sequence: u64,
     records: HashMap<(PeerId, ConnectionId), ConnectionRecord>,
     pending_dcutr: HashMap<(PeerId, ConnectionId), Instant>,
     tombstones: HashMap<(PeerId, ConnectionId), Instant>,
 }
+impl Default for ConnectionBook {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
 impl ConnectionBook {
+    pub fn new(expected_exchange: Option<PeerId>) -> Self {
+        Self {
+            expected_exchange,
+            next_sequence: 0,
+            records: HashMap::new(),
+            pending_dcutr: HashMap::new(),
+            tombstones: HashMap::new(),
+        }
+    }
     pub fn on_connection_established(
         &mut self,
         peer_id: PeerId,
@@ -56,6 +71,11 @@ impl ConnectionBook {
         self.sweep(now);
         let key = (peer_id, connection_id);
         if self.tombstones.contains_key(&key) {
+            return;
+        }
+        if matches!(classify_connected_point(endpoint), PathKind::Relay { .. })
+            && !self.valid_relay(endpoint.get_remote_address())
+        {
             return;
         }
         if let Some(record) = self.records.get_mut(&key) {
@@ -115,7 +135,9 @@ impl ConnectionBook {
         let key = (peer_id, connection_id);
         self.records.remove(&key);
         self.pending_dcutr.remove(&key);
-        Self::insert_bounded(&mut self.tombstones, key, now + TOMBSTONE_TTL);
+        if self.tombstones.len() < MAX_CONNECTION_LIFECYCLES {
+            self.tombstones.insert(key, now + TOMBSTONE_TTL);
+        }
     }
     pub fn mark_ping(&mut self, peer_id: PeerId, connection_id: ConnectionId, now: Instant) {
         if let Some(r) = self.records.get_mut(&(peer_id, connection_id)) {
@@ -159,6 +181,13 @@ impl ConnectionBook {
     }
     pub fn tombstone_count(&self) -> usize {
         self.tombstones.len()
+    }
+    fn valid_relay(&self, address: &Multiaddr) -> bool {
+        self.expected_exchange.is_some_and(|expected| {
+            address
+                .iter()
+                .any(|p| matches!(p, Protocol::P2p(peer) if peer == expected))
+        })
     }
     fn insert_bounded(
         map: &mut HashMap<(PeerId, ConnectionId), Instant>,
