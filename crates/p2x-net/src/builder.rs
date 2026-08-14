@@ -13,6 +13,22 @@ pub const IDLE_TIMEOUT_SECONDS: u64 = 120;
 pub const PING_INTERVAL_SECONDS: u64 = 15;
 pub const PING_TIMEOUT_SECONDS: u64 = 5;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RelayProfile {
+    #[default]
+    DefaultLab,
+    LimitTest,
+}
+impl RelayProfile {
+    pub fn config(self) -> relay::Config {
+        let mut c = relay::Config::default();
+        if matches!(self, Self::LimitTest) {
+            c.max_circuits = 8;
+        }
+        c
+    }
+}
+
 pub fn lab_identity(seed: Option<u64>) -> Result<libp2p::identity::Keypair, BuildError> {
     match seed {
         None => Ok(libp2p::identity::Keypair::generate_ed25519()),
@@ -36,6 +52,7 @@ pub struct SwarmConfig {
     pub tcp_listen: Option<libp2p::Multiaddr>,
     pub quic_listen: Option<libp2p::Multiaddr>,
     pub allow_public: bool,
+    pub relay_profile: RelayProfile,
 }
 #[derive(Debug, Error)]
 pub enum BuildError {
@@ -144,14 +161,18 @@ pub fn build_exchange_swarm(
     libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
-            tcp::Config::default(),
+            tcp::Config::default().nodelay(true),
             noise::Config::new,
-            yamux::Config::default,
+            || {
+                let mut config = yamux::Config::default();
+                config.set_max_num_streams(MAX_STREAMS);
+                config
+            },
         )
         .map_err(|e| BuildError::Builder(e.to_string()))?
         .with_quic()
         .with_behaviour(|_| ExchangeBehaviour {
-            relay: relay::Behaviour::new(peer_id, relay::Config::default()),
+            relay: relay::Behaviour::new(peer_id, config.relay_profile.config()),
             identify: identify::Behaviour::new(identify::Config::new(
                 IDENTIFY_PROTOCOL.to_owned(),
                 public_key,
@@ -180,9 +201,13 @@ pub fn build_peer_swarm(
     libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
-            tcp::Config::default(),
+            tcp::Config::default().nodelay(true),
             noise::Config::new,
-            yamux::Config::default,
+            || {
+                let mut config = yamux::Config::default();
+                config.set_max_num_streams(MAX_STREAMS);
+                config
+            },
         )
         .map_err(|e| BuildError::Builder(e.to_string()))?
         .with_quic()
@@ -225,7 +250,14 @@ mod tests {
     #[test]
     fn concrete_swarms_build_with_loopback_config() {
         let key = libp2p::identity::Keypair::generate_ed25519();
-        build_exchange_swarm(key, SwarmConfig::default()).unwrap();
+        build_exchange_swarm(
+            key,
+            SwarmConfig {
+                relay_profile: RelayProfile::DefaultLab,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let key = libp2p::identity::Keypair::generate_ed25519();
         build_peer_swarm(key, SwarmConfig::default()).unwrap();
     }
