@@ -3,6 +3,29 @@ use std::io::{Read, Write};
 use thiserror::Error;
 
 pub const MAX_HEADER: usize = 4096;
+pub const MAX_TRANSFER: u64 = 16 * 1024 * 1024;
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeTerminal {
+    Ok,
+    Malformed,
+    Truncated,
+    Timeout,
+    Io,
+}
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProbeAck {
+    pub nonce: u64,
+    pub request_id: u64,
+    pub path: String,
+    pub connection_id_hash: u64,
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+    pub read_hash: u64,
+    pub write_hash: u64,
+    pub half_close: bool,
+    pub terminal: ProbeTerminal,
+}
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeMode {
@@ -30,7 +53,14 @@ pub fn decode_header(bytes: &[u8]) -> Result<ProbeHeader, ProbeError> {
     if bytes.len() > MAX_HEADER {
         return Err(ProbeError::TooLarge);
     }
-    serde_json::from_slice(bytes).map_err(|e| ProbeError::Invalid(e.to_string()))
+    let header: ProbeHeader =
+        serde_json::from_slice(bytes).map_err(|e| ProbeError::Invalid(e.to_string()))?;
+    if header.length > MAX_TRANSFER {
+        return Err(ProbeError::Invalid(
+            "length exceeds configured transfer limit".into(),
+        ));
+    }
+    Ok(header)
 }
 pub fn read_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, ProbeError> {
     let mut prefix = [0; 4];
@@ -88,6 +118,35 @@ mod tests {
         assert_eq!(
             read_frame(&mut &[0, 0, 0, 2, b'{'][..]),
             Err(ProbeError::Truncated)
+        );
+    }
+    #[test]
+    fn rejects_transfer_above_configured_limit() {
+        let body = serde_json::to_vec(&ProbeHeader {
+            mode: ProbeMode::NonceEcho,
+            nonce: 1,
+            length: MAX_TRANSFER + 1,
+        })
+        .unwrap();
+        assert!(matches!(decode_header(&body), Err(ProbeError::Invalid(_))));
+    }
+    #[test]
+    fn ack_round_trips_with_stable_terminal_code() {
+        let ack = ProbeAck {
+            nonce: 1,
+            request_id: 2,
+            path: "direct".into(),
+            connection_id_hash: 3,
+            bytes_read: 4,
+            bytes_written: 5,
+            read_hash: 6,
+            write_hash: 7,
+            half_close: true,
+            terminal: ProbeTerminal::Ok,
+        };
+        assert_eq!(
+            serde_json::from_slice::<ProbeAck>(&serde_json::to_vec(&ack).unwrap()).unwrap(),
+            ack
         );
     }
     #[test]
