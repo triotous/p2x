@@ -65,6 +65,9 @@ pub fn load_or_create_identity(config: &IdentityConfig) -> Result<LoadedIdentity
     };
     let keypair =
         Keypair::from_protobuf_encoding(&bytes).map_err(|_| IdentityError::InvalidEncoding)?;
+    if keypair.key_type() != libp2p_identity::KeyType::Ed25519 {
+        return Err(IdentityError::InvalidEncoding);
+    }
     let peer_id = PeerId::from_public_key(&keypair.public());
     let fingerprint = hex(&Sha256::digest(keypair.public().encode_protobuf()));
     Ok(LoadedIdentity {

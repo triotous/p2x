@@ -5,12 +5,14 @@ use std::{env, fs, path::Path};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "lowercase")]
 pub enum CredentialRole {
     Client,
     Server,
 }
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialRecord {
     pub credential_id: String,
     pub token_sha256: String,
