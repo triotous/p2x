@@ -33,6 +33,8 @@ struct Args {
     case_id: String,
     #[arg(long, default_value_t = 300)]
     worker_timeout_secs: u64,
+    #[arg(long, default_value_t = false)]
+    drop_first_probe: bool,
 }
 
 struct WorkerResult {
@@ -64,6 +66,7 @@ async fn main() -> io::Result<()> {
     let mut worker_admission = WorkerAdmission::default();
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerResult>(128);
     let mut resource_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut first_probe_dropped = false;
     if let Some(exchange) = args.exchange {
         let relay_peer = exchange
             .iter()
@@ -196,6 +199,14 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::Behaviour(PeerEvent::Relay(_)) => {}
                     SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundOpened { mut stream, peer_id, connection_id })) => {
+                        if args.drop_first_probe && !first_probe_dropped {
+                            first_probe_dropped = true;
+                            swarm.behaviour_mut().probe_stream.inbound_release(peer_id);
+                            swarm.close_connection(connection_id);
+                            emitter.emit(&LifecycleRecord::OperationalError { code: "probe.fault_drop_first", message: "selected connection closed during payload" })?;
+                            drop(stream);
+                            continue;
+                        }
                         let path = connection_paths.get(&connection_id).copied().unwrap_or(ProbePath::Relay);
                         if let Err(error) = worker_admission.admit(peer_id) {
                             swarm.behaviour_mut().probe_stream.inbound_release(peer_id);

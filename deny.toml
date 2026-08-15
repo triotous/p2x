@@ -1,8 +1,16 @@
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = [
+  { id = "RUSTSEC-2026-0118", reason = "hickory-proto is compiled without dnssec-ring/dnssec-aws-lc-rs, so DnssecDnsHandle is unreachable; remove when libp2p-dns moves to hickory 0.26.1+" },
+  { id = "RUSTSEC-2026-0119", reason = "the lab DNS transport encodes bounded resolver queries, not attacker-supplied record sets; remove when libp2p-dns moves to hickory-proto 0.26.1+" },
+  { id = "RUSTSEC-2024-0436", reason = "paste is an unmaintained build dependency reached through if-watch/netlink on Linux, with no reported vulnerability; remove with the next compatible libp2p/if-watch update" },
+]
 
 [licenses]
-allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0"]
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+
+[licenses.private]
+ignore = true
 
 [bans]
 multiple-versions = "warn"
