@@ -20,6 +20,7 @@ struct FailureBucket {
 #[derive(Default)]
 pub struct AdmissionLedger {
     connections: usize,
+    peer_connections: HashMap<String, usize>,
     inflight: usize,
     peer_inflight: HashMap<String, usize>,
     failures: HashMap<String, FailureBucket>,
@@ -32,8 +33,21 @@ impl AdmissionLedger {
         self.connections += 1;
         Admission::Accepted
     }
-    pub fn close_connection(&mut self) {
+    pub fn admit_peer_connection(&mut self, peer: &str) -> Admission {
+        if self.peer_connections.get(peer).copied().unwrap_or(0) >= 2 {
+            return Admission::Rejected(PublicErrorCode::LimitAuthConnections);
+        }
+        *self.peer_connections.entry(peer.to_owned()).or_default() += 1;
+        Admission::Accepted
+    }
+    pub fn close_connection(&mut self, peer: &str) {
         self.connections = self.connections.saturating_sub(1);
+        if let Some(n) = self.peer_connections.get_mut(peer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.peer_connections.remove(peer);
+            }
+        }
     }
     pub fn begin_auth(&mut self, peer: &str, now: i64) -> Admission {
         self.sweep(now);
@@ -95,7 +109,7 @@ mod tests {
             a.admit_connection(),
             Admission::Rejected(PublicErrorCode::LimitAuthConnections)
         );
-        a.close_connection();
+        a.close_connection("p");
         assert_eq!(a.begin_auth("p", 0), Admission::Accepted);
         assert_eq!(
             a.begin_auth("p", 0),
