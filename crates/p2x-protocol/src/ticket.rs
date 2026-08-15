@@ -62,6 +62,11 @@ fn text(b: &[u8], p: &mut usize) -> Result<String, TicketError> {
     let n = u16v(b, p)? as usize;
     String::from_utf8(take(b, p, n)?.to_vec()).map_err(|_| TicketError::Invalid)
 }
+fn validate_peer(bytes: &[u8]) -> Result<(), TicketError> {
+    libp2p_identity::PeerId::from_bytes(bytes)
+        .map(|_| ())
+        .map_err(|_| TicketError::Invalid)
+}
 fn put_bytes(o: &mut Vec<u8>, v: &[u8]) -> Result<(), TicketError> {
     if v.len() > u8::MAX as usize {
         return Err(TicketError::Invalid);
@@ -80,6 +85,9 @@ fn put_text(o: &mut Vec<u8>, v: &str) -> Result<(), TicketError> {
 }
 impl ConnectionTicketClaimsV1 {
     pub fn encode(&self) -> Result<Vec<u8>, TicketError> {
+        validate_peer(&self.issuer_exchange_peer_id)?;
+        validate_peer(&self.client_peer_id)?;
+        validate_peer(&self.server_peer_id)?;
         if self.issuer_exchange_peer_id.is_empty()
             || self.client_peer_id.is_empty()
             || self.server_peer_id.is_empty()
@@ -232,12 +240,16 @@ pub fn verify_envelope(e: &[u8], key_id: [u8; 16], key: &VerifyingKey) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    const PEER: &[u8] = &[
+        0, 36, 8, 1, 18, 32, 107, 117, 237, 81, 229, 13, 170, 0, 121, 162, 207, 180, 128, 192, 5,
+        180, 135, 200, 156, 15, 161, 190, 109, 221, 66, 55, 60, 198, 198, 8, 78, 161,
+    ];
     fn claims() -> ConnectionTicketClaimsV1 {
         ConnectionTicketClaimsV1 {
-            issuer_exchange_peer_id: vec![1],
+            issuer_exchange_peer_id: PEER.to_vec(),
             tenant: "t".into(),
-            client_peer_id: vec![2],
-            server_peer_id: vec![3],
+            client_peer_id: PEER.to_vec(),
+            server_peer_id: PEER.to_vec(),
             upstream_id: "u".into(),
             selector_fingerprint: [4; 32],
             registration_revision: 1,

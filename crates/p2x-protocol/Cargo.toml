@@ -7,7 +7,7 @@ publish.workspace = true
 [dependencies]
 ed25519-dalek.workspace = true
 base64.workspace = true
-libp2p-identity.workspace = true
+libp2p-identity = { workspace = true, features = ["peerid", "rand"] }
 serde.workspace = true
 sha2.workspace = true
 subtle.workspace = true

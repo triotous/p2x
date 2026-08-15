@@ -56,7 +56,19 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), SecretFileErro
     let mut file = options.open(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    fs::rename(&tmp, path)?;
+    match fs::hard_link(&tmp, path) {
+        Ok(()) => {
+            fs::remove_file(&tmp)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&tmp);
+            return Err(SecretFileError::Io(error));
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(SecretFileError::Io(error));
+        }
+    }
     let directory = OpenOptions::new().read(true).open(parent)?;
     directory.sync_all()?;
     Ok(())

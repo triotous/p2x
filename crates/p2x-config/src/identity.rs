@@ -45,8 +45,18 @@ pub fn load_or_create_identity(config: &IdentityConfig) -> Result<LoadedIdentity
             let bytes = key
                 .to_protobuf_encoding()
                 .map_err(|_| IdentityError::InvalidEncoding)?;
-            write_secret_file(&config.path, &bytes).map_err(|error| if matches!(error, SecretFileError::Io(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists) { IdentityError::AlreadyExists } else { IdentityError::File(error) })?;
-            bytes
+            match write_secret_file(&config.path, &bytes) {
+                Ok(()) => bytes,
+                Err(SecretFileError::Io(error))
+                    if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    return load_or_create_identity(&IdentityConfig {
+                        path: config.path.clone(),
+                        generate_if_missing: false,
+                    });
+                }
+                Err(error) => return Err(IdentityError::File(error)),
+            }
         }
         Err(SecretFileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(IdentityError::MissingWithoutGeneration);
