@@ -128,6 +128,32 @@ pub async fn read_pattern<R: AsyncRead + Unpin>(
     Ok(StreamStats { bytes, hash })
 }
 
+pub async fn read_pattern_futures<R: FuturesRead + Unpin>(
+    reader: &mut R,
+    length: u64,
+) -> io::Result<StreamStats> {
+    if length > MAX_TRANSFER {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "transfer exceeds configured limit",
+        ));
+    }
+    let mut buffer = [0u8; BUFFER_SIZE];
+    let mut remaining = length;
+    let mut bytes = 0;
+    let mut hash = FNV_OFFSET;
+    while remaining != 0 {
+        let count = remaining.min(BUFFER_SIZE as u64) as usize;
+        reader.read_exact(&mut buffer[..count]).await?;
+        for byte in &buffer[..count] {
+            hash = (hash ^ *byte as u64).wrapping_mul(FNV_PRIME);
+        }
+        remaining -= count as u64;
+        bytes += count as u64;
+    }
+    Ok(StreamStats { bytes, hash })
+}
+
 pub async fn execute_header<R, W>(reader: &mut R, writer: &mut W) -> Result<ProbeHeader, ProbeError>
 where
     R: AsyncRead + Unpin,
@@ -269,6 +295,17 @@ where
 {
     let body = read_frame_futures(stream).await?;
     let header = decode_header(&body)?;
+    let written = match header.mode {
+        ProbeMode::NonceEcho => StreamStats { bytes: 0, hash: 0 },
+        ProbeMode::HalfClose | ProbeMode::SlowReader => stream_pattern_futures(
+            stream,
+            header.length,
+            header.slow_delay_ms,
+            header.slow_chunk_size,
+        )
+        .await
+        .map_err(|_| ProbeError::Truncated)?,
+    };
     let ack = ProbeAck {
         schema_version: SCHEMA_VERSION,
         nonce: header.nonce,
@@ -276,16 +313,63 @@ where
         path,
         connection_id_hash,
         bytes_read: 0,
-        bytes_written: 0,
+        bytes_written: written.bytes,
         read_hash: 0,
-        write_hash: 0,
-        half_close: false,
+        write_hash: written.hash,
+        half_close: header.mode == ProbeMode::HalfClose,
         terminal: ProbeTerminal::Ok,
     };
     let encoded =
         serde_json::to_vec(&ack).map_err(|error| ProbeError::Invalid(error.to_string()))?;
     write_frame_futures(stream, &encoded).await?;
+    if header.mode == ProbeMode::HalfClose {
+        stream.close().await.map_err(|_| ProbeError::Truncated)?;
+    }
     Ok(ack)
+}
+
+pub async fn stream_pattern_futures<W: FuturesWrite + Unpin>(
+    writer: &mut W,
+    length: u64,
+    delay_ms: u32,
+    requested_chunk: u32,
+) -> io::Result<StreamStats> {
+    if length > MAX_TRANSFER {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "transfer exceeds configured limit",
+        ));
+    }
+    let chunk = if requested_chunk == 0 {
+        BUFFER_SIZE
+    } else {
+        requested_chunk as usize
+    };
+    if chunk > BUFFER_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "chunk exceeds buffer limit",
+        ));
+    }
+    let mut buffer = [0u8; BUFFER_SIZE];
+    let mut offset = 0;
+    let mut hash = FNV_OFFSET;
+    while offset < length {
+        let count = (length - offset).min(chunk as u64) as usize;
+        for (index, byte) in buffer[..count].iter_mut().enumerate() {
+            *byte = pattern_byte(offset + index as u64);
+            hash = (hash ^ *byte as u64).wrapping_mul(FNV_PRIME);
+        }
+        writer.write_all(&buffer[..count]).await?;
+        offset += count as u64;
+        if delay_ms != 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+        }
+    }
+    Ok(StreamStats {
+        bytes: offset,
+        hash,
+    })
 }
 
 #[cfg(test)]
@@ -328,6 +412,17 @@ mod tests {
         let stats = read_pattern(&mut reader, 1024).await.unwrap();
         assert_eq!(stats.bytes, 1024);
         assert_eq!(stats, task.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn futures_worker_streams_slow_reader_payload() {
+        let mut output = futures::io::Cursor::new(Vec::new());
+        let stats = stream_pattern_futures(&mut output, 1024, 0, 17)
+            .await
+            .unwrap();
+        assert_eq!(stats.bytes, 1024);
+        assert_eq!(stats.hash, stream_hash(output.get_ref()));
+        assert_eq!(output.get_ref()[251], 0);
     }
 
     fn stream_hash(bytes: &[u8]) -> u64 {

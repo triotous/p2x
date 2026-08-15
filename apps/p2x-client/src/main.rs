@@ -28,6 +28,10 @@ struct Args {
     path: Path,
     #[arg(long, default_value_t = 1)]
     count: u64,
+    #[arg(long, default_value = "nonce_echo")]
+    mode: String,
+    #[arg(long, default_value_t = 0)]
+    length: u64,
 }
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -57,6 +61,7 @@ async fn main() -> io::Result<()> {
         swarm.dial(address).map_err(io::Error::other)?;
     }
     let mut remaining = args.count;
+    let mut completed = 0u64;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
@@ -72,9 +77,19 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Probe(output)) => match output {
                         ProbeOutput::OutboundOpened { stream, request_id, peer_id, connection_id } => {
                             let mut stream = stream;
-                            let header = ProbeHeader { schema_version: SCHEMA_VERSION, request_id: request_id.0, mode: ProbeMode::NonceEcho, nonce: request_id.0, length: 0, slow_delay_ms: 0, slow_chunk_size: 0 };
+                            let mode = match args.mode.as_str() {
+                                "nonce_echo" => ProbeMode::NonceEcho,
+                                "half_close" => ProbeMode::HalfClose,
+                                "slow_reader" => ProbeMode::SlowReader,
+                                other => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown probe mode: {other}"))),
+                            };
+                            let header = ProbeHeader { schema_version: SCHEMA_VERSION, request_id: request_id.0, mode, nonce: request_id.0, length: args.length, slow_delay_ms: if mode == ProbeMode::SlowReader { 1 } else { 0 }, slow_chunk_size: if mode == ProbeMode::SlowReader { 1024 } else { 0 } };
                             let body = serde_json::to_vec(&header).map_err(io::Error::other)?;
                             write_frame_futures(&mut stream, &body).await.map_err(io::Error::other)?;
+                            if header.length != 0 {
+                                let stats = p2x_net::probe_worker::read_pattern_futures(&mut stream, header.length).await.map_err(io::Error::other)?;
+                                emitter.event("probe_payload", Some(&format!("bytes={} hash={}", stats.bytes, stats.hash)))?;
+                            }
                             stream.close().await.map_err(io::Error::other)?;
                             let ack_body = read_frame_futures(&mut stream).await.map_err(io::Error::other)?;
                             let ack: ProbeAck = serde_json::from_slice(&ack_body).map_err(io::Error::other)?;
@@ -82,8 +97,11 @@ async fn main() -> io::Result<()> {
                                 return Err(io::Error::new(io::ErrorKind::InvalidData, "probe acknowledgement mismatch"));
                             }
                             emitter.event("probe_succeeded", Some(&format!("peer_id={peer_id} connection_id={connection_id:?} path={:?}", ack.path)))?;
-                            emitter.terminal("passed", "probe.ok")?;
-                            return Ok(());
+                            completed += 1;
+                            if completed == args.count {
+                                emitter.terminal("passed", "probe.ok")?;
+                                return Ok(());
+                            }
                         }
                         ProbeOutput::OutboundFailed { code, .. } => {
                             emitter.terminal("failed", code)?;
