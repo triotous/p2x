@@ -17,7 +17,11 @@ pub enum SecretFileError {
     UnsafePermissions,
 }
 pub fn read_secret_file(path: &Path) -> Result<Vec<u8>, SecretFileError> {
-    let metadata = fs::symlink_metadata(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
     if !metadata.file_type().is_file()
         || metadata.len() == 0
         || metadata.len() as usize > MAX_SECRET_FILE
@@ -27,14 +31,10 @@ pub fn read_secret_file(path: &Path) -> Result<Vec<u8>, SecretFileError> {
     if metadata.mode() & 0o077 != 0 {
         return Err(SecretFileError::UnsafePermissions);
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(MAX_SECRET_FILE));
     file.take((MAX_SECRET_FILE + 1) as u64)
         .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_SECRET_FILE {
+    if bytes.is_empty() || bytes.len() > MAX_SECRET_FILE || bytes.len() as u64 != metadata.len() {
         return Err(SecretFileError::InvalidSize);
     }
     Ok(bytes)
@@ -57,7 +57,14 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), SecretFileErro
     ));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
+    struct TempFileGuard(PathBuf);
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
     let mut file = options.open(&tmp)?;
+    let _guard = TempFileGuard(tmp.clone());
     file.write_all(bytes)?;
     file.sync_all()?;
     match fs::hard_link(&tmp, path) {

@@ -14,7 +14,7 @@ pub enum CredentialRole {
     Client,
     Server,
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialRecord {
     pub credential_id: String,
@@ -45,7 +45,7 @@ where
     }
     deserializer.deserialize_bool(StrictBool)
 }
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FixedTokenFile {
     pub schema_version: u16,
@@ -114,7 +114,11 @@ impl FixedTokenFile {
                 }
                 seen_scopes |= bit;
             }
-            if matches!(record.role, CredentialRole::Client) && seen_scopes & 2 != 0 {
+            let allowed = match record.role {
+                CredentialRole::Client => 4,
+                CredentialRole::Server => 3,
+            };
+            if seen_scopes & !allowed != 0 {
                 return Err(CredentialConfigError::Invalid("role scope"));
             }
             let digest = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -128,6 +132,31 @@ impl FixedTokenFile {
             }
         }
         Ok(())
+    }
+}
+impl fmt::Debug for CredentialRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CredentialRecord")
+            .field("credential_id", &self.credential_id)
+            .field("token_sha256", &"REDACTED")
+            .field("peer_id", &self.peer_id)
+            .field("tenant", &self.tenant)
+            .field("role", &self.role)
+            .field("scopes", &self.scopes)
+            .field("quota_profile", &self.quota_profile)
+            .field("not_before", &self.not_before)
+            .field("expires_at", &self.expires_at)
+            .field("revoked", &self.revoked)
+            .finish()
+    }
+}
+impl fmt::Debug for FixedTokenFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FixedTokenFile")
+            .field("schema_version", &self.schema_version)
+            .field("authorization_revision", &self.authorization_revision)
+            .field("credentials", &self.credentials)
+            .finish()
     }
 }
 #[derive(Debug)]

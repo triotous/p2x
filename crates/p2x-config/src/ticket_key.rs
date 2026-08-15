@@ -24,8 +24,8 @@ pub enum TicketKeyError {
     ConfigurationYaml(#[source] serde_yaml::Error),
 }
 pub struct TicketKey {
-    pub signing: SigningKey,
-    pub key_id: [u8; 16],
+    signing: SigningKey,
+    key_id: [u8; 16],
 }
 impl std::fmt::Debug for TicketKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -58,8 +58,15 @@ impl TicketKey {
         key_id.copy_from_slice(&digest[..16]);
         Self { signing, key_id }
     }
+    pub fn key_id(&self) -> [u8; 16] {
+        self.key_id
+    }
     pub fn public(&self) -> VerifyingKey {
         self.signing.verifying_key()
+    }
+    pub fn sign(&self, message: &[u8]) -> ed25519_dalek::Signature {
+        use ed25519_dalek::Signer;
+        self.signing.sign(message)
     }
 }
 #[derive(Clone, Debug, Deserialize)]
@@ -176,15 +183,15 @@ mod tests {
         let key = TicketKey::from_seed([9; 32]);
         let mut ring = VerificationKeyRing::default();
         ring.add(VerificationKey {
-            key_id: key.key_id,
+            key_id: key.key_id(),
             public: key.public(),
             activates_at: 10,
             retires_at: Some(20),
         })
         .unwrap();
-        assert!(ring.get(key.key_id, 9).is_none());
-        assert!(ring.get(key.key_id, 10).is_some());
-        assert!(ring.get(key.key_id, 20).is_none());
+        assert!(ring.get(key.key_id(), 9).is_none());
+        assert!(ring.get(key.key_id(), 10).is_some());
+        assert!(ring.get(key.key_id(), 20).is_none());
     }
     #[test]
     fn key_id_is_stable_and_debug_redacts() {
@@ -211,7 +218,7 @@ mod tests {
             .collect::<String>();
         std::fs::write(&path, format!("schema_version: 1\nkeys:\n  - key_id: {id}\n    public_key: {public}\n    activates_at: 1\n    retires_at: 2\n")).unwrap();
         let ring = VerificationKeyRing::load(&path).unwrap();
-        assert!(ring.get(key.key_id, 1).is_some());
+        assert!(ring.get(key.key_id(), 1).is_some());
         std::fs::write(&path, "schema_version: 1\nkeys: []\nextra: true\n").unwrap();
         assert!(matches!(
             VerificationKeyRing::load(&path),

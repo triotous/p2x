@@ -1,6 +1,7 @@
 use base64::Engine;
 use p2x_protocol::{CredentialId, QuotaProfile, Role, Tenant, TokenDigest, TokenSecret};
 use std::collections::HashMap;
+use std::fmt;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +36,17 @@ pub enum AuthFailure {
     #[error("forbidden role")]
     ForbiddenRole,
 }
+pub trait CredentialProvider {
+    fn authenticate(
+        &self,
+        peer_id: &str,
+        id: &CredentialId,
+        secret: &TokenSecret,
+        requested_role: Role,
+        now: i64,
+    ) -> Result<AuthPrincipal, AuthFailure>;
+}
+
 pub struct FixedTokenProvider {
     revision: u64,
     credentials: HashMap<CredentialId, CredentialBinding>,
@@ -153,6 +165,26 @@ impl FixedTokenProvider {
             credential_expires_at: binding.expires_at,
             credential_digest: binding.digest.clone(),
         })
+    }
+}
+impl CredentialProvider for FixedTokenProvider {
+    fn authenticate(
+        &self,
+        peer_id: &str,
+        id: &CredentialId,
+        secret: &TokenSecret,
+        requested_role: Role,
+        now: i64,
+    ) -> Result<AuthPrincipal, AuthFailure> {
+        Self::authenticate(self, peer_id, id, secret, requested_role, now)
+    }
+}
+impl fmt::Debug for FixedTokenProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FixedTokenProvider")
+            .field("revision", &self.revision)
+            .field("credentials", &self.credentials.len())
+            .finish()
     }
 }
 #[cfg(test)]
