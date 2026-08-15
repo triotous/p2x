@@ -1,13 +1,12 @@
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
-use futures::io::AsyncWriteExt;
 use libp2p::{Multiaddr, swarm::SwarmEvent};
 use p2x_net::{
     builder::{PeerSwarmConfig, build_peer_swarm, lab_identity, start_peer_listeners},
     lifecycle::Emitter,
-    probe::{ProbeAck, ProbeHeader, ProbeMode, SCHEMA_VERSION},
+    probe::{ProbeHeader, ProbeMode, SCHEMA_VERSION},
     probe_stream::behaviour::ProbeOutput,
-    probe_worker::{read_frame_futures, write_frame_futures},
+    probe_worker::execute_probe_client_futures,
 };
 use std::io;
 
@@ -101,18 +100,7 @@ async fn main() -> io::Result<()> {
                                 other => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown probe mode: {other}"))),
                             };
                             let header = ProbeHeader { schema_version: SCHEMA_VERSION, request_id: request_id.0, mode, nonce: request_id.0, length: args.length, slow_delay_ms: 0, slow_chunk_size: if mode == ProbeMode::SlowReader { 32 * 1024 } else { 0 } };
-                            let body = serde_json::to_vec(&header).map_err(io::Error::other)?;
-                            write_frame_futures(&mut stream, &body).await.map_err(io::Error::other)?;
-                            if header.length != 0 {
-                                let stats = p2x_net::probe_worker::read_pattern_futures(&mut stream, header.length).await.map_err(io::Error::other)?;
-                                emitter.event("probe_payload", Some(&format!("bytes={} hash={}", stats.bytes, stats.hash)))?;
-                            }
-                            let ack_body = read_frame_futures(&mut stream).await.map_err(io::Error::other)?;
-                            stream.close().await.map_err(io::Error::other)?;
-                            let ack: ProbeAck = serde_json::from_slice(&ack_body).map_err(io::Error::other)?;
-                            if ack.nonce != header.nonce || ack.request_id != header.request_id {
-                                return Err(io::Error::new(io::ErrorKind::InvalidData, "probe acknowledgement mismatch"));
-                            }
+                            let ack = execute_probe_client_futures(&mut stream, &header).await.map_err(io::Error::other)?;
                             emitter.event("probe_succeeded", Some(&format!("peer_id={peer_id} connection_id={connection_id:?} path={:?}", ack.path)))?;
                             completed += 1;
                             if completed == args.count {

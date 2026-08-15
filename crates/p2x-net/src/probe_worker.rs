@@ -6,12 +6,16 @@ use futures::io::{
     AsyncRead as FuturesRead, AsyncReadExt as FuturesReadExt, AsyncWrite as FuturesWrite,
     AsyncWriteExt as FuturesWriteExt,
 };
+use libp2p::PeerId;
+use std::collections::HashMap;
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{Duration, timeout};
 
 pub const BUFFER_SIZE: usize = 32 * 1024;
 pub const WORKER_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_WORKERS: usize = 128;
+pub const MAX_WORKERS_PER_PEER: usize = 64;
 const FNV_OFFSET: u64 = 1469598103934665603;
 const FNV_PRIME: u64 = 1099511628211;
 
@@ -19,6 +23,45 @@ const FNV_PRIME: u64 = 1099511628211;
 pub struct StreamStats {
     pub bytes: u64,
     pub hash: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct WorkerAdmission {
+    global: usize,
+    per_peer: HashMap<PeerId, usize>,
+    closed: bool,
+}
+
+impl WorkerAdmission {
+    pub fn admit(&mut self, peer: PeerId) -> Result<(), ProbeError> {
+        let peer_count = self.per_peer.get(&peer).copied().unwrap_or(0);
+        if self.closed || self.global >= MAX_WORKERS || peer_count >= MAX_WORKERS_PER_PEER {
+            return Err(ProbeError::AdmissionRejected);
+        }
+        self.global += 1;
+        self.per_peer.insert(peer, peer_count + 1);
+        Ok(())
+    }
+
+    pub fn release(&mut self, peer: PeerId) -> bool {
+        let Some(peer_count) = self.per_peer.get_mut(&peer) else {
+            return false;
+        };
+        self.global -= 1;
+        *peer_count -= 1;
+        if *peer_count == 0 {
+            self.per_peer.remove(&peer);
+        }
+        true
+    }
+
+    pub fn close(&mut self) {
+        self.closed = true;
+    }
+
+    pub const fn admitted(&self) -> usize {
+        self.global
+    }
 }
 
 pub async fn read_frame_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, ProbeError> {
@@ -152,6 +195,58 @@ pub async fn read_pattern_futures<R: FuturesRead + Unpin>(
         bytes += count as u64;
     }
     Ok(StreamStats { bytes, hash })
+}
+
+pub async fn read_pattern_futures_with_delay<R: FuturesRead + Unpin>(
+    reader: &mut R,
+    length: u64,
+    delay_ms: u32,
+    requested_chunk: u32,
+) -> io::Result<StreamStats> {
+    if length > MAX_TRANSFER {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "transfer exceeds configured limit",
+        ));
+    }
+    let chunk = if requested_chunk == 0 {
+        BUFFER_SIZE
+    } else {
+        requested_chunk as usize
+    };
+    if chunk > BUFFER_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "chunk exceeds buffer limit",
+        ));
+    }
+    let mut buffer = [0u8; BUFFER_SIZE];
+    let mut offset = 0;
+    let mut hash = FNV_OFFSET;
+    while offset < length {
+        let count = (length - offset).min(chunk as u64) as usize;
+        reader.read_exact(&mut buffer[..count]).await?;
+        for byte in &buffer[..count] {
+            hash = (hash ^ *byte as u64).wrapping_mul(FNV_PRIME);
+        }
+        offset += count as u64;
+        if delay_ms != 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+        }
+    }
+    Ok(StreamStats {
+        bytes: offset,
+        hash,
+    })
+}
+
+async fn expect_eof_futures<R: FuturesRead + Unpin>(reader: &mut R) -> Result<(), ProbeError> {
+    let mut byte = [0u8; 1];
+    match reader.read(&mut byte).await {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(ProbeError::EofMismatch),
+        Err(error) => Err(ProbeError::Io(error.to_string())),
+    }
 }
 
 pub async fn execute_header<R, W>(reader: &mut R, writer: &mut W) -> Result<ProbeHeader, ProbeError>
@@ -293,18 +388,69 @@ pub async fn execute_probe_futures<S>(
 where
     S: FuturesRead + FuturesWrite + Unpin,
 {
+    execute_probe_futures_with_timeout(stream, path, connection_id_hash, WORKER_TIMEOUT).await
+}
+
+pub async fn execute_probe_futures_with_timeout<S>(
+    stream: &mut S,
+    path: ProbePath,
+    connection_id_hash: u64,
+    deadline: Duration,
+) -> Result<ProbeAck, ProbeError>
+where
+    S: FuturesRead + FuturesWrite + Unpin,
+{
+    timeout(
+        deadline,
+        execute_probe_server_inner(stream, path, connection_id_hash),
+    )
+    .await
+    .map_err(|_| ProbeError::Timeout)?
+}
+
+async fn execute_probe_server_inner<S>(
+    stream: &mut S,
+    path: ProbePath,
+    connection_id_hash: u64,
+) -> Result<ProbeAck, ProbeError>
+where
+    S: FuturesRead + FuturesWrite + Unpin,
+{
     let body = read_frame_futures(stream).await?;
     let header = decode_header(&body)?;
-    let written = match header.mode {
+    let read = match header.mode {
         ProbeMode::NonceEcho => StreamStats { bytes: 0, hash: 0 },
-        ProbeMode::HalfClose | ProbeMode::SlowReader => stream_pattern_futures(
+        ProbeMode::HalfClose => {
+            let stats = read_pattern_futures(stream, header.length)
+                .await
+                .map_err(|error| ProbeError::Io(error.to_string()))?;
+            if stats.hash != crate::probe::pattern_hash(header.length) {
+                return Err(ProbeError::HashMismatch);
+            }
+            expect_eof_futures(stream).await?;
+            stats
+        }
+        ProbeMode::SlowReader => read_pattern_futures_with_delay(
             stream,
             header.length,
             header.slow_delay_ms,
             header.slow_chunk_size,
         )
         .await
-        .map_err(|_| ProbeError::Truncated)?,
+        .map_err(|error| ProbeError::Io(error.to_string()))?,
+    };
+    if header.mode == ProbeMode::SlowReader
+        && read.hash != crate::probe::pattern_hash(header.length)
+    {
+        return Err(ProbeError::HashMismatch);
+    }
+    let written = match header.mode {
+        ProbeMode::NonceEcho => StreamStats { bytes: 0, hash: 0 },
+        ProbeMode::HalfClose | ProbeMode::SlowReader => {
+            stream_pattern_futures(stream, header.length, 0, 0)
+                .await
+                .map_err(|error| ProbeError::Io(error.to_string()))?
+        }
     };
     let ack = ProbeAck {
         schema_version: SCHEMA_VERSION,
@@ -312,9 +458,9 @@ where
         request_id: header.request_id,
         path,
         connection_id_hash,
-        bytes_read: 0,
+        bytes_read: read.bytes,
         bytes_written: written.bytes,
-        read_hash: 0,
+        read_hash: read.hash,
         write_hash: written.hash,
         half_close: header.mode == ProbeMode::HalfClose,
         terminal: ProbeTerminal::Ok,
@@ -324,6 +470,90 @@ where
     write_frame_futures(stream, &encoded).await?;
     if header.mode == ProbeMode::HalfClose {
         stream.close().await.map_err(|_| ProbeError::Truncated)?;
+    }
+    Ok(ack)
+}
+
+pub async fn execute_probe_client_futures<S>(
+    stream: &mut S,
+    header: &ProbeHeader,
+) -> Result<ProbeAck, ProbeError>
+where
+    S: FuturesRead + FuturesWrite + Unpin,
+{
+    execute_probe_client_futures_with_timeout(stream, header, WORKER_TIMEOUT).await
+}
+
+pub async fn execute_probe_client_futures_with_timeout<S>(
+    stream: &mut S,
+    header: &ProbeHeader,
+    deadline: Duration,
+) -> Result<ProbeAck, ProbeError>
+where
+    S: FuturesRead + FuturesWrite + Unpin,
+{
+    timeout(deadline, execute_probe_client_inner(stream, header))
+        .await
+        .map_err(|_| ProbeError::Timeout)?
+}
+
+async fn execute_probe_client_inner<S>(
+    stream: &mut S,
+    header: &ProbeHeader,
+) -> Result<ProbeAck, ProbeError>
+where
+    S: FuturesRead + FuturesWrite + Unpin,
+{
+    let encoded =
+        serde_json::to_vec(header).map_err(|error| ProbeError::Invalid(error.to_string()))?;
+    // Decode locally too so callers cannot bypass the same closed validation used by the server.
+    decode_header(&encoded)?;
+    write_frame_futures(stream, &encoded).await?;
+    let sent = match header.mode {
+        ProbeMode::NonceEcho => StreamStats { bytes: 0, hash: 0 },
+        ProbeMode::HalfClose | ProbeMode::SlowReader => {
+            stream_pattern_futures(stream, header.length, 0, 0)
+                .await
+                .map_err(|error| ProbeError::Io(error.to_string()))?
+        }
+    };
+    if header.mode == ProbeMode::HalfClose {
+        stream
+            .close()
+            .await
+            .map_err(|error| ProbeError::Io(error.to_string()))?;
+    } else {
+        stream
+            .flush()
+            .await
+            .map_err(|error| ProbeError::Io(error.to_string()))?;
+    }
+    let received = match header.mode {
+        ProbeMode::NonceEcho => StreamStats { bytes: 0, hash: 0 },
+        ProbeMode::HalfClose | ProbeMode::SlowReader => read_pattern_futures(stream, header.length)
+            .await
+            .map_err(|error| ProbeError::Io(error.to_string()))?,
+    };
+    if received.hash != sent.hash || received.bytes != sent.bytes {
+        return Err(ProbeError::HashMismatch);
+    }
+    let ack_body = read_frame_futures(stream).await?;
+    let ack: ProbeAck = serde_json::from_slice(&ack_body)
+        .map_err(|error| ProbeError::Invalid(error.to_string()))?;
+    if ack.schema_version != SCHEMA_VERSION
+        || ack.request_id != header.request_id
+        || ack.nonce != header.nonce
+        || ack.bytes_read != sent.bytes
+        || ack.read_hash != sent.hash
+        || ack.bytes_written != received.bytes
+        || ack.write_hash != received.hash
+        || ack.half_close != (header.mode == ProbeMode::HalfClose)
+        || ack.terminal != ProbeTerminal::Ok
+    {
+        return Err(ProbeError::HashMismatch);
+    }
+    if header.mode == ProbeMode::HalfClose {
+        expect_eof_futures(stream).await?;
     }
     Ok(ack)
 }
@@ -375,6 +605,7 @@ pub async fn stream_pattern_futures<W: FuturesWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe::{ProbeHeader, SCHEMA_VERSION, pattern_hash, write_frame};
     use tokio::io::{AsyncReadExt, duplex};
 
     #[tokio::test]
@@ -423,6 +654,89 @@ mod tests {
         assert_eq!(stats.bytes, 1024);
         assert_eq!(stats.hash, stream_hash(output.get_ref()));
         assert_eq!(output.get_ref()[251], 0);
+    }
+
+    #[tokio::test]
+    async fn server_observes_half_close_and_reports_both_directions() {
+        let header = ProbeHeader {
+            schema_version: SCHEMA_VERSION,
+            request_id: 7,
+            mode: ProbeMode::HalfClose,
+            nonce: 9,
+            length: 257,
+            slow_delay_ms: 0,
+            slow_chunk_size: 0,
+        };
+        let mut input = Vec::new();
+        write_frame(&mut input, &serde_json::to_vec(&header).unwrap()).unwrap();
+        input.extend((0..header.length).map(pattern_byte));
+        let request_len = input.len();
+        let mut stream = futures::io::Cursor::new(input);
+        let ack = execute_probe_futures(&mut stream, ProbePath::Direct, 11)
+            .await
+            .unwrap();
+        assert_eq!(ack.bytes_read, header.length);
+        assert_eq!(ack.bytes_written, header.length);
+        assert_eq!(ack.read_hash, pattern_hash(header.length));
+        assert_eq!(ack.write_hash, pattern_hash(header.length));
+        assert!(ack.half_close);
+        assert_eq!(
+            &stream.get_ref()[request_len..request_len + header.length as usize],
+            &(0..header.length).map(pattern_byte).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn server_rejects_wrong_pattern_and_trailing_half_close_bytes() {
+        let header = ProbeHeader {
+            schema_version: SCHEMA_VERSION,
+            request_id: 1,
+            mode: ProbeMode::HalfClose,
+            nonce: 1,
+            length: 1,
+            slow_delay_ms: 0,
+            slow_chunk_size: 0,
+        };
+        let encoded = serde_json::to_vec(&header).unwrap();
+        let mut wrong = Vec::new();
+        write_frame(&mut wrong, &encoded).unwrap();
+        wrong.push(99);
+        assert_eq!(
+            execute_probe_futures(&mut futures::io::Cursor::new(wrong), ProbePath::Relay, 1).await,
+            Err(ProbeError::HashMismatch)
+        );
+
+        let mut trailing = Vec::new();
+        write_frame(&mut trailing, &encoded).unwrap();
+        trailing.extend([pattern_byte(0), 99]);
+        assert_eq!(
+            execute_probe_futures(&mut futures::io::Cursor::new(trailing), ProbePath::Relay, 1)
+                .await,
+            Err(ProbeError::EofMismatch)
+        );
+    }
+
+    #[test]
+    fn worker_admission_enforces_global_and_per_peer_limits() {
+        let first = PeerId::random();
+        let second = PeerId::random();
+        let mut admission = WorkerAdmission::default();
+        for _ in 0..MAX_WORKERS_PER_PEER {
+            admission.admit(first).unwrap();
+        }
+        assert_eq!(admission.admit(first), Err(ProbeError::AdmissionRejected));
+        for _ in 0..MAX_WORKERS_PER_PEER {
+            admission.admit(second).unwrap();
+        }
+        assert_eq!(admission.admitted(), MAX_WORKERS);
+        assert_eq!(
+            admission.admit(PeerId::random()),
+            Err(ProbeError::AdmissionRejected)
+        );
+        assert!(admission.release(first));
+        assert!(!admission.release(PeerId::random()));
+        admission.close();
+        assert_eq!(admission.admit(first), Err(ProbeError::AdmissionRejected));
     }
 
     fn stream_hash(bytes: &[u8]) -> u64 {

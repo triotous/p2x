@@ -11,10 +11,14 @@ pub const MAX_SLOW_CHUNK_SIZE: u32 = 32 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum ProbeTerminal {
     Ok,
+    Oversize,
     Malformed,
     Truncated,
     Timeout,
     Io,
+    HashMismatch,
+    EofMismatch,
+    AdmissionRejected,
 }
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +71,29 @@ pub enum ProbeError {
     Timeout,
     #[error("invalid header: {0}")]
     Invalid(String),
+    #[error("I/O error: {0}")]
+    Io(String),
+    #[error("payload hash mismatch")]
+    HashMismatch,
+    #[error("expected stream EOF")]
+    EofMismatch,
+    #[error("probe worker admission rejected")]
+    AdmissionRejected,
+}
+
+impl ProbeError {
+    pub const fn terminal(&self) -> ProbeTerminal {
+        match self {
+            Self::TooLarge => ProbeTerminal::Oversize,
+            Self::Truncated => ProbeTerminal::Truncated,
+            Self::Timeout => ProbeTerminal::Timeout,
+            Self::Invalid(_) => ProbeTerminal::Malformed,
+            Self::Io(_) => ProbeTerminal::Io,
+            Self::HashMismatch => ProbeTerminal::HashMismatch,
+            Self::EofMismatch => ProbeTerminal::EofMismatch,
+            Self::AdmissionRejected => ProbeTerminal::AdmissionRejected,
+        }
+    }
 }
 
 pub fn decode_header(bytes: &[u8]) -> Result<ProbeHeader, ProbeError> {
@@ -205,5 +232,22 @@ mod tests {
         );
         assert_eq!(pattern_byte(251), 0);
         assert_ne!(pattern_hash(1), pattern_hash(2));
+    }
+
+    #[test]
+    fn every_error_has_a_stable_terminal_code() {
+        assert_eq!(ProbeError::TooLarge.terminal(), ProbeTerminal::Oversize);
+        assert_eq!(
+            ProbeError::HashMismatch.terminal(),
+            ProbeTerminal::HashMismatch
+        );
+        assert_eq!(
+            ProbeError::EofMismatch.terminal(),
+            ProbeTerminal::EofMismatch
+        );
+        assert_eq!(
+            ProbeError::AdmissionRejected.terminal(),
+            ProbeTerminal::AdmissionRejected
+        );
     }
 }
