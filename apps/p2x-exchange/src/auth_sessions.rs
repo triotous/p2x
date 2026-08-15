@@ -1,4 +1,5 @@
 use crate::authn::AuthPrincipal;
+use crate::authn::FixedTokenProvider;
 use p2x_protocol::PublicErrorCode;
 use std::{collections::HashMap, time::Duration};
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -16,6 +17,7 @@ pub enum SessionAction {
 }
 pub struct AuthSessionLedger {
     sessions: HashMap<String, AuthSession>,
+    connections: HashMap<String, usize>,
     max_sessions: usize,
     lifetime: Duration,
 }
@@ -28,6 +30,7 @@ impl AuthSessionLedger {
     pub fn new(max_sessions: usize) -> Self {
         Self {
             sessions: HashMap::new(),
+            connections: HashMap::new(),
             max_sessions,
             lifetime: Duration::from_secs(15 * 60),
         }
@@ -70,10 +73,23 @@ impl AuthSessionLedger {
             None => SessionAction::Rejected(PublicErrorCode::AuthSessionRequired),
         }
     }
+    pub fn connection_established(&mut self, peer_id: &str) {
+        *self.connections.entry(peer_id.to_owned()).or_default() += 1;
+    }
     pub fn connection_closed(&mut self, peer_id: &str) -> Option<SessionAction> {
+        let count = self.connections.get_mut(peer_id)?;
+        *count = count.saturating_sub(1);
+        if *count != 0 {
+            return None;
+        }
+        self.connections.remove(peer_id);
         self.sessions
             .remove(peer_id)
             .map(|_| SessionAction::Removed(peer_id.to_owned()))
+    }
+    pub fn replace_snapshot(&mut self, provider: &FixedTokenProvider) {
+        self.sessions
+            .retain(|peer, session| provider.binding_matches(peer, &session.principal));
     }
     pub fn replace_revision(&mut self, revision: u64) {
         self.sessions

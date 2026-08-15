@@ -89,6 +89,20 @@ impl FixedTokenProvider {
     pub fn revision(&self) -> u64 {
         self.revision
     }
+    pub fn binding_matches(&self, peer_id: &str, principal: &AuthPrincipal) -> bool {
+        self.credentials
+            .get(&principal.credential_id)
+            .is_some_and(|binding| {
+                binding.peer_id == peer_id
+                    && binding.tenant == principal.tenant
+                    && binding.role == principal.role
+                    && binding.scopes == principal.scopes
+                    && binding.quota_profile == principal.quota_profile
+                    && !binding.revoked
+                    && binding.expires_at == principal.credential_expires_at
+                    && self.revision == principal.authorization_revision
+            })
+    }
     pub fn authenticate(
         &self,
         peer_id: &str,
