@@ -1,5 +1,6 @@
 use crate::probe::{
-    MAX_HEADER, MAX_TRANSFER, ProbeError, ProbeHeader, ProbeMode, decode_header, pattern_byte,
+    MAX_HEADER, MAX_TRANSFER, ProbeAck, ProbeError, ProbeHeader, ProbeMode, ProbePath,
+    ProbeTerminal, SCHEMA_VERSION, decode_header, pattern_byte,
 };
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -138,6 +139,54 @@ where
         write_frame_async(writer, &ack).await?;
     }
     Ok(header)
+}
+
+pub async fn execute_probe<S>(
+    stream: &mut S,
+    path: ProbePath,
+    connection_id_hash: u64,
+) -> Result<ProbeAck, ProbeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let frame = timeout(WORKER_TIMEOUT, read_frame_async(stream))
+        .await
+        .map_err(|_| ProbeError::Timeout)??;
+    let header = decode_header(&frame)?;
+    let written = match header.mode {
+        ProbeMode::NonceEcho => StreamStats { bytes: 0, hash: 0 },
+        ProbeMode::HalfClose => {
+            let stats = stream_pattern(stream, header.length)
+                .await
+                .map_err(|_| ProbeError::Truncated)?;
+            stream.shutdown().await.map_err(|_| ProbeError::Truncated)?;
+            stats
+        }
+        ProbeMode::SlowReader => stream_pattern_with_delay(
+            stream,
+            header.length,
+            header.slow_delay_ms,
+            header.slow_chunk_size,
+        )
+        .await
+        .map_err(|_| ProbeError::Truncated)?,
+    };
+    let ack = ProbeAck {
+        schema_version: SCHEMA_VERSION,
+        nonce: header.nonce,
+        request_id: header.request_id,
+        path,
+        connection_id_hash,
+        bytes_read: 0,
+        bytes_written: written.bytes,
+        read_hash: 0,
+        write_hash: written.hash,
+        half_close: header.mode == ProbeMode::HalfClose,
+        terminal: ProbeTerminal::Ok,
+    };
+    let body = serde_json::to_vec(&ack).map_err(|error| ProbeError::Invalid(error.to_string()))?;
+    write_frame_async(stream, &body).await?;
+    Ok(ack)
 }
 
 #[cfg(test)]

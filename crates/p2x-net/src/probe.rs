@@ -5,6 +5,8 @@ use thiserror::Error;
 pub const MAX_HEADER: usize = 4096;
 pub const MAX_TRANSFER: u64 = 256 * 1024 * 1024;
 pub const SCHEMA_VERSION: u16 = 1;
+pub const MAX_SLOW_DELAY_MS: u32 = 1_000;
+pub const MAX_SLOW_CHUNK_SIZE: u32 = 32 * 1024;
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeTerminal {
@@ -89,9 +91,17 @@ pub fn decode_header(bytes: &[u8]) -> Result<ProbeHeader, ProbeError> {
         ));
     }
     if header.mode == ProbeMode::SlowReader
-        && (header.slow_chunk_size == 0 || header.slow_chunk_size > 32 * 1024)
+        && (header.slow_chunk_size == 0 || header.slow_chunk_size > MAX_SLOW_CHUNK_SIZE)
     {
         return Err(ProbeError::Invalid("invalid slow-reader chunk size".into()));
+    }
+    if header.slow_delay_ms > MAX_SLOW_DELAY_MS {
+        return Err(ProbeError::Invalid(
+            "slow-reader delay exceeds profile cap".into(),
+        ));
+    }
+    if header.mode == ProbeMode::NonceEcho && header.length != 0 {
+        return Err(ProbeError::Invalid("nonce-echo length must be zero".into()));
     }
     Ok(header)
 }
