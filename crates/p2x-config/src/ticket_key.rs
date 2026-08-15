@@ -8,8 +8,12 @@ use thiserror::Error;
 pub enum TicketKeyError {
     #[error("ticket key file failed")]
     File(#[from] SecretFileError),
-    #[error("ticket key must contain exactly 32 bytes")]
+    #[error("ticket key is invalid")]
     Invalid,
+    #[error("ticket verification key is invalid")]
+    InvalidVerificationKey,
+    #[error("ticket verification key already exists")]
+    DuplicateVerificationKey,
 }
 pub struct TicketKey {
     pub signing: SigningKey,
@@ -62,13 +66,18 @@ pub struct VerificationKeyRing {
     keys: Vec<VerificationKey>,
 }
 impl VerificationKeyRing {
-    pub fn add(&mut self, key: VerificationKey) {
-        assert!(
-            key.retires_at
-                .is_none_or(|retire| retire > key.activates_at)
-        );
-        assert!(!self.keys.iter().any(|old| old.key_id == key.key_id));
-        self.keys.push(key)
+    pub fn add(&mut self, key: VerificationKey) -> Result<(), TicketKeyError> {
+        if key
+            .retires_at
+            .is_some_and(|retire| retire <= key.activates_at)
+        {
+            return Err(TicketKeyError::InvalidVerificationKey);
+        }
+        if self.keys.iter().any(|old| old.key_id == key.key_id) {
+            return Err(TicketKeyError::DuplicateVerificationKey);
+        }
+        self.keys.push(key);
+        Ok(())
     }
     pub fn get(&self, key_id: [u8; 16], now: i64) -> Option<&VerificationKey> {
         self.keys.iter().find(|k| {
@@ -88,7 +97,8 @@ mod tests {
             public: key.public(),
             activates_at: 10,
             retires_at: Some(20),
-        });
+        })
+        .unwrap();
         assert!(ring.get(key.key_id, 9).is_none());
         assert!(ring.get(key.key_id, 10).is_some());
         assert!(ring.get(key.key_id, 20).is_none());

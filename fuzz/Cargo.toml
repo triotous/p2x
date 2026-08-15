@@ -22,6 +22,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "token_parse"
+path = "fuzz_targets/token_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "ticket_claims_decode"
 path = "fuzz_targets/ticket_claims_decode.rs"
 test = false
