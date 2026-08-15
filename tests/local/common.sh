@@ -6,6 +6,7 @@ start_services() {
   RUN_ID=${P2X_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}
   OUT=${P2X_ARTIFACT_DIR:-target/p2x-spike/$RUN_ID}/$case_id
   mkdir -p "$OUT"
+  cd "$(git rev-parse --show-toplevel)"
   cargo build --workspace --bins >/dev/null
   pids=()
   cleanup() {
@@ -17,10 +18,23 @@ start_services() {
   P2X_RUN_ID="$RUN_ID" target/debug/p2x-exchange \
     --identity-seed 1 --tcp-listen /ip4/127.0.0.1/tcp/0 >"$OUT/exchange.ndjson" 2>&1 &
   pids+=("$!")
+  for _ in $(seq 1 100); do
+    exchange_addr=$(awk -F'"detail":"' '/"event":"listen_addr"/{split($2,a,"\""); print a[1]; exit}' "$OUT/exchange.ndjson" || true)
+    [[ -n "${exchange_addr:-}" ]] && break
+    sleep 0.1
+  done
+  [[ -n "${exchange_addr:-}" ]] || { echo 'exchange did not become ready' >&2; return 2; }
   P2X_RUN_ID="$RUN_ID" target/debug/p2x-server \
-    --identity-seed 2 --tcp-listen /ip4/127.0.0.1/tcp/0 >"$OUT/server.ndjson" 2>&1 &
+    --identity-seed 2 --exchange "$exchange_addr" --tcp-listen /ip4/127.0.0.1/tcp/0 >"$OUT/server.ndjson" 2>&1 &
   pids+=("$!")
-  sleep 1
+  for _ in $(seq 1 100); do
+    circuit_addr=$(awk -F'"detail":"' '/"event":"circuit_ready"/{split($2,a,"\""); print a[1]; exit}' "$OUT/server.ndjson" || true)
+    [[ -n "${circuit_addr:-}" ]] && break
+    sleep 0.1
+  done
+  [[ -n "${circuit_addr:-}" ]] || { echo 'server relay circuit did not become ready' >&2; return 2; }
+  P2X_RUN_ID="$RUN_ID" target/debug/p2x-client --identity-seed 3 --server "$circuit_addr" >"$OUT/client.ndjson" 2>&1 &
+  pids+=("$!")
 }
 
 run_local_case() {

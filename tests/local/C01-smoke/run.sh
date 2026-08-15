@@ -12,10 +12,17 @@ trap cleanup TERM INT EXIT
 cargo build --workspace --bins >/dev/null
 P2X_RUN_ID="$run_id" target/debug/p2x-exchange --identity-seed 1 --tcp-listen /ip4/127.0.0.1/tcp/0 >"$out/exchange.ndjson" 2>&1 & pids+=("$!")
 P2X_RUN_ID="$run_id" target/debug/p2x-server --identity-seed 2 --tcp-listen /ip4/127.0.0.1/tcp/0 >"$out/server.ndjson" 2>&1 & pids+=("$!")
-sleep 1
+for _ in $(seq 1 100); do
+  if grep -q '"event":"listen_addr"' "$out/exchange.ndjson" && grep -q '"event":"listen_addr"' "$out/server.ndjson"; then break; fi
+  sleep 0.1
+done
+if ! grep -q '"event":"listen_addr"' "$out/exchange.ndjson" || ! grep -q '"event":"listen_addr"' "$out/server.ndjson"; then
+  echo 'services did not become ready' >&2
+  exit 2
+fi
 P2X_RUN_ID="$run_id" target/debug/p2x-client --identity-seed 3 >"$out/client.ndjson" 2>&1 & client_pid=$!
 for _ in $(seq 1 20); do
-  if [ -s "$out/client.ndjson" ]; then break; fi
+  if grep -q '"event":"started"' "$out/client.ndjson"; then break; fi
   sleep 0.1
 done
 kill "$client_pid" 2>/dev/null || true

@@ -50,7 +50,15 @@ async fn main() -> io::Result<()> {
     }
     emitter.event("started", Some(&swarm.local_peer_id().to_string()))?;
     loop {
-        tokio::select! { _ = tokio::signal::ctrl_c() => break, event = swarm.select_next_some() => { if let SwarmEvent::NewListenAddr { address, .. } = event { emitter.event("listen_addr", Some(&address.to_string()))?; } } }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            event = swarm.select_next_some() => {
+                if let SwarmEvent::NewListenAddr { address, .. } = event {
+                    let name = if address.to_string().contains("p2p-circuit") { "circuit_ready" } else { "listen_addr" };
+                    emitter.event(name, Some(&address.to_string()))?;
+                }
+            }
+        }
     }
     emitter.terminal("stopped", "shutdown")?;
     Ok(())
