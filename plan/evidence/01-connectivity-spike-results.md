@@ -1,10 +1,10 @@
 # Connectivity spike results
 
-**Status:** implementation complete; external architecture gates pending
+**Status:** complete; ADR 0001 accepted
 
 ## Verified baseline
 
-- Reviewed implementation: `e84df74adfe29c5a6690bb1f520ea2b060aa80c2` plus this evidence-only documentation commit.
+- Executed connectivity implementation: `389690c98aa6757732489974ac461758feb04cff`; later commits `508271d` and `51222c2` hardened C14 capture and provenance validation without changing the probed connectivity implementation.
 - Toolchain: `rustc 1.96.0`, `cargo 1.96.0`, `cargo-deny 0.20.2`.
 - Network baseline: `libp2p = 0.56.0`; exact resolved components are frozen in `Cargo.lock`.
 - Platform observed here: native macOS (`Darwin`), same-host exchange/server/client processes.
@@ -31,11 +31,40 @@ All rows were produced by `tests/connectivity/local.sh`; raw NDJSON and resource
 | C12 | `20260815T092027Z-13735` | Two real reservation renewals were observed while the original relay probe remained valid. |
 | C13 | `20260815T092524Z-39212` | 100 relay connect/probe/close iterations completed after correcting all-path churn cleanup. |
 
-These observations close the native local implementation findings. They do not substitute for Linux packet filtering or a real two-network topology.
+These observations close the native local implementation findings.
 
-## Remaining external evidence
+## Linux namespace observations
 
-- C02–C13 must be executed on Linux with root/CAP_NET_ADMIN using `tests/connectivity/manual-gates.sh --linux`. The runner creates three run-scoped namespaces, applies TCP/UDP peer filters for C02–C04, and reuses the same canonical fault matrix for C05–C13. This macOS host cannot execute or validate those mutations.
-- C14 must be executed on two native hosts on separate networks using the three role scripts in `tests/two-host/C14-relay/`, followed by `tests/connectivity/manual-gates.sh --c14-validate <artifact-directory>`.
+The canonical Linux runner created isolated exchange/server/client namespaces. The committed topology artifacts show the named peer filters for C02–C04; every canonical summary below reports `passed: true` and `probe.ok`.
 
-ADR 0001 therefore remains `Deferred`. Plan 02 corrective implementation is permitted and complete locally; product Plan 03 remains blocked until the Linux and C14 artifacts pass and the ADR is changed to an accepted or rejected decision.
+| Case | Run ID | Observed result |
+| --- | --- | --- |
+| C02 | `20260815T104620Z-71051` | TCP peer traffic was blocked; one receiver-observed direct probe passed over the allowed path. |
+| C03 | `20260815T104620Z-71235` | UDP peer traffic was blocked; one receiver-observed direct probe passed over the allowed path. |
+| C04 | `20260815T104621Z-71379` | Direct peer traffic was blocked; relay was selected and observed. |
+| C05 | `20260815T104622Z-71525` | Two exact-connection probes completed with direct and relay coexisting. |
+| C06 | `20260815T104623Z-71681` | Suppressed DCUtR terminal handling committed relay and completed the probe. |
+| C07 | `20260815T104625Z-72010` | The interruption case completed on the selected direct path. |
+| C08 | `20260815T104642Z-74425` | Relay failure/recovery case completed with the next relay probe. |
+| C09 | `20260815T104643Z-74603` | Low relay limits rejected excess admission while the admitted relay probe passed. |
+| C10 / 64 | `20260815T104646Z-74817` | All 64 concurrent direct probes completed. |
+| C10 / 128 | `20260815T104647Z-74968` | All 128 concurrent direct probes completed. |
+| C11 direct | `20260815T104647Z-75152` | 256 MiB direct slow-reader transfer and concurrent nonce probe passed. |
+| C11 relay | `20260815T104719Z-80106` | 256 MiB relay slow-reader transfer and concurrent nonce probe passed. |
+| C12 | `20260815T104755Z-85674` | Reservation renewal case stayed relay-reachable and passed. |
+| C13 | `20260815T104926Z-96148` | All 100 relay churn probes completed. |
+
+## Two-network C14 observation
+
+The validated artifact root `target/p2x-spike/c14-20260815T114925Z/C14-relay/` records:
+
+- Host A: native Linux, running exchange and server;
+- Host B: native macOS, running client;
+- distinct network/interface environments, with relay TCP/UDP permitted;
+- identical tested implementation commit `389690c98aa6757732489974ac461758feb04cff` on both hosts;
+- client selected relay, receiver reported relay, terminal code `probe.ok`, and setup completed in 580 ms;
+- `summary.json` reports `passed: true` and the expected scrubbed artifacts.
+
+## Gate outcome
+
+The native, Linux namespace, and C14 evidence satisfy the Phase 0 connectivity gate. The product owner confirmed completion of the full Plan 02 test set on 2026-08-15. ADR 0001 is accepted with the custom exact-connection behaviour/handler as a required part of the architecture, and Product Plan 03 may proceed.
