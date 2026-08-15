@@ -13,7 +13,8 @@ use std::{
 };
 
 const MAX_HANDLER_QUEUE: usize = 64;
-const MAX_HANDLER_EVENTS: usize = 64;
+// Keep one event slot available so a full open queue can always report rejection.
+const MAX_HANDLER_EVENTS: usize = 63;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RequestId(pub u64);
