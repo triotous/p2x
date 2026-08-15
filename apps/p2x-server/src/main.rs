@@ -64,6 +64,15 @@ async fn main() -> io::Result<()> {
                             emitter.event("circuit_ready", Some(&address.to_string()))?;
                         }
                     }
+                    SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
+                        emitter.event("connection_established", Some(&format!("peer_id={peer_id} connection_id={connection_id:?}")))?;
+                    }
+                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        emitter.event("connection_error", Some(&format!("peer_id={peer_id:?} error={error}")))?;
+                    }
+                    SwarmEvent::ListenerError { error, .. } => {
+                        emitter.event("listener_error", Some(&error.to_string()))?;
+                    }
                     SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundOpened { mut stream, peer_id, connection_id })) => {
                         let ack = execute_probe_futures(&mut stream, p2x_net::probe::ProbePath::Relay, format!("{connection_id:?}").bytes().fold(0u64, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte as u64))).await.map_err(io::Error::other)?;
                         emitter.event("probe_observed", Some(&format!("peer_id={peer_id} connection_id={connection_id:?} path={:?} bytes={}", ack.path, ack.bytes_written)))?;

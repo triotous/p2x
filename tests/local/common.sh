@@ -28,7 +28,7 @@ start_services() {
     --identity-seed 2 --exchange "$exchange_addr" --tcp-listen /ip4/127.0.0.1/tcp/0 >"$OUT/server.ndjson" 2>&1 &
   pids+=("$!")
   for _ in $(seq 1 100); do
-    circuit_addr=$(awk -F'"detail":"' '/"event":"circuit_ready"/{split($2,a,"\""); print a[1]; exit}' "$OUT/server.ndjson" || true)
+    circuit_addr=$(awk -F'circuit=' '/"event":"relay_dial"/{split($2,a,"\""); print a[1]; exit}' "$OUT/server.ndjson" || true)
     [[ -n "${circuit_addr:-}" ]] && break
     sleep 0.1
   done
