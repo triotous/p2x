@@ -161,13 +161,18 @@ impl ReservationContext {
     pub fn apply(&mut self, event: ReservationEvent) {
         self.apply_at(event, Instant::now());
     }
+    pub fn retry_delay(&self, jitter_per_mille: u16) -> Duration {
+        let base = INITIAL_RETRY
+            .saturating_mul(2u32.saturating_pow(self.retry_attempt.saturating_sub(1)))
+            .min(MAX_RETRY);
+        let jitter = base.mul_f64((jitter_per_mille.min(200) as f64) / 1000.0);
+        base + jitter
+    }
+
     fn degrade(&mut self, now: Instant) {
         self.degraded = true;
         self.retry_attempt = self.retry_attempt.saturating_add(1);
-        let exp = INITIAL_RETRY
-            .saturating_mul(2u32.saturating_pow(self.retry_attempt.saturating_sub(1)))
-            .min(MAX_RETRY);
-        self.retry_deadline = Some(now + exp);
+        self.retry_deadline = Some(now + self.retry_delay(0));
     }
 }
 pub fn transition(state: ReservationState, event: ReservationEvent) -> ReservationState {

@@ -39,6 +39,11 @@ pub enum ProbeOutput {
         connection_id: ConnectionId,
         stream: libp2p::swarm::Stream,
     },
+    InboundRejected {
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        code: &'static str,
+    },
 }
 #[derive(Default)]
 pub struct ProbeStreamBehaviour {
@@ -245,11 +250,19 @@ impl NetworkBehaviour for ProbeStreamBehaviour {
                 }
             }
             ProbeEvent::InboundOpened { stream } => {
-                self.events.push_back(ProbeOutput::InboundOpened {
-                    peer_id: peer,
-                    connection_id: id,
-                    stream,
-                })
+                if self.inbound_admit(peer).is_ok() {
+                    self.events.push_back(ProbeOutput::InboundOpened {
+                        peer_id: peer,
+                        connection_id: id,
+                        stream,
+                    });
+                } else {
+                    self.events.push_back(ProbeOutput::InboundRejected {
+                        peer_id: peer,
+                        connection_id: id,
+                        code: "limit.inbound_workers",
+                    });
+                }
             }
         }
     }
