@@ -35,6 +35,12 @@ async fn main() -> io::Result<()> {
     let emitter = Emitter::new("client", &run_id);
     let key = lab_identity(args.identity_seed).map_err(io::Error::other)?;
     let mut swarm = build_peer_swarm(key, SwarmConfig::default()).map_err(io::Error::other)?;
+    let target_peer = args.server.as_ref().and_then(|address| {
+        address.iter().find_map(|part| match part {
+            libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
+            _ => None,
+        })
+    });
     emitter.event(
         "started",
         Some(&format!(
@@ -57,7 +63,7 @@ async fn main() -> io::Result<()> {
                 match event {
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
                         emitter.event("connection_established", Some(&format!("peer_id={peer_id} connection_id={connection_id:?}")))?;
-                        if remaining != 0 {
+                        if remaining != 0 && target_peer == Some(peer_id) {
                             swarm.behaviour_mut().probe_stream.open_on(peer_id, connection_id).map_err(io::Error::other)?;
                             remaining -= 1;
                         }
