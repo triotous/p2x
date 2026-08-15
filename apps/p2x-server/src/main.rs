@@ -45,7 +45,10 @@ async fn main() -> io::Result<()> {
             })?;
         swarm.dial(exchange.clone()).map_err(io::Error::other)?;
         relay_peer_id = Some(relay_peer);
-        let circuit = exchange.clone().with(Protocol::P2pCircuit);
+        let circuit = exchange
+            .clone()
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(*swarm.local_peer_id()));
         pending_circuit = Some(circuit.clone());
         let advertised = exchange
             .clone()
@@ -88,11 +91,7 @@ async fn main() -> io::Result<()> {
                         let accepted = matches!(relay_event, libp2p::relay::client::Event::ReservationReqAccepted { .. });
                         emitter.event("relay_event", Some(&format!("{relay_event:?}")))?;
                         if accepted && let Some(address) = pending_circuit.as_ref() {
-                            let advertised = address
-                                .clone()
-                                .with(Protocol::P2pCircuit)
-                                .with(Protocol::P2p(*swarm.local_peer_id()));
-                            emitter.event("reservation_accepted", Some(&advertised.to_string()))?;
+                            emitter.event("reservation_accepted", Some(&address.to_string()))?;
                         }
                     }
                     SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundOpened { mut stream, peer_id, connection_id })) => {
