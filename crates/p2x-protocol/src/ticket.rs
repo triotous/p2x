@@ -236,6 +236,8 @@ pub struct TicketValidation<'a> {
     pub selector_fingerprint: [u8; 32],
     pub registration_revision: u64,
     pub authorization_revision: u64,
+    pub permissions: u32,
+    pub max_streams: u16,
     pub now: i64,
     pub clock_skew: i64,
 }
@@ -281,6 +283,8 @@ pub fn verify_and_validate(
         || c.selector_fingerprint != expected.selector_fingerprint
         || c.registration_revision != expected.registration_revision
         || c.authorization_revision != expected.authorization_revision
+        || c.permissions != expected.permissions
+        || c.max_streams != expected.max_streams
         || c.not_before > expected.now.saturating_add(expected.clock_skew)
         || c.expires_at < expected.now.saturating_sub(expected.clock_skew)
     {
