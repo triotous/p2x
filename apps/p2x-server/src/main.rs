@@ -45,7 +45,8 @@ async fn main() -> io::Result<()> {
             })?;
         swarm.dial(exchange.clone()).map_err(io::Error::other)?;
         relay_peer_id = Some(relay_peer);
-        pending_circuit = Some(exchange.clone().with(Protocol::P2pCircuit));
+        let circuit = exchange.clone().with(Protocol::P2pCircuit);
+        pending_circuit = Some(circuit.clone());
         let advertised = exchange
             .clone()
             .with(Protocol::P2pCircuit)
@@ -54,6 +55,7 @@ async fn main() -> io::Result<()> {
             "relay_dial",
             Some(&format!("relay={relay_peer} circuit={advertised}")),
         )?;
+        swarm.listen_on(circuit).map_err(io::Error::other)?;
     }
     emitter.event("started", Some(&swarm.local_peer_id().to_string()))?;
     loop {
@@ -71,11 +73,7 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
                         emitter.event("connection_established", Some(&format!("peer_id={peer_id} connection_id={connection_id:?}")))?;
-                        if relay_peer_id == Some(peer_id)
-                            && !reservation_requested
-                            && let Some(address) = pending_circuit.clone()
-                        {
-                            swarm.listen_on(address).map_err(io::Error::other)?;
+                        if relay_peer_id == Some(peer_id) && !reservation_requested {
                             reservation_requested = true;
                             emitter.event("reservation_requested", Some(&peer_id.to_string()))?;
                         }
