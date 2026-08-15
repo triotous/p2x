@@ -32,6 +32,10 @@ fn chrono_like_now() -> i64 {
 struct Args {
     #[arg(long)]
     identity_seed: Option<u64>,
+    #[arg(long)]
+    identity_file: Option<PathBuf>,
+    #[arg(long)]
+    generate_identity: bool,
     #[arg(long, default_value = "/ip4/127.0.0.1/tcp/0")]
     tcp_listen: Multiaddr,
     #[arg(long, default_value = "/ip4/127.0.0.1/udp/0/quic-v1")]
@@ -70,7 +74,6 @@ async fn main() -> io::Result<()> {
         Some(path) => Emitter::with_artifact("exchange", &run_id, path)?,
         None => Emitter::new("exchange", &run_id),
     };
-    let key = lab_identity(args.identity_seed).map_err(io::Error::other)?;
     let provider = args
         .credential_file
         .as_deref()
@@ -79,6 +82,21 @@ async fn main() -> io::Result<()> {
         .map(|file| FixedTokenProvider::from_config(&file))
         .transpose()
         .map_err(io::Error::other)?;
+    let key = if let Some(path) = args.identity_file.as_ref() {
+        p2x_config::identity::load_or_create_identity(&p2x_config::identity::IdentityConfig {
+            path: path.clone(),
+            generate_if_missing: args.generate_identity,
+        })
+        .map_err(io::Error::other)?
+        .keypair
+    } else if provider.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "authenticated exchange requires --identity-file",
+        ));
+    } else {
+        lab_identity(args.identity_seed).map_err(io::Error::other)?
+    };
     let mut sessions = AuthSessionLedger::default();
     let config = ExchangeSwarmConfig {
         tcp_listen: args.tcp_listen,

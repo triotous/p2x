@@ -52,6 +52,10 @@ struct Args {
     #[arg(long)]
     identity_seed: Option<u64>,
     #[arg(long)]
+    identity_file: Option<PathBuf>,
+    #[arg(long)]
+    generate_identity: bool,
+    #[arg(long)]
     exchange: Option<Multiaddr>,
     #[arg(long)]
     credential_env: Option<String>,
@@ -156,7 +160,21 @@ async fn main() -> io::Result<()> {
         Some(path) => Emitter::with_artifact("client", &run_id, path)?,
         None => Emitter::new("client", &run_id),
     };
-    let key = lab_identity(args.identity_seed).map_err(io::Error::other)?;
+    let key = if let Some(path) = args.identity_file.as_ref() {
+        p2x_config::identity::load_or_create_identity(&p2x_config::identity::IdentityConfig {
+            path: path.clone(),
+            generate_if_missing: args.generate_identity,
+        })
+        .map_err(io::Error::other)?
+        .keypair
+    } else if args.credential_env.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "authenticated client requires --identity-file",
+        ));
+    } else {
+        lab_identity(args.identity_seed).map_err(io::Error::other)?
+    };
     let credential = args
         .credential_env
         .as_deref()

@@ -2104,6 +2104,7 @@ dependencies = [
  "base64",
  "clap",
  "futures",
+ "getrandom 0.3.4",
  "libp2p",
  "p2x-config",
  "p2x-net",
