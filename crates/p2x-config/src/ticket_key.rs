@@ -23,13 +23,20 @@ impl std::fmt::Debug for TicketKey {
 impl TicketKey {
     pub fn load(path: &Path) -> Result<Self, TicketKeyError> {
         let b = read_secret_file(path)?;
-        let seed: [u8; 32] = b.try_into().map_err(|_| TicketKeyError::Invalid)?;
+        if b.first() != Some(&1) || b.len() != 33 {
+            return Err(TicketKeyError::Invalid);
+        }
+        let seed: [u8; 32] = b[1..].try_into().map_err(|_| TicketKeyError::Invalid)?;
         Ok(Self::from_seed(seed))
     }
     pub fn create(path: &Path) -> Result<Self, TicketKeyError> {
-        let seed = [0u8; 32];
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).map_err(|_| TicketKeyError::Invalid)?;
         let key = Self::from_seed(seed);
-        write_secret_file(path, &seed)?;
+        let mut file = Vec::with_capacity(33);
+        file.push(1);
+        file.extend_from_slice(&seed);
+        write_secret_file(path, &file)?;
         Ok(key)
     }
     pub fn from_seed(seed: [u8; 32]) -> Self {
