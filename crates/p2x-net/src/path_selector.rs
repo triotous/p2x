@@ -316,6 +316,36 @@ mod tests {
         ));
     }
     #[test]
+    fn terminal_failure_is_emitted_once() {
+        let now = Instant::now();
+        let mut attempt = PathAttempt::new(now);
+        let first = attempt.apply(event(attempt.id, now, PathEventKind::Cancelled));
+        let second = attempt.apply(event(attempt.id, now, PathEventKind::Cancelled));
+        assert_eq!(first, vec![PathAction::Finish(PathFailure::Cancelled)]);
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn begin_cannot_recommit_a_terminal_attempt() {
+        let now = Instant::now();
+        let mut attempt = PathAttempt::new(now);
+        attempt.apply(event(attempt.id, now, PathEventKind::Cancelled));
+        assert!(
+            attempt
+                .apply(event(
+                    attempt.id,
+                    now,
+                    PathEventKind::Begin {
+                        relay: Some(id(1)),
+                        direct: Some(id(2)),
+                    },
+                ))
+                .is_empty()
+        );
+        assert!(matches!(attempt.state, PathState::Failed { .. }));
+    }
+
+    #[test]
     fn direct_open_has_one_relay_fallback_before_payload() {
         let now = Instant::now();
         let mut a = PathAttempt::new(now);
