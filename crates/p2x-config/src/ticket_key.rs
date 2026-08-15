@@ -1,5 +1,7 @@
 use crate::secret_file::{SecretFileError, read_secret_file, write_secret_file};
+use base64::Engine;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use thiserror::Error;
@@ -14,6 +16,12 @@ pub enum TicketKeyError {
     InvalidVerificationKey,
     #[error("ticket verification key already exists")]
     DuplicateVerificationKey,
+    #[error("ticket key configuration is invalid")]
+    InvalidConfiguration,
+    #[error("ticket key configuration could not be read")]
+    ConfigurationIo(#[source] std::io::Error),
+    #[error("ticket key configuration YAML is invalid")]
+    ConfigurationYaml(#[source] serde_yaml::Error),
 }
 pub struct TicketKey {
     pub signing: SigningKey,
@@ -54,6 +62,52 @@ impl TicketKey {
         self.signing.verifying_key()
     }
 }
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerificationKeyRecord {
+    key_id: String,
+    public_key: String,
+    activates_at: i64,
+    retires_at: Option<i64>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerificationKeyFile {
+    schema_version: u16,
+    keys: Vec<VerificationKeyRecord>,
+}
+
+fn decode_hex_id(value: &str) -> Result<[u8; 16], TicketKeyError> {
+    if value.len() != 32
+        || value
+            .bytes()
+            .any(|b| !b.is_ascii_hexdigit() || b.is_ascii_uppercase())
+    {
+        return Err(TicketKeyError::InvalidConfiguration);
+    }
+    let mut output = [0; 16];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        output[index] = (pair[0] as char)
+            .to_digit(16)
+            .ok_or(TicketKeyError::InvalidConfiguration)? as u8
+            * 16
+            + (pair[1] as char)
+                .to_digit(16)
+                .ok_or(TicketKeyError::InvalidConfiguration)? as u8;
+    }
+    Ok(output)
+}
+
+impl VerificationKeyFile {
+    fn load(path: &Path) -> Result<Self, TicketKeyError> {
+        crate::yaml::load(path).map_err(|error| match error {
+            crate::yaml::YamlError::Io(error) => TicketKeyError::ConfigurationIo(error),
+            crate::yaml::YamlError::Parse(error) => TicketKeyError::ConfigurationYaml(error),
+            crate::yaml::YamlError::TooLarge => TicketKeyError::InvalidConfiguration,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct VerificationKey {
     pub key_id: [u8; 16],
@@ -66,6 +120,35 @@ pub struct VerificationKeyRing {
     keys: Vec<VerificationKey>,
 }
 impl VerificationKeyRing {
+    pub fn load(path: &Path) -> Result<Self, TicketKeyError> {
+        let file = VerificationKeyFile::load(path)?;
+        if file.schema_version != 1 || file.keys.len() > 256 {
+            return Err(TicketKeyError::InvalidConfiguration);
+        }
+        let mut ring = Self::default();
+        for record in file.keys {
+            let key_id = decode_hex_id(&record.key_id)?;
+            let public_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(record.public_key.as_bytes())
+                .map_err(|_| TicketKeyError::InvalidConfiguration)?;
+            let public_bytes: [u8; 32] = public_bytes
+                .try_into()
+                .map_err(|_| TicketKeyError::InvalidConfiguration)?;
+            let public = VerifyingKey::from_bytes(&public_bytes)
+                .map_err(|_| TicketKeyError::InvalidConfiguration)?;
+            let digest = Sha256::digest(public.as_bytes());
+            if key_id != digest[..16] {
+                return Err(TicketKeyError::InvalidConfiguration);
+            }
+            ring.add(VerificationKey {
+                key_id,
+                public,
+                activates_at: record.activates_at,
+                retires_at: record.retires_at,
+            })?;
+        }
+        Ok(ring)
+    }
     pub fn add(&mut self, key: VerificationKey) -> Result<(), TicketKeyError> {
         if key
             .retires_at
@@ -114,5 +197,26 @@ mod tests {
             ]
         );
         assert!(format!("{k:?}").contains("REDACTED"));
+    }
+    #[test]
+    fn ring_loader_rejects_wrong_key_id_and_unknown_fields() {
+        let key = TicketKey::from_seed([9; 32]);
+        let path = std::env::temp_dir().join(format!("p2x-ticket-ring-{}", std::process::id()));
+        let public =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.public().as_bytes());
+        let id = key
+            .key_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        std::fs::write(&path, format!("schema_version: 1\nkeys:\n  - key_id: {id}\n    public_key: {public}\n    activates_at: 1\n    retires_at: 2\n")).unwrap();
+        let ring = VerificationKeyRing::load(&path).unwrap();
+        assert!(ring.get(key.key_id, 1).is_some());
+        std::fs::write(&path, "schema_version: 1\nkeys: []\nextra: true\n").unwrap();
+        assert!(matches!(
+            VerificationKeyRing::load(&path),
+            Err(TicketKeyError::ConfigurationYaml(_))
+        ));
+        let _ = std::fs::remove_file(path);
     }
 }

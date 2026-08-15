@@ -350,4 +350,31 @@ mod tests {
             )
         }
     }
+    #[test]
+    fn rejects_zero_oversize_and_truncated_frames_before_decode() {
+        for frame in [
+            0u32.to_be_bytes().to_vec(),
+            ((MAX_AUTH_FRAME as u32) + 1).to_be_bytes().to_vec(),
+            vec![0, 0, 0],
+        ] {
+            assert!(
+                block_on(AuthCodec::read_request(
+                    &mut AuthCodec,
+                    &libp2p::StreamProtocol::new(AUTH_PROTOCOL),
+                    &mut Cursor::new(frame),
+                ))
+                .is_err()
+            );
+        }
+        let mut truncated = (3u32).to_be_bytes().to_vec();
+        truncated.extend_from_slice(&[VERSION, 0]);
+        assert!(
+            block_on(AuthCodec::read_request(
+                &mut AuthCodec,
+                &libp2p::StreamProtocol::new(AUTH_PROTOCOL),
+                &mut Cursor::new(truncated),
+            ))
+            .is_err()
+        );
+    }
 }
