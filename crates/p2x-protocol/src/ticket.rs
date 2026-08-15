@@ -67,6 +67,17 @@ fn validate_peer(bytes: &[u8]) -> Result<(), TicketError> {
         .map(|_| ())
         .map_err(|_| TicketError::Invalid)
 }
+fn validate_identifier(value: &str) -> Result<(), TicketError> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(TicketError::Invalid);
+    }
+    Ok(())
+}
 fn put_bytes(o: &mut Vec<u8>, v: &[u8]) -> Result<(), TicketError> {
     if v.len() > u8::MAX as usize {
         return Err(TicketError::Invalid);
@@ -91,6 +102,8 @@ impl ConnectionTicketClaimsV1 {
         if self.issuer_exchange_peer_id.is_empty()
             || self.client_peer_id.is_empty()
             || self.server_peer_id.is_empty()
+            || validate_identifier(&self.tenant).is_err()
+            || validate_identifier(&self.upstream_id).is_err()
             || self.not_before > self.expires_at
             || self.expires_at.saturating_sub(self.not_before) > 60
             || self.permissions != 4
@@ -339,6 +352,15 @@ mod tests {
         let mut x = t.clone();
         *x.last_mut().unwrap() ^= 1;
         assert!(verify_envelope(&x, s.key_id, &s.public_key()).is_err());
+        for index in 24..t.len() - 64 {
+            let mut mutated = t.clone();
+            mutated[index] ^= 1;
+            assert!(verify_envelope(&mutated, s.key_id, &s.public_key()).is_err());
+        }
+        let mut wrong_key = TicketSigner::from_seed([8; 32]);
+        assert!(verify_envelope(&t, wrong_key.key_id, &wrong_key.public_key()).is_err());
+        wrong_key.key_id = s.key_id;
+        assert!(verify_envelope(&t, wrong_key.key_id, &wrong_key.public_key()).is_err());
         let v: serde_json::Value =
             serde_json::from_str(include_str!("../testdata/ticket-v1.json")).unwrap();
         let h = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();

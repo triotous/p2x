@@ -46,10 +46,11 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), SecretFileErro
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = PathBuf::from(parent);
     tmp.push(format!(
-        ".{}.tmp",
+        ".{}.{}.tmp",
         path.file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("secret")
+            .unwrap_or("secret"),
+        std::process::id()
     ));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
