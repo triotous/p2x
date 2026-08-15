@@ -2,6 +2,10 @@ use crate::probe::{
     MAX_HEADER, MAX_TRANSFER, ProbeAck, ProbeError, ProbeHeader, ProbeMode, ProbePath,
     ProbeTerminal, SCHEMA_VERSION, decode_header, pattern_byte,
 };
+use futures::io::{
+    AsyncRead as FuturesRead, AsyncReadExt as FuturesReadExt, AsyncWrite as FuturesWrite,
+    AsyncWriteExt as FuturesWriteExt,
+};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{Duration, timeout};
@@ -134,9 +138,22 @@ where
         .map_err(|_| ProbeError::Timeout)??;
     let header = decode_header(&frame)?;
     if header.mode == ProbeMode::NonceEcho {
-        let ack =
-            serde_json::to_vec(&header).map_err(|error| ProbeError::Invalid(error.to_string()))?;
-        write_frame_async(writer, &ack).await?;
+        let ack = ProbeAck {
+            schema_version: SCHEMA_VERSION,
+            nonce: header.nonce,
+            request_id: header.request_id,
+            path: ProbePath::Relay,
+            connection_id_hash: 0,
+            bytes_read: 0,
+            bytes_written: 0,
+            read_hash: 0,
+            write_hash: 0,
+            half_close: false,
+            terminal: ProbeTerminal::Ok,
+        };
+        let body =
+            serde_json::to_vec(&ack).map_err(|error| ProbeError::Invalid(error.to_string()))?;
+        write_frame_async(writer, &body).await?;
     }
     Ok(header)
 }
@@ -186,6 +203,88 @@ where
     };
     let body = serde_json::to_vec(&ack).map_err(|error| ProbeError::Invalid(error.to_string()))?;
     write_frame_async(stream, &body).await?;
+    Ok(ack)
+}
+
+pub async fn send_header<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    header: &ProbeHeader,
+) -> Result<(), ProbeError> {
+    let body =
+        serde_json::to_vec(header).map_err(|error| ProbeError::Invalid(error.to_string()))?;
+    write_frame_async(writer, &body).await
+}
+
+pub async fn read_ack<R: AsyncRead + Unpin>(reader: &mut R) -> Result<ProbeAck, ProbeError> {
+    let body = timeout(WORKER_TIMEOUT, read_frame_async(reader))
+        .await
+        .map_err(|_| ProbeError::Timeout)??;
+    serde_json::from_slice(&body).map_err(|error| ProbeError::Invalid(error.to_string()))
+}
+
+pub async fn write_frame_futures<W: FuturesWrite + Unpin>(
+    writer: &mut W,
+    body: &[u8],
+) -> Result<(), ProbeError> {
+    if body.len() > MAX_HEADER {
+        return Err(ProbeError::TooLarge);
+    }
+    writer
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .await
+        .map_err(|_| ProbeError::Truncated)?;
+    writer
+        .write_all(body)
+        .await
+        .map_err(|_| ProbeError::Truncated)
+}
+
+pub async fn read_frame_futures<R: FuturesRead + Unpin>(
+    reader: &mut R,
+) -> Result<Vec<u8>, ProbeError> {
+    let mut prefix = [0; 4];
+    reader
+        .read_exact(&mut prefix)
+        .await
+        .map_err(|_| ProbeError::Truncated)?;
+    let length = u32::from_be_bytes(prefix) as usize;
+    if length > MAX_HEADER {
+        return Err(ProbeError::TooLarge);
+    }
+    let mut body = vec![0; length];
+    reader
+        .read_exact(&mut body)
+        .await
+        .map_err(|_| ProbeError::Truncated)?;
+    Ok(body)
+}
+
+pub async fn execute_probe_futures<S>(
+    stream: &mut S,
+    path: ProbePath,
+    connection_id_hash: u64,
+) -> Result<ProbeAck, ProbeError>
+where
+    S: FuturesRead + FuturesWrite + Unpin,
+{
+    let body = read_frame_futures(stream).await?;
+    let header = decode_header(&body)?;
+    let ack = ProbeAck {
+        schema_version: SCHEMA_VERSION,
+        nonce: header.nonce,
+        request_id: header.request_id,
+        path,
+        connection_id_hash,
+        bytes_read: 0,
+        bytes_written: 0,
+        read_hash: 0,
+        write_hash: 0,
+        half_close: false,
+        terminal: ProbeTerminal::Ok,
+    };
+    let encoded =
+        serde_json::to_vec(&ack).map_err(|error| ProbeError::Invalid(error.to_string()))?;
+    write_frame_futures(stream, &encoded).await?;
     Ok(ack)
 }
 
