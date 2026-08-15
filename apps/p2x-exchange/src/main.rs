@@ -1,8 +1,11 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use libp2p::{Multiaddr, swarm::SwarmEvent};
 use p2x_net::{
-    builder::{SwarmConfig, build_exchange_swarm, lab_identity},
+    builder::{
+        ExchangeSwarmConfig, RelayProfile, build_exchange_swarm, lab_identity,
+        start_exchange_listeners,
+    },
     lifecycle::Emitter,
 };
 use std::io;
@@ -13,8 +16,27 @@ struct Args {
     identity_seed: Option<u64>,
     #[arg(long, default_value = "/ip4/127.0.0.1/tcp/0")]
     tcp_listen: Multiaddr,
+    #[arg(long, default_value = "/ip4/127.0.0.1/udp/0/quic-v1")]
+    quic_listen: Multiaddr,
+    #[arg(long, value_enum, default_value_t = RelayProfileArg::DefaultLab)]
+    relay_profile: RelayProfileArg,
     #[arg(long)]
     unsafe_lab_public_relay: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RelayProfileArg {
+    DefaultLab,
+    LimitTest,
+}
+
+impl From<RelayProfileArg> for RelayProfile {
+    fn from(value: RelayProfileArg) -> Self {
+        match value {
+            RelayProfileArg::DefaultLab => Self::DefaultLab,
+            RelayProfileArg::LimitTest => Self::LimitTest,
+        }
+    }
 }
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -22,16 +44,14 @@ async fn main() -> io::Result<()> {
     let run_id = std::env::var("P2X_RUN_ID").unwrap_or_else(|_| "manual".into());
     let emitter = Emitter::new("exchange", &run_id);
     let key = lab_identity(args.identity_seed).map_err(io::Error::other)?;
-    let mut swarm = build_exchange_swarm(
-        key,
-        SwarmConfig {
-            tcp_listen: Some(args.tcp_listen.clone()),
-            allow_public: args.unsafe_lab_public_relay,
-            ..Default::default()
-        },
-    )
-    .map_err(io::Error::other)?;
-    swarm.listen_on(args.tcp_listen).map_err(io::Error::other)?;
+    let config = ExchangeSwarmConfig {
+        tcp_listen: args.tcp_listen,
+        quic_listen: args.quic_listen,
+        allow_public: args.unsafe_lab_public_relay,
+        relay_profile: args.relay_profile.into(),
+    };
+    let mut swarm = build_exchange_swarm(key, &config).map_err(io::Error::other)?;
+    start_exchange_listeners(&mut swarm, &config).map_err(io::Error::other)?;
     emitter.event("started", Some(&swarm.local_peer_id().to_string()))?;
     loop {
         tokio::select! {

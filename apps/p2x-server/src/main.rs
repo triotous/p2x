@@ -2,7 +2,7 @@ use clap::Parser;
 use futures::StreamExt;
 use libp2p::{Multiaddr, multiaddr::Protocol, swarm::SwarmEvent};
 use p2x_net::{
-    builder::{PeerEvent, SwarmConfig, build_peer_swarm, lab_identity},
+    builder::{PeerEvent, PeerSwarmConfig, build_peer_swarm, lab_identity, start_peer_listeners},
     lifecycle::Emitter,
     probe_stream::behaviour::ProbeOutput,
     probe_worker::execute_probe_futures,
@@ -15,6 +15,8 @@ struct Args {
     identity_seed: Option<u64>,
     #[arg(long, default_value = "/ip4/127.0.0.1/tcp/0")]
     tcp_listen: Multiaddr,
+    #[arg(long, default_value = "/ip4/127.0.0.1/udp/0/quic-v1")]
+    quic_listen: Multiaddr,
     /// Exchange relay address, including its /p2p/<peer-id> component.
     #[arg(long)]
     exchange: Option<Multiaddr>,
@@ -25,8 +27,12 @@ async fn main() -> io::Result<()> {
     let run_id = std::env::var("P2X_RUN_ID").unwrap_or_else(|_| "manual".into());
     let emitter = Emitter::new("server", &run_id);
     let key = lab_identity(args.identity_seed).map_err(io::Error::other)?;
-    let mut swarm = build_peer_swarm(key, SwarmConfig::default()).map_err(io::Error::other)?;
-    swarm.listen_on(args.tcp_listen).map_err(io::Error::other)?;
+    let config = PeerSwarmConfig {
+        tcp_listen: args.tcp_listen,
+        quic_listen: args.quic_listen,
+    };
+    let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
+    start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
     let mut relay_peer_id = None;
     let mut pending_circuit = None;
     let mut reservation_requested = false;

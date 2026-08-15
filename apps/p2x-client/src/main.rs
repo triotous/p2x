@@ -3,7 +3,7 @@ use futures::StreamExt;
 use futures::io::AsyncWriteExt;
 use libp2p::{Multiaddr, swarm::SwarmEvent};
 use p2x_net::{
-    builder::{SwarmConfig, build_peer_swarm, lab_identity},
+    builder::{PeerSwarmConfig, build_peer_swarm, lab_identity, start_peer_listeners},
     lifecycle::Emitter,
     probe::{ProbeAck, ProbeHeader, ProbeMode, SCHEMA_VERSION},
     probe_stream::behaviour::ProbeOutput,
@@ -24,6 +24,10 @@ struct Args {
     exchange: Option<Multiaddr>,
     #[arg(long)]
     server: Option<Multiaddr>,
+    #[arg(long, default_value = "/ip4/127.0.0.1/tcp/0")]
+    tcp_listen: Multiaddr,
+    #[arg(long, default_value = "/ip4/127.0.0.1/udp/0/quic-v1")]
+    quic_listen: Multiaddr,
     #[arg(long, value_enum, default_value_t = Path::Relay)]
     path: Path,
     #[arg(long, default_value_t = 1)]
@@ -41,7 +45,12 @@ async fn main() -> io::Result<()> {
     let run_id = std::env::var("P2X_RUN_ID").unwrap_or_else(|_| "manual".into());
     let emitter = Emitter::new("client", &run_id);
     let key = lab_identity(args.identity_seed).map_err(io::Error::other)?;
-    let mut swarm = build_peer_swarm(key, SwarmConfig::default()).map_err(io::Error::other)?;
+    let config = PeerSwarmConfig {
+        tcp_listen: args.tcp_listen,
+        quic_listen: args.quic_listen,
+    };
+    let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
+    start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
     let server_address = args.server.clone();
     let target_peer = args.server.as_ref().and_then(|address| {
         address.iter().fold(None, |last, part| match part {
