@@ -4,13 +4,18 @@ use crate::{
 };
 use p2x_protocol::{AuthRequest, AuthResponse, PublicError, PublicErrorCode};
 
+fn random_session_id() -> [u8; 16] {
+    let mut id = [0; 16];
+    getrandom::fill(&mut id).expect("OS randomness unavailable");
+    id
+}
+
 pub fn handle_request(
     provider: &FixedTokenProvider,
     sessions: &mut AuthSessionLedger,
     peer_id: &str,
     request: AuthRequest,
     now: i64,
-    session_id: [u8; 16],
 ) -> AuthResponse {
     match request {
         AuthRequest::Authenticate {
@@ -28,10 +33,10 @@ pub fn handle_request(
                 now,
             );
             match result {
-                Ok(principal) => match sessions.authenticate(principal, session_id, now) {
+                Ok(principal) => match sessions.authenticate(principal, random_session_id(), now) {
                     SessionAction::Authenticated(session) => AuthResponse::Authenticated {
                         request_id,
-                        session_id,
+                        session_id: session.session_id,
                         tenant: session.principal.tenant,
                         role: session.principal.role,
                         scopes: session.principal.scopes,
@@ -111,20 +116,21 @@ mod tests {
                 supported_features: 0,
             },
             1,
-            [2; 16],
         );
-        assert!(matches!(response, AuthResponse::Authenticated { .. }));
+        let session_id = match response {
+            AuthResponse::Authenticated { session_id, .. } => session_id,
+            _ => panic!("authentication failed"),
+        };
         let pong = handle_request(
             &provider,
             &mut ledger,
             "peer",
             AuthRequest::Ping {
                 request_id: [3; 16],
-                session_id: [2; 16],
+                session_id,
                 nonce: 9,
             },
             2,
-            [0; 16],
         );
         assert!(matches!(pong, AuthResponse::Pong { nonce: 9, .. }));
     }

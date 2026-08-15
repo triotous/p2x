@@ -226,6 +226,20 @@ pub fn decode_envelope(
     let sig = Signature::from_slice(&e[24 + n..]).map_err(|_| TicketError::Invalid)?;
     Ok((id, c, sig))
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TicketValidation<'a> {
+    pub issuer_exchange_peer_id: &'a [u8],
+    pub client_peer_id: &'a [u8],
+    pub server_peer_id: &'a [u8],
+    pub tenant: &'a str,
+    pub upstream_id: &'a str,
+    pub selector_fingerprint: [u8; 32],
+    pub registration_revision: u64,
+    pub authorization_revision: u64,
+    pub now: i64,
+    pub clock_skew: i64,
+}
+
 pub fn verify_envelope(e: &[u8], key_id: [u8; 16], key: &VerifyingKey) -> Result<(), TicketError> {
     let (id, c, sig) = decode_envelope(e)?;
     if id != key_id {
@@ -236,6 +250,30 @@ pub fn verify_envelope(e: &[u8], key_id: [u8; 16], key: &VerifyingKey) -> Result
     m.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
     m.extend_from_slice(&bytes);
     key.verify(&m, &sig).map_err(|_| TicketError::Invalid)
+}
+
+pub fn verify_and_validate(
+    e: &[u8],
+    key_id: [u8; 16],
+    key: &VerifyingKey,
+    expected: &TicketValidation<'_>,
+) -> Result<(), TicketError> {
+    verify_envelope(e, key_id, key)?;
+    let (_, c, _) = decode_envelope(e)?;
+    if c.issuer_exchange_peer_id != expected.issuer_exchange_peer_id
+        || c.client_peer_id != expected.client_peer_id
+        || c.server_peer_id != expected.server_peer_id
+        || c.tenant != expected.tenant
+        || c.upstream_id != expected.upstream_id
+        || c.selector_fingerprint != expected.selector_fingerprint
+        || c.registration_revision != expected.registration_revision
+        || c.authorization_revision != expected.authorization_revision
+        || c.not_before > expected.now.saturating_add(expected.clock_skew)
+        || c.expires_at < expected.now.saturating_sub(expected.clock_skew)
+    {
+        return Err(TicketError::Invalid);
+    }
+    Ok(())
 }
 #[cfg(test)]
 mod tests {

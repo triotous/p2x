@@ -14,6 +14,7 @@ p2x-protocol = { path = "../../crates/p2x-protocol" }
 thiserror.workspace = true
 clap.workspace = true
 futures.workspace = true
+getrandom.workspace = true
 libp2p.workspace = true
 p2x-net = { path = "../../crates/p2x-net" }
 tokio.workspace = true
