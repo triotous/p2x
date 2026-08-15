@@ -64,7 +64,8 @@ impl<'a> Emitter<'a> {
         let stdout = io::stdout();
         let mut out = stdout.lock();
         serde_json::to_writer(&mut out, value).map_err(io::Error::other)?;
-        out.write_all(b"\n")
+        out.write_all(b"\n")?;
+        out.flush()
     }
 }
 
