@@ -33,6 +33,15 @@ fn forced_path_matches(path: Path, observed_path: ProbePath) -> bool {
             | (Path::Both, ProbePath::Direct | ProbePath::Relay)
     )
 }
+
+fn release_failed_launch(
+    launched: &mut u64,
+    opened_connections: &mut HashSet<libp2p::swarm::ConnectionId>,
+    connection_id: libp2p::swarm::ConnectionId,
+) {
+    *launched = launched.saturating_sub(1);
+    opened_connections.remove(&connection_id);
+}
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(long)]
@@ -260,6 +269,7 @@ async fn main() -> io::Result<()> {
                         if args.recover_after_failure && !recovery_attempted {
                             recovery_attempted = true;
                             started = false;
+                            release_failed_launch(&mut launched, &mut forced_opened_connections, worker.connection_id);
                             swarm.close_connection(worker.connection_id);
                             if let Some(address) = server_address.clone() { swarm.dial(address).map_err(io::Error::other)?; }
                             let message = error.to_string(); emitter.emit(&LifecycleRecord::OperationalError { code: "probe.recovering", message: &message })?;
@@ -357,6 +367,7 @@ async fn main() -> io::Result<()> {
                             if args.recover_after_failure && !recovery_attempted {
                                 recovery_attempted = true;
                                 started = false;
+                                release_failed_launch(&mut launched, &mut forced_opened_connections, connection_id);
                                 if let Some(address) = server_address.clone() { swarm.dial(address).map_err(io::Error::other)?; }
                                 emitter.emit(&LifecycleRecord::OperationalError { code: "probe.recovering", message: code })?;
                                 continue;
@@ -424,5 +435,17 @@ mod tests {
         assert!(forced_path_matches(Path::Both, ProbePath::Direct));
         assert!(forced_path_matches(Path::Both, ProbePath::Relay));
         assert!(!forced_path_matches(Path::Auto, ProbePath::Direct));
+    }
+
+    #[test]
+    fn recovery_releases_failed_launch_budget_and_connection() {
+        let connection_id = libp2p::swarm::ConnectionId::new_unchecked(7);
+        let mut launched = 1;
+        let mut opened = HashSet::from([connection_id]);
+
+        release_failed_launch(&mut launched, &mut opened, connection_id);
+
+        assert_eq!(launched, 0);
+        assert!(opened.is_empty());
     }
 }
