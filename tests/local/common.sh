@@ -28,7 +28,7 @@ start_services() {
     --identity-seed 2 --exchange "$exchange_addr" --tcp-listen /ip4/127.0.0.1/tcp/0 >"$OUT/server.ndjson" 2>&1 &
   pids+=("$!")
   for _ in $(seq 1 100); do
-    circuit_addr=$(awk -F'"detail":"' '/"event":"reservation_accepted"/{split($2,a,"\""); print a[1]; exit}' "$OUT/server.ndjson" || true)
+    circuit_addr=$(awk -F'"detail":"' '/"event":"circuit_ready"/{split($2,a,"\""); print a[1]; exit}' "$OUT/server.ndjson" || true)
     [[ -n "${circuit_addr:-}" ]] && break
     sleep 0.1
   done
@@ -40,8 +40,15 @@ start_services() {
 run_local_case() {
   local case_id=$1
   start_services "$case_id"
-  printf '{"schema_version":1,"case":"%s","run_id":"%s","passed":false,"terminal_code":"not_implemented","reason":"the binary lifecycle required by this case is not implemented","artifacts":["exchange.ndjson","server.ndjson"]}\n' "$case_id" "$RUN_ID" >"$OUT/summary.json"
+  for _ in $(seq 1 200); do
+    if grep -q '"event":"probe_succeeded"' "$OUT/client.ndjson" && grep -q '"event":"probe_observed"' "$OUT/server.ndjson"; then
+      printf '{"schema_version":1,"case":"%s","run_id":"%s","passed":true,"terminal_code":"probe.ok","artifacts":["exchange.ndjson","server.ndjson","client.ndjson"]}\n' "$case_id" "$RUN_ID" >"$OUT/summary.json"
+      cat "$OUT/summary.json"
+      return 0
+    fi
+    sleep 0.1
+  done
+  printf '{"schema_version":1,"case":"%s","run_id":"%s","passed":false,"terminal_code":"failed","reason":"probe lifecycle did not complete","artifacts":["exchange.ndjson","server.ndjson","client.ndjson"]}\n' "$case_id" "$RUN_ID" >"$OUT/summary.json"
   cat "$OUT/summary.json"
-  echo "$case_id is not implemented; services were started and stopped" >&2
-  return 2
+  return 1
 }

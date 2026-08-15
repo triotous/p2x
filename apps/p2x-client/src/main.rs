@@ -1,5 +1,6 @@
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
+use futures::io::AsyncWriteExt;
 use libp2p::{Multiaddr, swarm::SwarmEvent};
 use p2x_net::{
     builder::{SwarmConfig, build_peer_swarm, lab_identity},
@@ -74,6 +75,7 @@ async fn main() -> io::Result<()> {
                             let header = ProbeHeader { schema_version: SCHEMA_VERSION, request_id: request_id.0, mode: ProbeMode::NonceEcho, nonce: request_id.0, length: 0, slow_delay_ms: 0, slow_chunk_size: 0 };
                             let body = serde_json::to_vec(&header).map_err(io::Error::other)?;
                             write_frame_futures(&mut stream, &body).await.map_err(io::Error::other)?;
+                            stream.close().await.map_err(io::Error::other)?;
                             let ack_body = read_frame_futures(&mut stream).await.map_err(io::Error::other)?;
                             let ack: ProbeAck = serde_json::from_slice(&ack_body).map_err(io::Error::other)?;
                             if ack.nonce != header.nonce || ack.request_id != header.request_id {
@@ -81,7 +83,7 @@ async fn main() -> io::Result<()> {
                             }
                             emitter.event("probe_succeeded", Some(&format!("peer_id={peer_id} connection_id={connection_id:?} path={:?}", ack.path)))?;
                             emitter.terminal("passed", "probe.ok")?;
-                            break;
+                            return Ok(());
                         }
                         ProbeOutput::OutboundFailed { code, .. } => {
                             emitter.terminal("failed", code)?;

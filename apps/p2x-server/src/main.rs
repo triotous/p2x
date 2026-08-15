@@ -50,10 +50,7 @@ async fn main() -> io::Result<()> {
             .with(Protocol::P2pCircuit)
             .with(Protocol::P2p(*swarm.local_peer_id()));
         pending_circuit = Some(circuit.clone());
-        let advertised = exchange
-            .clone()
-            .with(Protocol::P2pCircuit)
-            .with(Protocol::P2p(*swarm.local_peer_id()));
+        let advertised = circuit.clone();
         emitter.event(
             "relay_dial",
             Some(&format!("relay={relay_peer} circuit={advertised}")),
@@ -66,7 +63,12 @@ async fn main() -> io::Result<()> {
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
-                        emitter.event("listen_addr", Some(&address.to_string()))?;
+                        let event = if address.to_string().contains("p2p-circuit") {
+                            "circuit_ready"
+                        } else {
+                            "listen_addr"
+                        };
+                        emitter.event(event, Some(&address.to_string()))?;
                     }
                     SwarmEvent::ExternalAddrConfirmed { address } => {
                         if address.to_string().contains("p2p-circuit") {
@@ -90,11 +92,14 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::ListenerError { error, .. } => {
                         emitter.event("listener_error", Some(&error.to_string()))?;
                     }
+                    SwarmEvent::ListenerClosed { reason, .. } => {
+                        emitter.event("listener_closed", Some(&format!("{reason:?}")))?;
+                    }
                     SwarmEvent::Behaviour(PeerEvent::Relay(relay_event)) => {
                         let accepted = matches!(relay_event, libp2p::relay::client::Event::ReservationReqAccepted { .. });
                         emitter.event("relay_event", Some(&format!("{relay_event:?}")))?;
-                        if accepted && let Some(address) = pending_circuit.as_ref() {
-                            emitter.event("reservation_accepted", Some(&address.to_string()))?;
+                        if accepted {
+                            emitter.event("reservation_accepted", None)?;
                         }
                     }
                     SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundOpened { mut stream, peer_id, connection_id })) => {
