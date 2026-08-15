@@ -34,7 +34,8 @@ async fn main() -> io::Result<()> {
     swarm.listen_on(args.tcp_listen).map_err(io::Error::other)?;
     emitter.event("started", Some(&swarm.local_peer_id().to_string()))?;
     loop {
-        tokio::select! { _ = tokio::signal::ctrl_c() => break, event = swarm.select_next_some() => { if let SwarmEvent::NewListenAddr { address, .. } = event { emitter.event("listen_addr", Some(&address.to_string()))?; } } }
+        tokio::select! { _ = tokio::signal::ctrl_c() => break, event = swarm.select_next_some() => { if let SwarmEvent::NewListenAddr { address, .. } = event { let advertised = address.with(libp2p::multiaddr::Protocol::P2p(*swarm.local_peer_id()));
+        emitter.event("listen_addr", Some(&advertised.to_string()))?; } } }
     }
     emitter.terminal("stopped", "shutdown")?;
     Ok(())
