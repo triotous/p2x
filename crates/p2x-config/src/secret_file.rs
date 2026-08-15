@@ -3,6 +3,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
+    path::PathBuf,
 };
 use thiserror::Error;
 pub const MAX_SECRET_FILE: usize = 4096;
@@ -42,11 +43,22 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), SecretFileErro
     if bytes.is_empty() || bytes.len() > MAX_SECRET_FILE {
         return Err(SecretFileError::InvalidSize);
     }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = PathBuf::from(parent);
+    tmp.push(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("secret")
+    ));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
-    let mut file = options.open(path)?;
+    let mut file = options.open(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    fs::rename(&tmp, path)?;
+    let directory = OpenOptions::new().read(true).open(parent)?;
+    directory.sync_all()?;
     Ok(())
 }
 #[cfg(test)]

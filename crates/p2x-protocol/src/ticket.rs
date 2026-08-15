@@ -27,20 +27,55 @@ pub enum TicketError {
     #[error("ticket exceeds bound")]
     TooLarge,
 }
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), TicketError> {
-    if bytes.len() > u8::MAX as usize {
+fn take<'a>(b: &'a [u8], p: &mut usize, n: usize) -> Result<&'a [u8], TicketError> {
+    let end = p.checked_add(n).ok_or(TicketError::Invalid)?;
+    let v = b.get(*p..end).ok_or(TicketError::Invalid)?;
+    *p = end;
+    Ok(v)
+}
+fn u16v(b: &[u8], p: &mut usize) -> Result<u16, TicketError> {
+    Ok(u16::from_be_bytes(
+        take(b, p, 2)?
+            .try_into()
+            .map_err(|_| TicketError::Invalid)?,
+    ))
+}
+fn u64v(b: &[u8], p: &mut usize) -> Result<u64, TicketError> {
+    Ok(u64::from_be_bytes(
+        take(b, p, 8)?
+            .try_into()
+            .map_err(|_| TicketError::Invalid)?,
+    ))
+}
+fn i64v(b: &[u8], p: &mut usize) -> Result<i64, TicketError> {
+    Ok(i64::from_be_bytes(
+        take(b, p, 8)?
+            .try_into()
+            .map_err(|_| TicketError::Invalid)?,
+    ))
+}
+fn bytes(b: &[u8], p: &mut usize) -> Result<Vec<u8>, TicketError> {
+    let n = take(b, p, 1)?[0] as usize;
+    Ok(take(b, p, n)?.to_vec())
+}
+fn text(b: &[u8], p: &mut usize) -> Result<String, TicketError> {
+    let n = u16v(b, p)? as usize;
+    String::from_utf8(take(b, p, n)?.to_vec()).map_err(|_| TicketError::Invalid)
+}
+fn put_bytes(o: &mut Vec<u8>, v: &[u8]) -> Result<(), TicketError> {
+    if v.len() > u8::MAX as usize {
         return Err(TicketError::Invalid);
     }
-    out.push(bytes.len() as u8);
-    out.extend_from_slice(bytes);
+    o.push(v.len() as u8);
+    o.extend_from_slice(v);
     Ok(())
 }
-fn put_text(out: &mut Vec<u8>, text: &str) -> Result<(), TicketError> {
-    if text.len() > u16::MAX as usize {
+fn put_text(o: &mut Vec<u8>, v: &str) -> Result<(), TicketError> {
+    if v.len() > u16::MAX as usize {
         return Err(TicketError::Invalid);
     }
-    out.extend_from_slice(&(text.len() as u16).to_be_bytes());
-    out.extend_from_slice(text.as_bytes());
+    o.extend_from_slice(&(v.len() as u16).to_be_bytes());
+    o.extend_from_slice(v.as_bytes());
     Ok(())
 }
 impl ConnectionTicketClaimsV1 {
@@ -55,25 +90,78 @@ impl ConnectionTicketClaimsV1 {
         {
             return Err(TicketError::Invalid);
         }
-        let mut out = Vec::new();
-        out.extend_from_slice(&1u16.to_be_bytes());
-        put_bytes(&mut out, &self.issuer_exchange_peer_id)?;
-        put_text(&mut out, &self.tenant)?;
-        put_bytes(&mut out, &self.client_peer_id)?;
-        put_bytes(&mut out, &self.server_peer_id)?;
-        put_text(&mut out, &self.upstream_id)?;
-        out.extend_from_slice(&self.selector_fingerprint);
-        out.extend_from_slice(&self.registration_revision.to_be_bytes());
-        out.extend_from_slice(&self.authorization_revision.to_be_bytes());
-        out.extend_from_slice(&self.permissions.to_be_bytes());
-        out.extend_from_slice(&self.not_before.to_be_bytes());
-        out.extend_from_slice(&self.expires_at.to_be_bytes());
-        out.extend_from_slice(&self.ticket_id);
-        out.extend_from_slice(&self.max_streams.to_be_bytes());
-        if out.len() > MAX_TICKET_CLAIMS {
+        let mut o = Vec::new();
+        o.extend_from_slice(&1u16.to_be_bytes());
+        put_bytes(&mut o, &self.issuer_exchange_peer_id)?;
+        put_text(&mut o, &self.tenant)?;
+        put_bytes(&mut o, &self.client_peer_id)?;
+        put_bytes(&mut o, &self.server_peer_id)?;
+        put_text(&mut o, &self.upstream_id)?;
+        o.extend_from_slice(&self.selector_fingerprint);
+        o.extend_from_slice(&self.registration_revision.to_be_bytes());
+        o.extend_from_slice(&self.authorization_revision.to_be_bytes());
+        o.extend_from_slice(&self.permissions.to_be_bytes());
+        o.extend_from_slice(&self.not_before.to_be_bytes());
+        o.extend_from_slice(&self.expires_at.to_be_bytes());
+        o.extend_from_slice(&self.ticket_id);
+        o.extend_from_slice(&self.max_streams.to_be_bytes());
+        if o.len() > MAX_TICKET_CLAIMS {
+            Err(TicketError::TooLarge)
+        } else {
+            Ok(o)
+        }
+    }
+    pub fn decode(b: &[u8]) -> Result<Self, TicketError> {
+        if b.len() > MAX_TICKET_CLAIMS {
             return Err(TicketError::TooLarge);
         }
-        Ok(out)
+        let mut p = 0;
+        if u16v(b, &mut p)? != 1 {
+            return Err(TicketError::Invalid);
+        }
+        let issuer = bytes(b, &mut p)?;
+        let tenant = text(b, &mut p)?;
+        let client = bytes(b, &mut p)?;
+        let server = bytes(b, &mut p)?;
+        let upstream = text(b, &mut p)?;
+        let selector = take(b, &mut p, 32)?
+            .try_into()
+            .map_err(|_| TicketError::Invalid)?;
+        let registration_revision = u64v(b, &mut p)?;
+        let authorization_revision = u64v(b, &mut p)?;
+        let permissions = u32::from_be_bytes(
+            take(b, &mut p, 4)?
+                .try_into()
+                .map_err(|_| TicketError::Invalid)?,
+        );
+        let not_before = i64v(b, &mut p)?;
+        let expires_at = i64v(b, &mut p)?;
+        let ticket_id = take(b, &mut p, 16)?
+            .try_into()
+            .map_err(|_| TicketError::Invalid)?;
+        let max_streams = u16v(b, &mut p)?;
+        if p != b.len() {
+            return Err(TicketError::Invalid);
+        }
+        let c = Self {
+            issuer_exchange_peer_id: issuer,
+            tenant,
+            client_peer_id: client,
+            server_peer_id: server,
+            upstream_id: upstream,
+            selector_fingerprint: selector,
+            registration_revision,
+            authorization_revision,
+            permissions,
+            not_before,
+            expires_at,
+            ticket_id,
+            max_streams,
+        };
+        if c.encode()? != b {
+            return Err(TicketError::Invalid);
+        }
+        Ok(c)
     }
 }
 pub struct TicketSigner {
@@ -83,58 +171,63 @@ pub struct TicketSigner {
 impl TicketSigner {
     pub fn from_seed(seed: [u8; 32]) -> Self {
         let key = SigningKey::from_bytes(&seed);
-        let digest = Sha256::digest(key.verifying_key().as_bytes());
-        let mut key_id = [0; 16];
-        key_id.copy_from_slice(&digest[..16]);
-        Self { key, key_id }
+        let d = Sha256::digest(key.verifying_key().as_bytes());
+        let mut id = [0; 16];
+        id.copy_from_slice(&d[..16]);
+        Self { key, key_id: id }
     }
-    pub fn sign(&self, claims: &ConnectionTicketClaimsV1) -> Result<Vec<u8>, TicketError> {
-        let claims = claims.encode()?;
-        let mut message = b"p2x-ticket-v1\0".to_vec();
-        message.extend_from_slice(&(claims.len() as u16).to_be_bytes());
-        message.extend_from_slice(&claims);
-        let signature = self.key.sign(&message);
-        let mut out = b"P2XT".to_vec();
-        out.push(1);
-        out.push(16);
-        out.extend_from_slice(&self.key_id);
-        out.extend_from_slice(&(claims.len() as u16).to_be_bytes());
-        out.extend_from_slice(&claims);
-        out.extend_from_slice(&signature.to_bytes());
-        if out.len() > MAX_TICKET_ENVELOPE {
-            return Err(TicketError::TooLarge);
+    pub fn sign(&self, c: &ConnectionTicketClaimsV1) -> Result<Vec<u8>, TicketError> {
+        let c = c.encode()?;
+        let mut m = b"p2x-ticket-v1\0".to_vec();
+        m.extend_from_slice(&(c.len() as u16).to_be_bytes());
+        m.extend_from_slice(&c);
+        let sig = self.key.sign(&m);
+        let mut o = b"P2XT".to_vec();
+        o.extend_from_slice(&[1, 16]);
+        o.extend_from_slice(&self.key_id);
+        o.extend_from_slice(&(c.len() as u16).to_be_bytes());
+        o.extend_from_slice(&c);
+        o.extend_from_slice(&sig.to_bytes());
+        if o.len() > MAX_TICKET_ENVELOPE {
+            Err(TicketError::TooLarge)
+        } else {
+            Ok(o)
         }
-        Ok(out)
     }
     pub fn public_key(&self) -> VerifyingKey {
         self.key.verifying_key()
     }
 }
-pub fn verify_envelope(
-    envelope: &[u8],
-    key_id: [u8; 16],
-    key: &VerifyingKey,
-) -> Result<(), TicketError> {
-    if envelope.len() > MAX_TICKET_ENVELOPE
-        || envelope.len() < 4 + 1 + 1 + 16 + 2 + 64
-        || &envelope[..4] != b"P2XT"
-        || envelope[4] != 1
-        || envelope[5] != 16
-        || envelope[6..22] != key_id
+pub fn decode_envelope(
+    e: &[u8],
+) -> Result<([u8; 16], ConnectionTicketClaimsV1, Signature), TicketError> {
+    if e.len() > MAX_TICKET_ENVELOPE
+        || e.len() < 88
+        || &e[..4] != b"P2XT"
+        || e[4] != 1
+        || e[5] != 16
     {
         return Err(TicketError::Invalid);
     }
-    let len = u16::from_be_bytes([envelope[22], envelope[23]]) as usize;
-    if len > MAX_TICKET_CLAIMS || envelope.len() != 24 + len + 64 {
+    let id = e[6..22].try_into().map_err(|_| TicketError::Invalid)?;
+    let n = u16::from_be_bytes([e[22], e[23]]) as usize;
+    if e.len() != 24 + n + 64 {
         return Err(TicketError::Invalid);
     }
-    let mut message = b"p2x-ticket-v1\0".to_vec();
-    message.extend_from_slice(&(len as u16).to_be_bytes());
-    message.extend_from_slice(&envelope[24..24 + len]);
-    let signature =
-        Signature::from_slice(&envelope[24 + len..]).map_err(|_| TicketError::Invalid)?;
-    key.verify(&message, &signature)
-        .map_err(|_| TicketError::Invalid)
+    let c = ConnectionTicketClaimsV1::decode(&e[24..24 + n])?;
+    let sig = Signature::from_slice(&e[24 + n..]).map_err(|_| TicketError::Invalid)?;
+    Ok((id, c, sig))
+}
+pub fn verify_envelope(e: &[u8], key_id: [u8; 16], key: &VerifyingKey) -> Result<(), TicketError> {
+    let (id, c, sig) = decode_envelope(e)?;
+    if id != key_id {
+        return Err(TicketError::Invalid);
+    }
+    let bytes = c.encode()?;
+    let mut m = b"p2x-ticket-v1\0".to_vec();
+    m.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    m.extend_from_slice(&bytes);
+    key.verify(&m, &sig).map_err(|_| TicketError::Invalid)
 }
 #[cfg(test)]
 mod tests {
@@ -157,31 +250,25 @@ mod tests {
         }
     }
     #[test]
-    fn committed_vector_reproduces_exact_bytes() {
+    fn decode_is_canonical() {
         let c = claims();
-        let signer = TicketSigner::from_seed([9; 32]);
-        let encoded = c.encode().unwrap();
-        let ticket = signer.sign(&c).unwrap();
-        let vector: serde_json::Value =
-            serde_json::from_str(include_str!("../testdata/ticket-v1.json")).unwrap();
-        let hex = |bytes: &[u8]| {
-            bytes
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        };
-        assert_eq!(hex(&encoded), vector["claims_hex"]);
-        assert_eq!(hex(&ticket), vector["envelope_hex"]);
-        assert_eq!(hex(&signer.key_id), vector["key_id_hex"]);
+        assert_eq!(
+            ConnectionTicketClaimsV1::decode(&c.encode().unwrap()).unwrap(),
+            c
+        )
     }
-
     #[test]
-    fn signs_and_rejects_mutation() {
-        let signer = TicketSigner::from_seed([9; 32]);
-        let ticket = signer.sign(&claims()).unwrap();
-        verify_envelope(&ticket, signer.key_id, &signer.public_key()).unwrap();
-        let mut changed = ticket;
-        *changed.last_mut().unwrap() ^= 1;
-        assert!(verify_envelope(&changed, signer.key_id, &signer.public_key()).is_err());
+    fn vector_and_mutation() {
+        let s = TicketSigner::from_seed([9; 32]);
+        let t = s.sign(&claims()).unwrap();
+        verify_envelope(&t, s.key_id, &s.public_key()).unwrap();
+        let mut x = t.clone();
+        *x.last_mut().unwrap() ^= 1;
+        assert!(verify_envelope(&x, s.key_id, &s.public_key()).is_err());
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/ticket-v1.json")).unwrap();
+        let h = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        assert_eq!(h(&t), v["envelope_hex"]);
+        assert_eq!(h(&s.key_id), v["key_id_hex"]);
     }
 }
