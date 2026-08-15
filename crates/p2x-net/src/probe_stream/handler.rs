@@ -90,6 +90,8 @@ impl ConnectionHandler for ProbeHandler {
                 if self.events.len() < MAX_HANDLER_EVENTS {
                     self.events
                         .push_back(ProbeEvent::InboundOpened { stream: e.protocol });
+                } else {
+                    let _ = e.protocol;
                 }
             }
             ConnectionEvent::FullyNegotiatedOutbound(e) => {
@@ -98,10 +100,23 @@ impl ConnectionHandler for ProbeHandler {
                         request_id: e.info.request_id,
                         stream: e.protocol,
                     });
+                } else {
+                    let _ = e.protocol;
+                    self.events.push_back(ProbeEvent::OutboundFailed {
+                        request_id: e.info.request_id,
+                        code: "limit.handler_event_queue_full",
+                    });
                 }
             }
             ConnectionEvent::DialUpgradeError(e) => {
                 if self.events.len() < MAX_HANDLER_EVENTS {
+                    self.events.push_back(ProbeEvent::OutboundFailed {
+                        request_id: e.info.request_id,
+                        code: "probe.negotiation_failed",
+                    });
+                } else {
+                    // The reserved event slot guarantees this completion is retained.
+                    self.events.pop_back();
                     self.events.push_back(ProbeEvent::OutboundFailed {
                         request_id: e.info.request_id,
                         code: "probe.negotiation_failed",

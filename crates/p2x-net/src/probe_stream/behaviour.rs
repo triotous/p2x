@@ -52,6 +52,7 @@ pub struct ProbeStreamBehaviour {
     pending: HashMap<RequestId, PendingOpen>,
     commands: VecDeque<(PeerId, ConnectionId, OpenProbe)>,
     events: VecDeque<ProbeOutput>,
+    outbound_terminals: VecDeque<(RequestId, ProbeOutput)>,
     inbound_workers: HashMap<PeerId, usize>,
 }
 #[derive(Clone)]
@@ -154,16 +155,24 @@ impl ProbeStreamBehaviour {
         let Some(pending) = self.pending.remove(&request_id) else {
             return false;
         };
-        self.events.push_back(ProbeOutput::OutboundFailed {
+        self.terminal(
             request_id,
-            peer_id: pending.peer_id,
-            connection_id: pending.connection_id,
-            code,
-        });
+            ProbeOutput::OutboundFailed {
+                request_id,
+                peer_id: pending.peer_id,
+                connection_id: pending.connection_id,
+                code,
+            },
+        );
         true
     }
-    fn take_pending(&mut self, request_id: RequestId) -> Option<PendingOpen> {
-        self.pending.remove(&request_id)
+    fn pending(&self, request_id: RequestId) -> Option<&PendingOpen> {
+        self.pending.get(&request_id)
+    }
+    fn terminal(&mut self, request_id: RequestId, output: ProbeOutput) {
+        if self.pending.contains_key(&request_id) {
+            self.outbound_terminals.push_back((request_id, output));
+        }
     }
 }
 impl NetworkBehaviour for ProbeStreamBehaviour {
@@ -212,41 +221,46 @@ impl NetworkBehaviour for ProbeStreamBehaviour {
     ) {
         match event {
             ProbeEvent::OutboundOpened { request_id, stream } => {
-                if let Some(pending) = self.take_pending(request_id) {
-                    if pending.peer_id != peer || pending.connection_id != id {
-                        self.events.push_back(ProbeOutput::OutboundFailed {
+                if let Some(pending) = self.pending(request_id).cloned() {
+                    let output = if pending.peer_id != peer || pending.connection_id != id {
+                        ProbeOutput::OutboundFailed {
                             request_id,
                             peer_id: pending.peer_id,
                             connection_id: pending.connection_id,
                             code: "probe.internal_identity_mismatch",
-                        });
-                        return;
-                    }
-                    self.events.push_back(ProbeOutput::OutboundOpened {
-                        request_id,
-                        peer_id: peer,
-                        connection_id: id,
-                        stream,
-                    });
+                        }
+                    } else {
+                        ProbeOutput::OutboundOpened {
+                            request_id,
+                            peer_id: peer,
+                            connection_id: id,
+                            stream,
+                        }
+                    };
+                    self.terminal(request_id, output);
                 }
             }
             ProbeEvent::OutboundFailed { request_id, code } => {
-                if let Some(pending) = self.take_pending(request_id) {
-                    if pending.peer_id != peer || pending.connection_id != id {
-                        self.events.push_back(ProbeOutput::OutboundFailed {
-                            request_id,
-                            peer_id: pending.peer_id,
-                            connection_id: pending.connection_id,
-                            code: "probe.internal_identity_mismatch",
-                        });
-                        return;
-                    }
-                    self.events.push_back(ProbeOutput::OutboundFailed {
+                if let Some(pending) = self.pending(request_id).cloned() {
+                    let (peer_id, connection_id, code) =
+                        if pending.peer_id != peer || pending.connection_id != id {
+                            (
+                                pending.peer_id,
+                                pending.connection_id,
+                                "probe.internal_identity_mismatch",
+                            )
+                        } else {
+                            (peer, id, code)
+                        };
+                    self.terminal(
                         request_id,
-                        peer_id: peer,
-                        connection_id: id,
-                        code,
-                    });
+                        ProbeOutput::OutboundFailed {
+                            request_id,
+                            peer_id,
+                            connection_id,
+                            code,
+                        },
+                    );
                 }
             }
             ProbeEvent::InboundOpened { stream } => {
@@ -267,6 +281,10 @@ impl NetworkBehaviour for ProbeStreamBehaviour {
         }
     }
     fn poll(&mut self, _: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+        if let Some((request_id, event)) = self.outbound_terminals.pop_front() {
+            self.pending.remove(&request_id);
+            return Poll::Ready(ToSwarm::GenerateEvent(event));
+        }
         if let Some(event) = self.events.pop_front() {
             return Poll::Ready(ToSwarm::GenerateEvent(event));
         }
