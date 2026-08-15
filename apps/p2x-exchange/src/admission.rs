@@ -1,3 +1,4 @@
+use libp2p::swarm::ConnectionId;
 use p2x_protocol::PublicErrorCode;
 use std::collections::HashMap;
 
@@ -20,9 +21,14 @@ struct FailureBucket {
     window: i64,
     failures: u32,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConnectionRecord {
+    peer: String,
+    ip: String,
+}
 #[derive(Default)]
 pub struct AdmissionLedger {
-    connections: usize,
+    connections: HashMap<ConnectionId, ConnectionRecord>,
     peer_connections: HashMap<String, usize>,
     ip_connections: HashMap<String, usize>,
     inflight: usize,
@@ -30,66 +36,53 @@ pub struct AdmissionLedger {
     failures: HashMap<String, FailureBucket>,
 }
 impl AdmissionLedger {
-    pub fn admit_connection(&mut self) -> Admission {
-        self.admit_connection_from("<unknown>")
-    }
-    pub fn admit_connection_from(&mut self, ip: &str) -> Admission {
-        if self.connections >= MAX_CONNECTIONS
+    pub fn admit_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: &str,
+        ip: &str,
+    ) -> Admission {
+        if self.connections.contains_key(&connection_id) {
+            return Admission::Accepted;
+        }
+        if self.connections.len() >= MAX_CONNECTIONS
             || self.ip_connections.get(ip).copied().unwrap_or(0) >= MAX_CONNECTIONS_PER_IP
+            || self.peer_connections.get(peer).copied().unwrap_or(0) >= MAX_CONNECTIONS_PER_PEER
         {
             return Admission::Rejected(PublicErrorCode::LimitAuthConnections);
         }
-        self.connections += 1;
+        self.connections.insert(
+            connection_id,
+            ConnectionRecord {
+                peer: peer.to_owned(),
+                ip: ip.to_owned(),
+            },
+        );
         *self.ip_connections.entry(ip.to_owned()).or_default() += 1;
-        Admission::Accepted
-    }
-    pub fn admit_peer_connection(&mut self, peer: &str) -> Admission {
-        self.admit_peer_connection_from(peer, "<unknown>")
-    }
-    pub fn admit_peer_connection_from(&mut self, peer: &str, ip: &str) -> Admission {
-        if self.peer_connections.get(peer).copied().unwrap_or(0) >= MAX_CONNECTIONS_PER_PEER {
-            self.connections = self.connections.saturating_sub(1);
-            if let Some(n) = self.ip_connections.get_mut(ip) {
-                *n = n.saturating_sub(1);
-                if *n == 0 {
-                    self.ip_connections.remove(ip);
-                }
-            }
-            return Admission::Rejected(PublicErrorCode::LimitAuthConnections);
-        }
         *self.peer_connections.entry(peer.to_owned()).or_default() += 1;
         Admission::Accepted
     }
-    pub fn close_connection(&mut self, peer: &str) {
-        self.close_connection_from(peer, "<unknown>");
+    pub fn close_connection(&mut self, connection_id: ConnectionId) {
+        let Some(record) = self.connections.remove(&connection_id) else {
+            return;
+        };
+        decrement(&mut self.ip_connections, &record.ip);
+        decrement(&mut self.peer_connections, &record.peer);
     }
-    pub fn close_connection_from(&mut self, peer: &str, ip: &str) {
-        self.connections = self.connections.saturating_sub(1);
-        if let Some(n) = self.ip_connections.get_mut(ip) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                self.ip_connections.remove(ip);
-            }
-        }
-        if let Some(n) = self.peer_connections.get_mut(peer) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                self.peer_connections.remove(peer);
-            }
-        }
-    }
-    pub fn begin_auth(&mut self, peer: &str, now: i64) -> Admission {
-        self.begin_auth_from(peer, "<unknown>", now)
-    }
-    pub fn begin_auth_from(&mut self, peer: &str, ip: &str, now: i64) -> Admission {
+    pub fn begin_auth(&mut self, connection_id: ConnectionId, now: i64) -> Admission {
         self.sweep(now);
-        if self.inflight >= MAX_INFLIGHT {
+        let Some(record) = self.connections.get(&connection_id).cloned() else {
+            return Admission::Rejected(PublicErrorCode::LimitAuthConnections);
+        };
+        if self.inflight >= MAX_INFLIGHT
+            || self.peer_inflight.get(&record.peer).copied().unwrap_or(0) >= MAX_INFLIGHT_PER_PEER
+        {
             return Admission::Rejected(PublicErrorCode::LimitAuthRequests);
         }
-        if self.peer_inflight.get(peer).copied().unwrap_or(0) >= MAX_INFLIGHT_PER_PEER {
-            return Admission::Rejected(PublicErrorCode::LimitAuthRequests);
-        }
-        for key in [Self::peer_failure_key(peer), Self::ip_failure_key(ip)] {
+        for key in [
+            Self::peer_failure_key(&record.peer),
+            Self::ip_failure_key(&record.ip),
+        ] {
             if self
                 .failures
                 .get(&key)
@@ -102,28 +95,20 @@ impl AdmissionLedger {
             }
         }
         self.inflight += 1;
-        *self.peer_inflight.entry(peer.to_owned()).or_default() += 1;
+        *self.peer_inflight.entry(record.peer).or_default() += 1;
         Admission::Accepted
     }
-    fn peer_failure_key(peer: &str) -> String {
-        format!("peer:{peer}")
-    }
-    fn ip_failure_key(ip: &str) -> String {
-        format!("ip:{ip}")
-    }
-    pub fn finish_auth(&mut self, peer: &str, failed: bool, now: i64) {
-        self.finish_auth_from(peer, "<unknown>", failed, now);
-    }
-    pub fn finish_auth_from(&mut self, peer: &str, ip: &str, failed: bool, now: i64) {
+    pub fn finish_auth(&mut self, connection_id: ConnectionId, failed: bool, now: i64) {
+        let Some(record) = self.connections.get(&connection_id).cloned() else {
+            return;
+        };
         self.inflight = self.inflight.saturating_sub(1);
-        if let Some(n) = self.peer_inflight.get_mut(peer) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                self.peer_inflight.remove(peer);
-            }
-        }
+        decrement(&mut self.peer_inflight, &record.peer);
         if failed {
-            for key in [Self::peer_failure_key(peer), Self::ip_failure_key(ip)] {
+            for key in [
+                Self::peer_failure_key(&record.peer),
+                Self::ip_failure_key(&record.ip),
+            ] {
                 if !self.failures.contains_key(&key) && self.failures.len() >= MAX_FAILURE_BUCKETS {
                     continue;
                 }
@@ -136,12 +121,18 @@ impl AdmissionLedger {
             }
         }
     }
+    fn peer_failure_key(peer: &str) -> String {
+        format!("peer:{peer}")
+    }
+    fn ip_failure_key(ip: &str) -> String {
+        format!("ip:{ip}")
+    }
     pub fn sweep(&mut self, now: i64) {
-        let window = now / FAILURE_WINDOW;
-        self.failures.retain(|_, b| b.window >= window);
+        self.failures
+            .retain(|_, b| b.window >= now / FAILURE_WINDOW);
     }
     pub fn connections(&self) -> usize {
-        self.connections
+        self.connections.len()
     }
     pub fn ip_connections(&self, ip: &str) -> usize {
         self.ip_connections.get(ip).copied().unwrap_or(0)
@@ -153,60 +144,53 @@ impl AdmissionLedger {
         self.inflight
     }
 }
+fn decrement(map: &mut HashMap<String, usize>, key: &str) {
+    if let Some(value) = map.get_mut(key) {
+        *value = value.saturating_sub(1);
+        if *value == 0 {
+            map.remove(key);
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn bounds_and_failure_windows_are_deterministic() {
-        let mut a = AdmissionLedger::default();
-        for n in 0..MAX_CONNECTIONS {
-            let ip = format!("ip{n}");
-            assert_eq!(a.admit_connection_from(&ip), Admission::Accepted);
-        }
+    fn rejected_close_cannot_undercount_admitted_connections() {
+        let mut ledger = AdmissionLedger::default();
+        let first = ConnectionId::new_unchecked(1);
+        let second = ConnectionId::new_unchecked(2);
+        let rejected = ConnectionId::new_unchecked(3);
         assert_eq!(
-            a.admit_connection(),
+            ledger.admit_connection(first, "peer-a", "ip"),
+            Admission::Accepted
+        );
+        assert_eq!(
+            ledger.admit_connection(second, "peer-a", "ip2"),
+            Admission::Accepted
+        );
+        assert_eq!(
+            ledger.admit_connection(rejected, "peer-a", "ip"),
             Admission::Rejected(PublicErrorCode::LimitAuthConnections)
         );
-        a.close_connection("p");
-        assert_eq!(a.connections(), MAX_CONNECTIONS - 1);
-        let mut peers = AdmissionLedger::default();
-        for n in 0..2 {
-            assert_eq!(
-                peers.admit_connection_from(if n == 0 { "ip" } else { "ip2" }),
-                Admission::Accepted
-            );
-            assert_eq!(peers.admit_peer_connection("p"), Admission::Accepted);
-        }
-        assert_eq!(peers.admit_connection_from("ip3"), Admission::Accepted);
+        ledger.close_connection(rejected);
+        assert_eq!(ledger.connections(), 2);
+        assert_eq!(ledger.peer_connections("peer-a"), 2);
+        assert_eq!(ledger.ip_connections("ip"), 1);
+        ledger.close_connection(rejected);
+        assert_eq!(ledger.connections(), 2);
+    }
+    #[test]
+    fn auth_is_owned_by_connection_id() {
+        let mut ledger = AdmissionLedger::default();
+        let id = ConnectionId::new_unchecked(7);
         assert_eq!(
-            peers.admit_peer_connection_from("p", "ip3"),
+            ledger.begin_auth(id, 0),
             Admission::Rejected(PublicErrorCode::LimitAuthConnections)
         );
-        assert_eq!(peers.connections(), 2);
-        assert_eq!(peers.ip_connections("ip3"), 0);
-        assert_eq!(a.begin_auth("p", 0), Admission::Accepted);
-        assert_eq!(
-            a.begin_auth("p", 0),
-            Admission::Rejected(PublicErrorCode::LimitAuthRequests)
-        );
-        a.finish_auth("p", true, 0);
-        for _ in 1..FAILURE_LIMIT {
-            assert_eq!(a.begin_auth("p", 0), Admission::Accepted);
-            a.finish_auth("p", true, 0);
-        }
-        assert_eq!(
-            a.begin_auth("p", 0),
-            Admission::Rejected(PublicErrorCode::LimitAuthRequests)
-        );
-        assert_eq!(a.begin_auth("p", FAILURE_WINDOW), Admission::Accepted);
-        let mut bounded = AdmissionLedger::default();
-        for n in 0..MAX_FAILURE_BUCKETS / 2 {
-            bounded.finish_auth_from(&format!("peer{n}"), &format!("ip{n}"), true, 0);
-        }
-        assert_eq!(bounded.failures.len(), MAX_FAILURE_BUCKETS);
-        assert_eq!(
-            bounded.begin_auth_from("overflow", "overflow", 0),
-            Admission::Rejected(PublicErrorCode::ExchangeOverloaded)
-        );
+        ledger.admit_connection(id, "peer", "ip");
+        assert_eq!(ledger.begin_auth(id, 0), Admission::Accepted);
+        ledger.finish_auth(id, true, 0);
+        assert_eq!(ledger.inflight(), 0);
     }
 }

@@ -20,7 +20,6 @@ use p2x_net::{
 };
 use p2x_protocol::{AuthResponse, PublicError, PublicErrorCode};
 use std::{
-    collections::HashMap,
     io,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
@@ -130,7 +129,6 @@ async fn main() -> io::Result<()> {
     };
     let mut sessions = AuthSessionLedger::default();
     let mut admission = AdmissionLedger::default();
-    let mut connection_ips = HashMap::new();
     let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
     let config = ExchangeSwarmConfig {
         tcp_listen: args.tcp_listen,
@@ -162,18 +160,23 @@ async fn main() -> io::Result<()> {
                     emitter.emit(&LifecycleRecord::ListenerReady { listener_id: &listener_id, address: &advertised })?;
                 }
                 SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, .. }, connection_id, .. })) => {
-                    let peer_name = peer.to_string();
-                    let ip = connection_ips.get(&connection_id).map(String::as_str).unwrap_or("<unknown>");
-                    if admission.begin_auth_from(&peer_name, ip, chrono_like_now()) != Admission::Accepted { continue; }
+                    let request_id = match &request {
+                        p2x_protocol::AuthRequest::Authenticate { request_id, .. } | p2x_protocol::AuthRequest::Ping { request_id, .. } => Some(*request_id),
+                    };
+                    if admission.begin_auth(connection_id, chrono_like_now()) != Admission::Accepted {
+                        let response = AuthResponse::Rejected { request_id, error: PublicError::new(PublicErrorCode::LimitAuthRequests, true) };
+                        swarm.behaviour_mut().auth.send_response(channel, response).map_err(|_| io::Error::other("auth response channel closed"))?;
+                        continue;
+                    }
                     let failed = matches!(&request, p2x_protocol::AuthRequest::Authenticate { .. });
-                    let response = if let Some(provider) = provider.as_ref() { handle_request(provider, &mut sessions, &peer.to_string(), request, chrono_like_now()) } else { AuthResponse::Rejected { request_id: None, error: PublicError::new(PublicErrorCode::AuthSessionRequired, false) } };
+                    let response = if let Some(provider) = provider.as_ref() { handle_request(provider, &mut sessions, &peer.to_string(), request, chrono_like_now()) } else { AuthResponse::Rejected { request_id, error: PublicError::new(PublicErrorCode::AuthSessionRequired, false) } };
                     let rejected = matches!(response, AuthResponse::Rejected { .. });
-                    admission.finish_auth_from(&peer_name, ip, rejected && failed, chrono_like_now());
+                    admission.finish_auth(connection_id, rejected && failed, chrono_like_now());
                     swarm.behaviour_mut().auth.send_response(channel, response).map_err(|_| io::Error::other("auth response channel closed"))?;
                 },
                 SwarmEvent::Behaviour(event) => { let message = format!("{event:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "relay.event", message: &message })?; }
-                SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => { let peer = peer_id.to_string(); let ip = endpoint.get_remote_address().iter().find_map(|p| match p { libp2p::multiaddr::Protocol::Ip4(v) => Some(v.to_string()), libp2p::multiaddr::Protocol::Ip6(v) => Some(v.to_string()), _ => None }).unwrap_or_else(|| "<unknown>".into()); if admission.admit_connection_from(&ip) != Admission::Accepted || admission.admit_peer_connection_from(&peer, &ip) != Admission::Accepted { swarm.close_connection(connection_id); continue; } sessions.connection_established(&peer); connection_ips.insert(connection_id, ip); emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Established, path: Some(if endpoint.is_relayed() { p2x_net::probe::ProbePath::Relay } else { p2x_net::probe::ProbePath::Direct }), reason: None })?; }
-                SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => { let peer = peer_id.to_string(); sessions.connection_closed(&peer); if let Some(ip) = connection_ips.remove(&connection_id) { admission.close_connection_from(&peer, &ip); } else { admission.close_connection(&peer); } let reason = format!("{cause:?}"); emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Closed, path: None, reason: Some(&reason) })?; }
+                SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => { let peer = peer_id.to_string(); let ip = endpoint.get_remote_address().iter().find_map(|p| match p { libp2p::multiaddr::Protocol::Ip4(v) => Some(v.to_string()), libp2p::multiaddr::Protocol::Ip6(v) => Some(v.to_string()), _ => None }).unwrap_or_else(|| "<unknown>".into()); if admission.admit_connection(connection_id, &peer, &ip) != Admission::Accepted { swarm.close_connection(connection_id); continue; } sessions.connection_established(&peer); emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Established, path: Some(if endpoint.is_relayed() { p2x_net::probe::ProbePath::Relay } else { p2x_net::probe::ProbePath::Direct }), reason: None })?; }
+                SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => { let peer = peer_id.to_string(); sessions.connection_closed(&peer); admission.close_connection(connection_id); let reason = format!("{cause:?}"); emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Closed, path: None, reason: Some(&reason) })?; }
                 SwarmEvent::IncomingConnectionError { error, .. } => { let message = error.to_string(); emitter.emit(&LifecycleRecord::OperationalError { code: "connection.incoming", message: &message })?; }
                 SwarmEvent::OutgoingConnectionError { error, .. } => { let message = error.to_string(); emitter.emit(&LifecycleRecord::OperationalError { code: "connection.outgoing", message: &message })?; }
                 _ => {}
