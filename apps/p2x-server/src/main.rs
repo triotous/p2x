@@ -41,12 +41,11 @@ async fn main() -> io::Result<()> {
                 )
             })?;
         swarm.dial(exchange.clone()).map_err(io::Error::other)?;
-        let circuit = exchange
-            .with(Protocol::P2pCircuit)
-            .with(Protocol::P2p(*swarm.local_peer_id()));
+        let circuit = exchange.with(Protocol::P2pCircuit);
+        let advertised = circuit.clone().with(Protocol::P2p(*swarm.local_peer_id()));
         emitter.event(
             "relay_dial",
-            Some(&format!("relay={relay_peer} circuit={circuit}")),
+            Some(&format!("relay={relay_peer} circuit={advertised}")),
         )?;
         swarm.listen_on(circuit).map_err(io::Error::other)?;
     }
