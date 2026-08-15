@@ -33,5 +33,7 @@ for f in "$out"/*.ndjson; do
     exit 1
   }
 done
-printf '{"schema_version":1,"case":"C01-smoke","run_id":"%s","passed":true,"artifacts":["exchange.ndjson","server.ndjson","client.ndjson"]}\n' "$run_id" >"$out/summary.json"
+printf '{"schema_version":1,"case":"C01-smoke","run_id":"%s","passed":false,"terminal_code":"not_implemented","reason":"process smoke is not the Plan 02 relay/DCUtR/exact-probe gate","artifacts":["exchange.ndjson","server.ndjson","client.ndjson"]}\n' "$run_id" >"$out/summary.json"
 cat "$out/summary.json"
+echo 'C01 process smoke completed; Plan 02 connectivity gate is not implemented' >&2
+exit 2
