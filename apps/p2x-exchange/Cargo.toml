@@ -8,6 +8,8 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+base64.workspace = true
+p2x-config = { path = "../../crates/p2x-config" }
 p2x-protocol = { path = "../../crates/p2x-protocol" }
 thiserror.workspace = true
 clap.workspace = true

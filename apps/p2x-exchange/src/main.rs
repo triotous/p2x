@@ -1,6 +1,13 @@
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
-use libp2p::{Multiaddr, swarm::SwarmEvent};
+use libp2p::{
+    Multiaddr,
+    request_response::{Event as RequestResponseEvent, Message as RequestResponseMessage},
+    swarm::SwarmEvent,
+};
+use p2x_exchange::{
+    auth_handler::handle_request, auth_sessions::AuthSessionLedger, authn::FixedTokenProvider,
+};
 use p2x_net::{
     builder::{
         ExchangeSwarmConfig, RelayProfile, build_exchange_swarm, lab_identity,
@@ -8,7 +15,18 @@ use p2x_net::{
     },
     lifecycle::{ConnectionState, Emitter, LifecycleRecord, TerminalResult, stable_hash},
 };
-use std::{io, path::PathBuf};
+use p2x_protocol::{AuthResponse, PublicError, PublicErrorCode};
+use std::{
+    io,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
+fn chrono_like_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -22,6 +40,8 @@ struct Args {
     relay_profile: RelayProfileArg,
     #[arg(long)]
     unsafe_lab_public_relay: bool,
+    #[arg(long)]
+    credential_file: Option<PathBuf>,
     #[arg(long)]
     artifact: Option<PathBuf>,
     #[arg(long, default_value = "lifecycle")]
@@ -51,6 +71,15 @@ async fn main() -> io::Result<()> {
         None => Emitter::new("exchange", &run_id),
     };
     let key = lab_identity(args.identity_seed).map_err(io::Error::other)?;
+    let provider = args
+        .credential_file
+        .as_deref()
+        .map(|path| p2x_config::credential::FixedTokenFile::load(path).map_err(io::Error::other))
+        .transpose()?
+        .map(|file| FixedTokenProvider::from_config(&file))
+        .transpose()
+        .map_err(io::Error::other)?;
+    let mut sessions = AuthSessionLedger::default();
     let config = ExchangeSwarmConfig {
         tcp_listen: args.tcp_listen,
         quic_listen: args.quic_listen,
@@ -74,6 +103,10 @@ async fn main() -> io::Result<()> {
                     let advertised = advertised.to_string();
                     emitter.emit(&LifecycleRecord::ListenerReady { listener_id: &listener_id, address: &advertised })?;
                 }
+                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, .. }, .. })) => {
+                    let response = if let Some(provider) = provider.as_ref() { handle_request(provider, &mut sessions, &peer.to_string(), request, chrono_like_now(), [0; 16]) } else { AuthResponse::Rejected { request_id: None, error: PublicError::new(PublicErrorCode::AuthSessionRequired, false) } };
+                    swarm.behaviour_mut().auth.send_response(channel, response).map_err(|_| io::Error::other("auth response channel closed"))?;
+                },
                 SwarmEvent::Behaviour(event) => { let message = format!("{event:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "relay.event", message: &message })?; }
                 SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => { let peer = peer_id.to_string(); emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Established, path: Some(if endpoint.is_relayed() { p2x_net::probe::ProbePath::Relay } else { p2x_net::probe::ProbePath::Direct }), reason: None })?; }
                 SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => { let peer = peer_id.to_string(); let reason = format!("{cause:?}"); emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Closed, path: None, reason: Some(&reason) })?; }

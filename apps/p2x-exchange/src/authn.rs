@@ -1,3 +1,4 @@
+use base64::Engine;
 use p2x_protocol::{CredentialId, QuotaProfile, Role, Tenant, TokenDigest, TokenSecret};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -37,6 +38,45 @@ pub struct FixedTokenProvider {
     credentials: HashMap<CredentialId, CredentialBinding>,
 }
 impl FixedTokenProvider {
+    pub fn from_config(file: &p2x_config::credential::FixedTokenFile) -> Result<Self, AuthFailure> {
+        let mut bindings = Vec::with_capacity(file.credentials.len());
+        for record in &file.credentials {
+            let digest: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&record.token_sha256)
+                .map_err(|_| AuthFailure::InvalidCredential)?
+                .try_into()
+                .map_err(|_| AuthFailure::InvalidCredential)?;
+            let role = match record.role {
+                p2x_config::credential::CredentialRole::Client => Role::Client,
+                p2x_config::credential::CredentialRole::Server => Role::Server,
+            };
+            let scopes =
+                record
+                    .scopes
+                    .iter()
+                    .try_fold(0u32, |bits, scope| match scope.as_str() {
+                        "register_services" => Ok(bits | 1),
+                        "reserve_relay" => Ok(bits | 2),
+                        "open_proxy_stream" => Ok(bits | 4),
+                        _ => Err(AuthFailure::InvalidCredential),
+                    })?;
+            bindings.push(CredentialBinding {
+                credential_id: CredentialId::new(&record.credential_id)
+                    .map_err(|_| AuthFailure::InvalidCredential)?,
+                digest: TokenDigest::from_bytes(digest),
+                peer_id: record.peer_id.clone(),
+                tenant: Tenant::new(&record.tenant).map_err(|_| AuthFailure::InvalidCredential)?,
+                role,
+                scopes,
+                quota_profile: QuotaProfile::new(&record.quota_profile)
+                    .map_err(|_| AuthFailure::InvalidCredential)?,
+                not_before: record.not_before,
+                expires_at: record.expires_at,
+                revoked: record.revoked,
+            });
+        }
+        Ok(Self::new(file.authorization_revision, bindings))
+    }
     pub fn new(revision: u64, bindings: impl IntoIterator<Item = CredentialBinding>) -> Self {
         Self {
             revision,

@@ -2097,9 +2097,11 @@ dependencies = [
 name = "p2x-exchange"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "futures",
  "libp2p",
+ "p2x-config",
  "p2x-net",
  "p2x-protocol",
  "thiserror 2.0.20",
