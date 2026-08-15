@@ -1,3 +1,4 @@
+pub mod auth_codec;
 pub mod builder;
 pub mod connection_book;
 pub mod lifecycle;

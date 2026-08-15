@@ -1,4 +1,7 @@
-use crate::probe_stream::ProbeStreamBehaviour;
+use crate::{
+    auth_codec::{AUTH_PROTOCOL, AuthCodec},
+    probe_stream::ProbeStreamBehaviour,
+};
 use libp2p::core::transport::ListenerId;
 use libp2p::swarm::{NetworkBehaviour, Swarm};
 use libp2p::{Multiaddr, PeerId, dcutr, identify, noise, ping, relay, tcp, yamux};
@@ -6,6 +9,7 @@ use std::{net::IpAddr, num::NonZeroU32, time::Duration};
 use thiserror::Error;
 
 pub const IDENTIFY_PROTOCOL: &str = "/p2x/connectivity/0.1.0";
+pub const AUTH_REQUEST_TIMEOUT_SECONDS: u64 = 5;
 pub const PROBE_PROTOCOL: libp2p::StreamProtocol = libp2p::StreamProtocol::new("/p2x/spike/1");
 pub const MAX_STREAMS: usize = 256;
 pub const MAX_NEGOTIATIONS: usize = 64;
@@ -196,12 +200,14 @@ pub struct ExchangeBehaviour {
     pub relay: relay::Behaviour,
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
+    pub auth: libp2p::request_response::Behaviour<AuthCodec>,
 }
 #[derive(Debug)]
 pub enum ExchangeEvent {
     Relay(relay::Event),
     Identify(Box<identify::Event>),
     Ping(ping::Event),
+    Auth(libp2p::request_response::Event<p2x_protocol::AuthRequest, p2x_protocol::AuthResponse>),
 }
 impl From<relay::Event> for ExchangeEvent {
     fn from(v: relay::Event) -> Self {
@@ -211,6 +217,15 @@ impl From<relay::Event> for ExchangeEvent {
 impl From<identify::Event> for ExchangeEvent {
     fn from(v: identify::Event) -> Self {
         Self::Identify(Box::new(v))
+    }
+}
+impl From<libp2p::request_response::Event<p2x_protocol::AuthRequest, p2x_protocol::AuthResponse>>
+    for ExchangeEvent
+{
+    fn from(
+        v: libp2p::request_response::Event<p2x_protocol::AuthRequest, p2x_protocol::AuthResponse>,
+    ) -> Self {
+        Self::Auth(v)
     }
 }
 impl From<ping::Event> for ExchangeEvent {
@@ -227,6 +242,7 @@ pub struct PeerBehaviour {
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
     pub probe_stream: ProbeStreamBehaviour,
+    pub auth: libp2p::request_response::Behaviour<AuthCodec>,
 }
 #[derive(Debug)]
 pub enum PeerEvent {
@@ -235,6 +251,7 @@ pub enum PeerEvent {
     Identify(Box<identify::Event>),
     Ping(ping::Event),
     Probe(crate::probe_stream::behaviour::ProbeOutput),
+    Auth(libp2p::request_response::Event<p2x_protocol::AuthRequest, p2x_protocol::AuthResponse>),
 }
 impl From<relay::client::Event> for PeerEvent {
     fn from(v: relay::client::Event) -> Self {
@@ -254,6 +271,15 @@ impl From<identify::Event> for PeerEvent {
 impl From<ping::Event> for PeerEvent {
     fn from(v: ping::Event) -> Self {
         Self::Ping(v)
+    }
+}
+impl From<libp2p::request_response::Event<p2x_protocol::AuthRequest, p2x_protocol::AuthResponse>>
+    for PeerEvent
+{
+    fn from(
+        v: libp2p::request_response::Event<p2x_protocol::AuthRequest, p2x_protocol::AuthResponse>,
+    ) -> Self {
+        Self::Auth(v)
     }
 }
 impl From<crate::probe_stream::behaviour::ProbeOutput> for PeerEvent {
@@ -297,6 +323,15 @@ pub fn build_exchange_swarm(
                 ping::Config::new()
                     .with_interval(Duration::from_secs(PING_INTERVAL_SECONDS))
                     .with_timeout(Duration::from_secs(PING_TIMEOUT_SECONDS)),
+            ),
+            auth: libp2p::request_response::Behaviour::with_codec(
+                AuthCodec,
+                [(
+                    libp2p::StreamProtocol::new(AUTH_PROTOCOL),
+                    libp2p::request_response::ProtocolSupport::Inbound,
+                )],
+                libp2p::request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(AUTH_REQUEST_TIMEOUT_SECONDS)),
             ),
         })
         .map_err(|e| BuildError::Builder(e.to_string()))
@@ -353,6 +388,15 @@ pub fn build_peer_swarm(
                     .with_timeout(Duration::from_secs(PING_TIMEOUT_SECONDS)),
             ),
             probe_stream: ProbeStreamBehaviour::default(),
+            auth: libp2p::request_response::Behaviour::with_codec(
+                AuthCodec,
+                [(
+                    libp2p::StreamProtocol::new(AUTH_PROTOCOL),
+                    libp2p::request_response::ProtocolSupport::Full,
+                )],
+                libp2p::request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(AUTH_REQUEST_TIMEOUT_SECONDS)),
+            ),
         })
         .map_err(|e| BuildError::Builder(e.to_string()))
         .map(|b| {
