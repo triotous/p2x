@@ -36,9 +36,9 @@ async fn main() -> io::Result<()> {
     let key = lab_identity(args.identity_seed).map_err(io::Error::other)?;
     let mut swarm = build_peer_swarm(key, SwarmConfig::default()).map_err(io::Error::other)?;
     let target_peer = args.server.as_ref().and_then(|address| {
-        address.iter().find_map(|part| match part {
+        address.iter().fold(None, |last, part| match part {
             libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
-            _ => None,
+            _ => last,
         })
     });
     emitter.event(
