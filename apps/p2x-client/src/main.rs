@@ -1,6 +1,10 @@
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
-use libp2p::{Multiaddr, swarm::SwarmEvent};
+use libp2p::{
+    Multiaddr,
+    request_response::{Event as RequestResponseEvent, Message as RequestResponseMessage},
+    swarm::SwarmEvent,
+};
 use p2x_net::{
     AttemptId, PathAction, PathAttempt, PathDecision, PathEvent, PathEventKind,
     builder::{PeerSwarmConfig, build_peer_swarm, lab_identity, start_peer_listeners},
@@ -10,6 +14,7 @@ use p2x_net::{
     probe_stream::behaviour::ProbeOutput,
     probe_worker::execute_probe_client_futures_with_timeout,
 };
+use p2x_protocol::{AuthRequest, AuthResponse, Role};
 use std::{
     collections::{HashSet, VecDeque},
     io,
@@ -48,6 +53,8 @@ struct Args {
     identity_seed: Option<u64>,
     #[arg(long)]
     exchange: Option<Multiaddr>,
+    #[arg(long)]
+    credential_env: Option<String>,
     #[arg(long)]
     server: Option<Multiaddr>,
     #[arg(long, default_value = "/ip4/127.0.0.1/tcp/0")]
@@ -150,6 +157,17 @@ async fn main() -> io::Result<()> {
         None => Emitter::new("client", &run_id),
     };
     let key = lab_identity(args.identity_seed).map_err(io::Error::other)?;
+    let credential = args
+        .credential_env
+        .as_deref()
+        .map(|env_name| {
+            p2x_config::credential::CredentialRef {
+                env_name: env_name.to_owned(),
+            }
+            .read()
+            .map_err(io::Error::other)
+        })
+        .transpose()?;
     let config = PeerSwarmConfig {
         tcp_listen: args.tcp_listen,
         quic_listen: args.quic_listen,
@@ -211,6 +229,7 @@ async fn main() -> io::Result<()> {
     let mut churn_redial_pending = false;
     let mut forced_opened_connections = HashSet::new();
     let mut attempt: Option<PathAttempt> = None;
+    let auth_request_id = [1u8; 16];
     let mut maintenance = tokio::time::interval(std::time::Duration::from_millis(100));
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerResult>(128);
     loop {
@@ -291,6 +310,7 @@ async fn main() -> io::Result<()> {
                         let observed_path = if endpoint.is_relayed() { ProbePath::Relay } else { ProbePath::Direct };
                         let peer = peer_id.to_string();
                         emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Established, path: Some(observed_path), reason: None })?;
+                        if expected_exchange == peer_id && let Some((id, token)) = credential.as_ref() { swarm.behaviour_mut().auth.send_request(&peer_id, AuthRequest::Authenticate { request_id: auth_request_id, credential_id: id.clone(), token_secret: *token.as_bytes(), requested_role: Role::Client, supported_features: 0 }); }
                         if target_peer == Some(peer_id) {
                             if let Err(error) = connections.on_connection_established(peer_id, connection_id, &endpoint, std::time::Instant::now()) {
                                 swarm.close_connection(connection_id);
@@ -316,6 +336,7 @@ async fn main() -> io::Result<()> {
                             }
                         }
                     }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { response: AuthResponse::Authenticated { session_id, .. }, .. }, .. })) => { swarm.behaviour_mut().auth.send_request(&peer, AuthRequest::Ping { request_id: [2; 16], session_id, nonce: 1 }); }
                     SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => {
                         connections.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?;
                         if let Some(current) = attempt.as_mut() {

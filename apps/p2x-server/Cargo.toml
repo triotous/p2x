@@ -5,6 +5,8 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+p2x-config = { path = "../../crates/p2x-config" }
+p2x-protocol = { path = "../../crates/p2x-protocol" }
 clap.workspace = true
 futures.workspace = true
 libp2p.workspace = true
