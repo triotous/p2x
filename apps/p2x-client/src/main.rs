@@ -60,7 +60,7 @@ async fn main() -> io::Result<()> {
     if let Some(address) = args.server {
         swarm.dial(address).map_err(io::Error::other)?;
     }
-    let mut remaining = args.count;
+    let mut started = false;
     let mut completed = 0u64;
     loop {
         tokio::select! {
@@ -69,9 +69,9 @@ async fn main() -> io::Result<()> {
                 match event {
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
                         emitter.event("connection_established", Some(&format!("peer_id={peer_id} connection_id={connection_id:?}")))?;
-                        if remaining != 0 && target_peer == Some(peer_id) {
+                        if !started && target_peer == Some(peer_id) {
                             swarm.behaviour_mut().probe_stream.open_on(peer_id, connection_id).map_err(io::Error::other)?;
-                            remaining -= 1;
+                            started = true;
                         }
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Probe(output)) => match output {
@@ -102,6 +102,7 @@ async fn main() -> io::Result<()> {
                                 emitter.terminal("passed", "probe.ok")?;
                                 return Ok(());
                             }
+                            swarm.behaviour_mut().probe_stream.open_on(peer_id, connection_id).map_err(io::Error::other)?;
                         }
                         ProbeOutput::OutboundFailed { code, .. } => {
                             emitter.terminal("failed", code)?;

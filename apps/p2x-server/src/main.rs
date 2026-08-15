@@ -7,7 +7,7 @@ use p2x_net::{
     probe_stream::behaviour::ProbeOutput,
     probe_worker::execute_probe_futures,
 };
-use std::io;
+use std::{collections::HashMap, io};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -30,6 +30,7 @@ async fn main() -> io::Result<()> {
     let mut relay_peer_id = None;
     let mut pending_circuit = None;
     let mut reservation_requested = false;
+    let mut connection_paths = HashMap::new();
     if let Some(exchange) = args.exchange {
         let relay_peer = exchange
             .iter()
@@ -75,7 +76,13 @@ async fn main() -> io::Result<()> {
                             emitter.event("circuit_ready", Some(&address.to_string()))?;
                         }
                     }
-                    SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
+                    SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+                        let path = if endpoint.is_relayed() {
+                            p2x_net::probe::ProbePath::Relay
+                        } else {
+                            p2x_net::probe::ProbePath::Direct
+                        };
+                        connection_paths.insert(connection_id, path);
                         emitter.event("connection_established", Some(&format!("peer_id={peer_id} connection_id={connection_id:?}")))?;
                         if relay_peer_id == Some(peer_id)
                             && !reservation_requested
@@ -103,7 +110,8 @@ async fn main() -> io::Result<()> {
                         }
                     }
                     SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundOpened { mut stream, peer_id, connection_id })) => {
-                        let ack = execute_probe_futures(&mut stream, p2x_net::probe::ProbePath::Relay, format!("{connection_id:?}").bytes().fold(0u64, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte as u64))).await.map_err(io::Error::other)?;
+                        let path = connection_paths.get(&connection_id).copied().unwrap_or(p2x_net::probe::ProbePath::Relay);
+                        let ack = execute_probe_futures(&mut stream, path, format!("{connection_id:?}").bytes().fold(0u64, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte as u64))).await.map_err(io::Error::other)?;
                         emitter.event("probe_observed", Some(&format!("peer_id={peer_id} connection_id={connection_id:?} path={:?} bytes={}", ack.path, ack.bytes_written)))?;
                     }
                     SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundRejected { code, .. })) => {
