@@ -7,7 +7,9 @@ start_services() {
   OUT=${P2X_ARTIFACT_DIR:-target/p2x-spike/$RUN_ID}/$case_id
   mkdir -p "$OUT"
   cd "$(git rev-parse --show-toplevel)"
-  cargo build --workspace --bins >/dev/null
+  if [[ "${P2X_SKIP_BUILD:-0}" != 1 ]]; then
+    cargo build --workspace --bins >/dev/null
+  fi
   if ! declare -p EXCHANGE_CMD >/dev/null 2>&1; then EXCHANGE_CMD=(target/debug/p2x-exchange); fi
   if ! declare -p SERVER_CMD >/dev/null 2>&1; then SERVER_CMD=(target/debug/p2x-server); fi
   if ! declare -p CLIENT_CMD >/dev/null 2>&1; then CLIENT_CMD=(target/debug/p2x-client); fi

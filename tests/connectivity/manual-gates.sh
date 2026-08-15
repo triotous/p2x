@@ -2,9 +2,34 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 
+build_linux_binaries() {
+  local cargo_bin=${P2X_CARGO:-}
+  local build_user=${SUDO_USER:-}
+  local build_home=""
+
+  if [[ -n "$build_user" && "$build_user" != root ]]; then
+    build_home=$(getent passwd "$build_user" | cut -d: -f6)
+    [[ -n "$cargo_bin" ]] || cargo_bin="$build_home/.cargo/bin/cargo"
+    [[ -x "$cargo_bin" ]] || {
+      echo "cargo for $build_user was not found at $cargo_bin; rerun with P2X_CARGO=/absolute/path/to/cargo" >&2
+      exit 2
+    }
+    sudo -u "$build_user" env HOME="$build_home" "$cargo_bin" build --manifest-path "$root/Cargo.toml" --workspace --bins
+  else
+    [[ -n "$cargo_bin" ]] || cargo_bin=$(command -v cargo || true)
+    [[ -n "$cargo_bin" && -x "$cargo_bin" ]] || {
+      echo "cargo was not found; set P2X_CARGO=/absolute/path/to/cargo" >&2
+      exit 2
+    }
+    "$cargo_bin" build --manifest-path "$root/Cargo.toml" --workspace --bins
+  fi
+  export P2X_SKIP_BUILD=1
+}
+
 case "${1:-}" in
   --linux)
     [[ "$(uname -s)" == Linux ]] || { echo "--linux must run on a Linux host with root/CAP_NET_ADMIN" >&2; exit 2; }
+    build_linux_binaries
     for case_id in C02 C03 C04 C05 C06 C07 C08 C09; do
       "$root/tests/connectivity/netns.sh" --case "$case_id"
     done

@@ -28,6 +28,12 @@ sudo ./tests/connectivity/manual-gates.sh --linux
 ./tests/connectivity/manual-gates.sh --c14-validate target/p2x-spike/<run-id>/C14-relay
 ```
 
+Linux mode compiles as the original `SUDO_USER` before creating namespaces, so Cargo does not run as root. It expects Cargo at that user's `~/.cargo/bin/cargo`. For another installation layout, provide the absolute path explicitly:
+
+```text
+sudo P2X_CARGO="$(command -v cargo)" ./tests/connectivity/manual-gates.sh --linux
+```
+
 The Linux mode requires `ip`, `iptables`, `tc`, `ps`, root/CAP_NET_ADMIN, and three run-scoped namespaces. It executes C02–C13, including the 64/128 concurrency and direct/relay 256 MiB variants. C14 role commands and firewall guidance are in [`two-host.md`](two-host.md).
 
 Dependency verification is pinned to `cargo-deny 0.20.2`; run `cargo deny check` from the repository root.
