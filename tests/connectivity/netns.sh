@@ -36,7 +36,15 @@ cleanup_topology() {
 }
 trap cleanup_topology EXIT INT TERM
 
-ip link add "$bridge" type bridge
+if ! ip link add "$bridge" type bridge; then
+  cat >&2 <<'EOF'
+unable to create the Linux bridge required by the connectivity matrix.
+Run this gate on a native Linux host or VM whose kernel enables CONFIG_BRIDGE
+(and exposes bridge plus veth networking to this environment). sudo alone
+cannot add kernel features that the host/container runtime does not provide.
+EOF
+  exit 2
+fi
 ip addr add 10.203.0.1/24 dev "$bridge"
 ip link set "$bridge" up
 for index in 0 1 2; do

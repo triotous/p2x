@@ -2,6 +2,8 @@
 
 Use two native hosts on separate networks: exchange on Host A, server on Host A or B, client on Host B. Open the configured TCP/QUIC relay listener ports and preserve UTC clocks. Build with the locked Rust toolchain on both hosts.
 
+The default artifact directory is `target/p2x-spike/<P2X_RUN_ID>/C14-relay`. Setting `P2X_ARTIFACT_DIR=/absolute/base/path` changes it to `/absolute/base/path/C14-relay` for all three scripts. After the run, merge `exchange.ndjson`, `server.ndjson`, `client.ndjson`, and a manually prepared `environment.txt` into that one directory.
+
 Host A:
 ```sh
 P2X_RUN_ID=c14-... ./start-exchange.sh
