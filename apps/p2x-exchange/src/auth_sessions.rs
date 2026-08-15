@@ -125,6 +125,8 @@ mod tests {
     #[test]
     fn replacement_expiry_and_close_are_bounded() {
         let mut ledger = AuthSessionLedger::new(1);
+        ledger.connection_established("peer");
+        ledger.connection_established("peer");
         assert!(matches!(
             ledger.authenticate(principal(1), [1; 16], 1),
             SessionAction::Authenticated(_)
@@ -136,6 +138,17 @@ mod tests {
         assert!(matches!(
             ledger.authorize_ping("peer", [2; 16], 2),
             SessionAction::Rejected(PublicErrorCode::AuthSessionRequired)
+        ));
+        assert!(ledger.connection_closed("peer").is_none());
+        assert!(matches!(
+            ledger.connection_closed("peer"),
+            Some(SessionAction::Removed(_))
+        ));
+        assert_eq!(ledger.len(), 0);
+        ledger.connection_established("peer");
+        assert!(matches!(
+            ledger.authenticate(principal(1), [1; 16], 1),
+            SessionAction::Authenticated(_)
         ));
         ledger.replace_revision(2);
         assert_eq!(ledger.len(), 0);
