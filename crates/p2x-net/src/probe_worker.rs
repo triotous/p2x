@@ -59,6 +59,14 @@ impl WorkerAdmission {
         self.closed = true;
     }
 
+    pub fn close_and_discard(&mut self) -> usize {
+        self.closed = true;
+        let discarded = self.global;
+        self.global = 0;
+        self.per_peer.clear();
+        discarded
+    }
+
     pub const fn admitted(&self) -> usize {
         self.global
     }

@@ -3,12 +3,13 @@ use futures::StreamExt;
 use libp2p::{Multiaddr, swarm::SwarmEvent};
 use p2x_net::{
     builder::{PeerSwarmConfig, build_peer_swarm, lab_identity, start_peer_listeners},
-    lifecycle::Emitter,
-    probe::{ProbeHeader, ProbeMode, SCHEMA_VERSION},
+    lifecycle::{ConnectionState, Emitter, LifecycleRecord, TerminalResult, stable_hash},
+    probe::{ProbeAck, ProbeHeader, ProbeMode, ProbePath, ProbeTerminal, SCHEMA_VERSION},
     probe_stream::behaviour::ProbeOutput,
-    probe_worker::execute_probe_client_futures,
+    probe_worker::execute_probe_client_futures_with_timeout,
 };
-use std::io;
+use std::{io, path::PathBuf};
+use tokio::sync::mpsc;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Path {
@@ -37,12 +38,33 @@ struct Args {
     length: u64,
     #[arg(long, default_value_t = false)]
     churn: bool,
+    #[arg(long)]
+    artifact: Option<PathBuf>,
+    #[arg(long, default_value = "probe")]
+    case_id: String,
+    #[arg(long, default_value_t = 1)]
+    slow_delay_ms: u32,
+    #[arg(long, default_value_t = 32 * 1024)]
+    slow_chunk_size: u32,
+    #[arg(long, default_value_t = 300)]
+    worker_timeout_secs: u64,
+}
+
+struct WorkerResult {
+    peer_id: libp2p::PeerId,
+    connection_id: libp2p::swarm::ConnectionId,
+    selected_path: ProbePath,
+    result: Result<ProbeAck, p2x_net::probe::ProbeError>,
 }
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    let started_at = std::time::Instant::now();
     let args = Args::parse();
     let run_id = std::env::var("P2X_RUN_ID").unwrap_or_else(|_| "manual".into());
-    let emitter = Emitter::new("client", &run_id);
+    let emitter = match &args.artifact {
+        Some(path) => Emitter::with_artifact("client", &run_id, path)?,
+        None => Emitter::new("client", &run_id),
+    };
     let key = lab_identity(args.identity_seed).map_err(io::Error::other)?;
     let config = PeerSwarmConfig {
         tcp_listen: args.tcp_listen,
@@ -57,14 +79,10 @@ async fn main() -> io::Result<()> {
             _ => last,
         })
     });
-    emitter.event(
-        "started",
-        Some(&format!(
-            "peer_id={} path={:?}",
-            swarm.local_peer_id(),
-            args.path
-        )),
-    )?;
+    let local_peer = swarm.local_peer_id().to_string();
+    emitter.emit(&LifecycleRecord::Started {
+        peer_id: &local_peer,
+    })?;
     if let Some(address) = args.exchange {
         swarm.dial(address).map_err(io::Error::other)?;
     }
@@ -73,20 +91,67 @@ async fn main() -> io::Result<()> {
     }
     let mut started = false;
     let mut completed = 0u64;
+    let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerResult>(128);
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            Some(worker) = worker_rx.recv() => {
+                let peer = worker.peer_id.to_string();
+                match worker.result {
+                    Ok(ack) => {
+                        emitter.emit(&LifecycleRecord::ProbeCompleted { peer_id: &peer, ack: &ack })?;
+                        completed += 1;
+                        if completed == args.count {
+                            let mut terminal = TerminalResult::simple(&args.case_id, "passed", "probe.ok");
+                            terminal.selected_path = Some(worker.selected_path);
+                            terminal.observed_path = Some(ack.path);
+                            terminal.connection_id_hash = Some(ack.connection_id_hash);
+                            terminal.bytes_read = ack.bytes_read;
+                            terminal.bytes_written = ack.bytes_written;
+                            terminal.read_hash = ack.read_hash;
+                            terminal.write_hash = ack.write_hash;
+                            terminal.half_close = ack.half_close;
+                            terminal.terminal = ack.terminal;
+                            terminal.setup_duration_ms = started_at.elapsed().as_millis();
+                            emitter.terminal(&terminal)?;
+                            return Ok(());
+                        }
+                        if args.churn {
+                            swarm.close_connection(worker.connection_id);
+                        } else {
+                            let request_id = swarm.behaviour_mut().probe_stream.open_on(worker.peer_id, worker.connection_id).map_err(io::Error::other)?;
+                            emitter.emit(&LifecycleRecord::PathSelected { request_id: request_id.0, connection_id_hash: stable_hash(worker.connection_id), selected_path: worker.selected_path })?;
+                        }
+                    }
+                    Err(error) => {
+                        let mut terminal = TerminalResult::simple(&args.case_id, "failed", "probe.failed");
+                        terminal.selected_path = Some(worker.selected_path);
+                        terminal.connection_id_hash = Some(stable_hash(worker.connection_id));
+                        terminal.terminal = error.terminal();
+                        terminal.setup_duration_ms = started_at.elapsed().as_millis();
+                        emitter.terminal(&terminal)?;
+                        return Err(io::Error::other(error));
+                    }
+                }
+            }
             event = swarm.select_next_some() => {
                 match event {
-                    SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
-                        emitter.event("connection_established", Some(&format!("peer_id={peer_id} connection_id={connection_id:?}")))?;
-                        if target_peer == Some(peer_id) && (!started || args.churn) {
-                            swarm.behaviour_mut().probe_stream.open_on(peer_id, connection_id).map_err(io::Error::other)?;
+                    SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+                        let observed_path = if endpoint.is_relayed() { ProbePath::Relay } else { ProbePath::Direct };
+                        let peer = peer_id.to_string();
+                        emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Established, path: Some(observed_path), reason: None })?;
+                        let requested_path = match args.path { Path::Direct => ProbePath::Direct, Path::Relay => ProbePath::Relay };
+                        if target_peer == Some(peer_id) && observed_path == requested_path && (!started || args.churn) {
+                            let request_id = swarm.behaviour_mut().probe_stream.open_on(peer_id, connection_id).map_err(io::Error::other)?;
+                            emitter.emit(&LifecycleRecord::PathSelected { request_id: request_id.0, connection_id_hash: stable_hash(connection_id), selected_path: requested_path })?;
                             started = true;
                         }
                     }
-                    SwarmEvent::ConnectionClosed { peer_id, .. } if args.churn && target_peer == Some(peer_id) && completed < args.count => {
-                        if let Some(address) = server_address.clone() {
+                    SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => {
+                        let peer = peer_id.to_string();
+                        let reason = format!("{cause:?}");
+                        emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Closed, path: None, reason: Some(&reason) })?;
+                        if args.churn && target_peer == Some(peer_id) && completed < args.count && let Some(address) = server_address.clone() {
                             swarm.dial(address).map_err(io::Error::other)?;
                         }
                     }
@@ -99,22 +164,20 @@ async fn main() -> io::Result<()> {
                                 "slow_reader" => ProbeMode::SlowReader,
                                 other => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown probe mode: {other}"))),
                             };
-                            let header = ProbeHeader { schema_version: SCHEMA_VERSION, request_id: request_id.0, mode, nonce: request_id.0, length: args.length, slow_delay_ms: 0, slow_chunk_size: if mode == ProbeMode::SlowReader { 32 * 1024 } else { 0 } };
-                            let ack = execute_probe_client_futures(&mut stream, &header).await.map_err(io::Error::other)?;
-                            emitter.event("probe_succeeded", Some(&format!("peer_id={peer_id} connection_id={connection_id:?} path={:?}", ack.path)))?;
-                            completed += 1;
-                            if completed == args.count {
-                                emitter.terminal("passed", "probe.ok")?;
-                                return Ok(());
-                            }
-                            if args.churn {
-                                swarm.close_connection(connection_id);
-                            } else {
-                                swarm.behaviour_mut().probe_stream.open_on(peer_id, connection_id).map_err(io::Error::other)?;
-                            }
+                            let header = ProbeHeader { schema_version: SCHEMA_VERSION, request_id: request_id.0, mode, nonce: request_id.0, length: args.length, slow_delay_ms: if mode == ProbeMode::SlowReader { args.slow_delay_ms } else { 0 }, slow_chunk_size: if mode == ProbeMode::SlowReader { args.slow_chunk_size } else { 0 } };
+                            let selected_path = match args.path { Path::Direct => ProbePath::Direct, Path::Relay => ProbePath::Relay };
+                            let tx = worker_tx.clone();
+                            let worker_timeout = std::time::Duration::from_secs(args.worker_timeout_secs);
+                            tokio::spawn(async move {
+                                let result = execute_probe_client_futures_with_timeout(&mut stream, &header, worker_timeout).await;
+                                let _ = tx.send(WorkerResult { peer_id, connection_id, selected_path, result }).await;
+                            });
                         }
                         ProbeOutput::OutboundFailed { code, .. } => {
-                            emitter.terminal("failed", code)?;
+                            let mut terminal = TerminalResult::simple(&args.case_id, "failed", code);
+                            terminal.terminal = ProbeTerminal::Io;
+                            terminal.setup_duration_ms = started_at.elapsed().as_millis();
+                            emitter.terminal(&terminal)?;
                             return Err(io::Error::other(code));
                         }
                         ProbeOutput::InboundOpened { .. } | ProbeOutput::InboundRejected { .. } => {}
@@ -124,6 +187,8 @@ async fn main() -> io::Result<()> {
             }
         }
     }
-    emitter.terminal("stopped", "shutdown")?;
+    let mut terminal = TerminalResult::simple(&args.case_id, "stopped", "shutdown");
+    terminal.setup_duration_ms = started_at.elapsed().as_millis();
+    emitter.terminal(&terminal)?;
     Ok(())
 }

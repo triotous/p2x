@@ -11,7 +11,14 @@ start_services() {
   pids=()
   cleanup() {
     trap - TERM INT EXIT
-    for pid in "${pids[@]:-}"; do kill "$pid" 2>/dev/null || true; done
+    for pid in "${pids[@]:-}"; do kill -INT "$pid" 2>/dev/null || true; done
+    for _ in $(seq 1 50); do
+      local alive=false
+      for pid in "${pids[@]:-}"; do kill -0 "$pid" 2>/dev/null && alive=true; done
+      [[ "$alive" == false ]] && break
+      sleep 0.1
+    done
+    for pid in "${pids[@]:-}"; do kill -TERM "$pid" 2>/dev/null || true; done
     wait 2>/dev/null || true
   }
   trap cleanup TERM INT EXIT
@@ -19,7 +26,7 @@ start_services() {
     --identity-seed 1 --tcp-listen /ip4/127.0.0.1/tcp/0 >"$OUT/exchange.ndjson" 2>&1 &
   pids+=("$!")
   for _ in $(seq 1 100); do
-    exchange_addr=$(awk -F'"detail":"' '/"event":"listen_addr"/{split($2,a,"\""); print a[1]; exit}' "$OUT/exchange.ndjson" || true)
+    exchange_addr=$(sed -n 's/.*"event":"listener_ready".*"address":"\([^" ]*\/tcp\/[^" ]*\)".*/\1/p' "$OUT/exchange.ndjson" | head -1 || true)
     [[ -n "${exchange_addr:-}" ]] && break
     sleep 0.1
   done
@@ -28,7 +35,7 @@ start_services() {
     --identity-seed 2 --exchange "$exchange_addr" --tcp-listen /ip4/127.0.0.1/tcp/0 >"$OUT/server.ndjson" 2>&1 &
   pids+=("$!")
   for _ in $(seq 1 100); do
-    circuit_addr=$(awk -F'"detail":"' '/"event":"circuit_ready"/{split($2,a,"\""); print a[1]; exit}' "$OUT/server.ndjson" || true)
+    circuit_addr=$(sed -n 's/.*"event":"listener_ready".*"address":"\([^"]*p2p-circuit[^"]*\)".*/\1/p' "$OUT/server.ndjson" | head -1 || true)
     [[ -n "${circuit_addr:-}" ]] && break
     sleep 0.1
   done
@@ -40,8 +47,8 @@ start_services() {
     C12-renewal) client_args+=(--count 1) ;;
     C13-churn) client_args+=(--count 100 --churn) ;;
     C05-direct)
-      server_peer=$(awk -F'"detail":"' '/"event":"started"/{split($2,a,"\""); split(a[1],b," "); print b[1]; exit}' "$OUT/server.ndjson")
-      direct_addr=$(awk -F'"detail":"' '/"event":"listen_addr"/{split($2,a,"\""); print a[1]; exit}' "$OUT/server.ndjson")
+      server_peer=$(sed -n 's/.*"event":"started","peer_id":"\([^"]*\)".*/\1/p' "$OUT/server.ndjson" | head -1)
+      direct_addr=$(sed -n 's/.*"event":"listener_ready".*"address":"\([^" ]*\/tcp\/[^" ]*\)".*/\1/p' "$OUT/server.ndjson" | head -1)
       client_args=(--identity-seed 3 --server "$direct_addr/p2p/$server_peer" --path direct)
       ;;
   esac
@@ -67,14 +74,16 @@ run_local_case() {
   [[ "$case_id" == C13-churn ]] && wait_loops=1800
   for _ in $(seq 1 "$wait_loops"); do
     local succeeded observed terminals
-    succeeded=$(grep -c '"event":"probe_succeeded"' "$OUT/client.ndjson" || true)
-    observed=$(grep -c '"event":"probe_observed"' "$OUT/server.ndjson" || true)
-    terminals=$(grep -c '"result":"' "$OUT/client.ndjson" || true)
+    succeeded=$(grep -c '"event":"probe_completed"' "$OUT/client.ndjson" || true)
+    observed=$(grep -c '"event":"probe_completed"' "$OUT/server.ndjson" || true)
+    terminals=$(grep -c '"event":"terminal"' "$OUT/client.ndjson" || true)
     local lifecycle_ok=true
     [[ "$case_id" == C12-renewal ]] && grep -q '"renewal":true' "$OUT/server.ndjson" || true
     if [[ "$case_id" == C12-renewal ]] && ! grep -q '"renewal":true' "$OUT/server.ndjson"; then lifecycle_ok=false; fi
-    if [[ "$case_id" == C13-churn ]] && [[ $(grep -c '"event":"connection_closed"' "$OUT/client.ndjson" || true) -lt 1 ]]; then lifecycle_ok=false; fi
-    if [[ "$succeeded" -ge "$expected" && "$observed" -ge "$expected" && "$terminals" -eq 1 && "$lifecycle_ok" == true ]] && grep -q "path=$client_path" "$OUT/client.ndjson" && grep -q "path=$client_path" "$OUT/server.ndjson"; then
+    if [[ "$case_id" == C13-churn ]] && [[ $(grep -c '"state":"closed"' "$OUT/client.ndjson" || true) -lt 1 ]]; then lifecycle_ok=false; fi
+    local json_path
+    json_path=$(printf '%s' "$client_path" | tr '[:upper:]' '[:lower:]')
+    if [[ "$succeeded" -ge "$expected" && "$observed" -ge "$expected" && "$terminals" -eq 1 && "$lifecycle_ok" == true ]] && grep -q "\"path\":\"$json_path\"" "$OUT/client.ndjson" && grep -q "\"path\":\"$json_path\"" "$OUT/server.ndjson"; then
       printf '{"schema_version":1,"case":"%s","run_id":"%s","passed":true,"terminal_code":"probe.ok","expected_probes":%d,"observed_probes":%d,"path":"%s","artifacts":["exchange.ndjson","server.ndjson","client.ndjson"]}\n' "$case_id" "$RUN_ID" "$expected" "$observed" "$client_path" >"$OUT/summary.json"
       cat "$OUT/summary.json"
       return 0
