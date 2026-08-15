@@ -61,6 +61,8 @@ pub enum ProbeError {
     TooLarge,
     #[error("truncated frame")]
     Truncated,
+    #[error("operation timed out")]
+    Timeout,
     #[error("invalid header: {0}")]
     Invalid(String),
 }

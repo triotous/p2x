@@ -4,6 +4,7 @@ pub mod lifecycle;
 pub mod path_selector;
 pub mod probe;
 pub mod probe_stream;
+pub mod probe_worker;
 pub mod reservation;
 
 pub use connection_book::{
