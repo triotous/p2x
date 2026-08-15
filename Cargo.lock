@@ -2085,6 +2085,7 @@ name = "p2x-config"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "ed25519-dalek",
  "libc",
  "libp2p-identity",
  "p2x-protocol",

@@ -1,6 +1,7 @@
 pub mod credential;
 pub mod identity;
 pub mod secret_file;
+pub mod ticket_key;
 pub mod trust;
 pub mod yaml;
 
