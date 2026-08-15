@@ -14,4 +14,4 @@ for c in jq ip tc iptables nft; do command -v "$c"; done
 ip netns list
 ```
 
-Artifacts: topology, commands, raw process logs, `resources.ndjson`, `summary.json`. A run fails on missing tools, leaked namespaces/interfaces/rules, invalid schema, duplicate terminal results, or non-zero final resources.
+Artifacts: topology, namespace/permission errors, raw process logs (once the matrix is wired), `resources.ndjson` (once sampling is wired), and `summary.json`. The current script is an honest namespace prerequisite smoke and exits 2 with `not_implemented`; it must not be read as a connectivity pass. A full run must fail on missing tools, leaked namespaces/interfaces/rules, invalid schema, duplicate terminal results, or non-zero final resources.
