@@ -102,6 +102,18 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundRejected { code, .. })) => {
                         emitter.event("probe_rejected", Some(code))?;
                     }
+                    SwarmEvent::Behaviour(PeerEvent::Dcutr(event)) => {
+                        emitter.event("dcutr_event", Some(&format!("{event:?}")))?;
+                    }
+                    SwarmEvent::Behaviour(PeerEvent::Identify(event)) => {
+                        emitter.event("identify_event", Some(&format!("{event:?}")))?;
+                    }
+                    SwarmEvent::Behaviour(PeerEvent::Ping(event)) => {
+                        emitter.event("ping_event", Some(&format!("{event:?}")))?;
+                    }
+                    SwarmEvent::Behaviour(event) => {
+                        emitter.event("behaviour_event", Some(&format!("{event:?}")))?;
+                    }
                     _ => {}
                 }
             }
