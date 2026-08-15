@@ -92,7 +92,7 @@ impl ConnectionTicketClaimsV1 {
             || self.client_peer_id.is_empty()
             || self.server_peer_id.is_empty()
             || self.not_before > self.expires_at
-            || self.expires_at - self.not_before > 60
+            || self.expires_at.saturating_sub(self.not_before) > 60
             || self.permissions != 4
             || self.max_streams != 1
         {
@@ -306,6 +306,13 @@ mod tests {
             ConnectionTicketClaimsV1::decode(&c.encode().unwrap()).unwrap(),
             c
         )
+    }
+    #[test]
+    fn rejects_overflowed_lifetime() {
+        let mut c = claims();
+        c.not_before = i64::MIN;
+        c.expires_at = i64::MAX;
+        assert_eq!(c.encode(), Err(TicketError::Invalid));
     }
     #[test]
     fn vector_and_mutation() {
