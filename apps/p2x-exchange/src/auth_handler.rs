@@ -45,12 +45,12 @@ pub fn handle_request(
                             request_id: Some(request_id),
                             error: PublicError::new(code, true),
                         },
-                        SessionAction::Removed(_) | SessionAction::PrincipalRevoked(_) => {
-                            AuthResponse::Rejected {
-                                request_id: Some(request_id),
-                                error: PublicError::new(PublicErrorCode::ExchangeOverloaded, true),
-                            }
-                        }
+                        SessionAction::Removed(_)
+                        | SessionAction::PrincipalRevoked(_)
+                        | SessionAction::ClosePeerConnections { .. } => AuthResponse::Rejected {
+                            request_id: Some(request_id),
+                            error: PublicError::new(PublicErrorCode::ExchangeOverloaded, true),
+                        },
                     },
                     Err(_) => AuthResponse::Rejected {
                         request_id: Some(request_id),

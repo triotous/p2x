@@ -1,7 +1,11 @@
 use crate::authn::AuthPrincipal;
 use crate::authn::FixedTokenProvider;
+use libp2p::swarm::ConnectionId;
 use p2x_protocol::PublicErrorCode;
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthSession {
     pub session_id: [u8; 16],
@@ -15,10 +19,14 @@ pub enum SessionAction {
     Rejected(PublicErrorCode),
     Removed(String),
     PrincipalRevoked(String),
+    ClosePeerConnections {
+        peer_id: String,
+        connection_ids: Vec<ConnectionId>,
+    },
 }
 pub struct AuthSessionLedger {
     sessions: HashMap<String, AuthSession>,
-    connections: HashMap<String, usize>,
+    connections: HashMap<String, HashSet<ConnectionId>>,
     max_sessions: usize,
     lifetime: Duration,
 }
@@ -82,13 +90,20 @@ impl AuthSessionLedger {
             None => SessionAction::Rejected(PublicErrorCode::AuthSessionRequired),
         }
     }
-    pub fn connection_established(&mut self, peer_id: &str) {
-        *self.connections.entry(peer_id.to_owned()).or_default() += 1;
+    pub fn connection_established(&mut self, peer_id: &str, connection_id: ConnectionId) {
+        self.connections
+            .entry(peer_id.to_owned())
+            .or_default()
+            .insert(connection_id);
     }
-    pub fn connection_closed(&mut self, peer_id: &str) -> Option<SessionAction> {
-        let count = self.connections.get_mut(peer_id)?;
-        *count = count.saturating_sub(1);
-        if *count != 0 {
+    pub fn connection_closed(
+        &mut self,
+        peer_id: &str,
+        connection_id: ConnectionId,
+    ) -> Option<SessionAction> {
+        let connections = self.connections.get_mut(peer_id)?;
+        connections.remove(&connection_id);
+        if !connections.is_empty() {
             return None;
         }
         self.connections.remove(peer_id);
@@ -119,13 +134,21 @@ impl AuthSessionLedger {
         self.remove_revoked(revoked)
     }
     fn remove_revoked(&mut self, revoked: Vec<String>) -> Vec<SessionAction> {
-        for peer in &revoked {
-            self.sessions.remove(peer);
+        let mut actions = Vec::new();
+        for peer in revoked {
+            self.sessions.remove(&peer);
+            let connection_ids = self
+                .connections
+                .get(&peer)
+                .map(|ids| ids.iter().copied().collect())
+                .unwrap_or_default();
+            actions.push(SessionAction::PrincipalRevoked(peer.clone()));
+            actions.push(SessionAction::ClosePeerConnections {
+                peer_id: peer,
+                connection_ids,
+            });
         }
-        revoked
-            .into_iter()
-            .map(SessionAction::PrincipalRevoked)
-            .collect()
+        actions
     }
     pub fn replace_revision(&mut self, revision: u64) -> Vec<SessionAction> {
         let revoked = self
@@ -182,7 +205,7 @@ mod tests {
         };
         let provider = FixedTokenProvider::new(1, [binding([9; 32])]);
         let mut ledger = AuthSessionLedger::new(1);
-        ledger.connection_established("peer");
+        ledger.connection_established("peer", ConnectionId::new_unchecked(1));
         assert!(matches!(
             ledger.authenticate(principal(1), [1; 16], 1),
             SessionAction::Authenticated(_)
@@ -191,14 +214,20 @@ mod tests {
         let changed = FixedTokenProvider::new(2, [binding([8; 32])]);
         assert_eq!(
             ledger.replace_snapshot_at(&changed, 2),
-            vec![SessionAction::PrincipalRevoked("peer".into())]
+            vec![
+                SessionAction::PrincipalRevoked("peer".into()),
+                SessionAction::ClosePeerConnections {
+                    peer_id: "peer".into(),
+                    connection_ids: vec![ConnectionId::new_unchecked(1)]
+                }
+            ]
         );
     }
     #[test]
     fn replacement_expiry_and_close_are_bounded() {
         let mut ledger = AuthSessionLedger::new(1);
-        ledger.connection_established("peer");
-        ledger.connection_established("peer");
+        ledger.connection_established("peer", ConnectionId::new_unchecked(1));
+        ledger.connection_established("peer", ConnectionId::new_unchecked(2));
         assert!(matches!(
             ledger.authenticate(principal(1), [1; 16], 1),
             SessionAction::Authenticated(_)
@@ -211,25 +240,35 @@ mod tests {
             ledger.authorize_ping("peer", [2; 16], 2),
             SessionAction::Rejected(PublicErrorCode::AuthSessionRequired)
         ));
-        assert!(ledger.connection_closed("peer").is_none());
+        assert!(
+            ledger
+                .connection_closed("peer", ConnectionId::new_unchecked(1))
+                .is_none()
+        );
         assert!(matches!(
-            ledger.connection_closed("peer"),
+            ledger.connection_closed("peer", ConnectionId::new_unchecked(2)),
             Some(SessionAction::Removed(_))
         ));
         assert_eq!(ledger.len(), 0);
-        ledger.connection_established("peer");
+        ledger.connection_established("peer", ConnectionId::new_unchecked(1));
         assert!(matches!(
             ledger.authenticate(principal(1), [1; 16], 1),
             SessionAction::Authenticated(_)
         ));
         assert_eq!(
             ledger.replace_revision(2),
-            vec![SessionAction::PrincipalRevoked("peer".into())]
+            vec![
+                SessionAction::PrincipalRevoked("peer".into()),
+                SessionAction::ClosePeerConnections {
+                    peer_id: "peer".into(),
+                    connection_ids: vec![ConnectionId::new_unchecked(1)]
+                }
+            ]
         );
         assert_eq!(ledger.len(), 0);
         ledger.sweep(100);
         assert_eq!(ledger.len(), 0);
-        ledger.connection_established("peer");
+        ledger.connection_established("peer", ConnectionId::new_unchecked(1));
         assert!(matches!(
             ledger.authenticate(principal(1), [3; 16], 1),
             SessionAction::Authenticated(_)
@@ -238,6 +277,10 @@ mod tests {
             ledger.authorize_ping("peer", [3; 16], 100),
             SessionAction::Rejected(PublicErrorCode::AuthSessionExpired)
         ));
-        assert!(ledger.connection_closed("peer").is_none());
+        assert!(
+            ledger
+                .connection_closed("peer", ConnectionId::new_unchecked(1))
+                .is_none()
+        );
     }
 }

@@ -17,6 +17,7 @@ pub struct AuthPrincipal {
     pub credential_expires_at: i64,
     pub credential_digest: TokenDigest,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CredentialBinding {
     pub credential_id: CredentialId,
     pub digest: TokenDigest,
@@ -36,6 +37,13 @@ pub enum AuthFailure {
     #[error("forbidden role")]
     ForbiddenRole,
 }
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum SnapshotError {
+    #[error("authorization revision must not decrease")]
+    RevisionDecreased,
+    #[error("snapshot changed without a higher authorization revision")]
+    RevisionRequired,
+}
 pub trait CredentialProvider {
     fn authenticate(
         &self,
@@ -47,6 +55,7 @@ pub trait CredentialProvider {
     ) -> Result<AuthPrincipal, AuthFailure>;
 }
 
+#[derive(Clone, Eq, PartialEq)]
 pub struct FixedTokenProvider {
     revision: u64,
     credentials: HashMap<CredentialId, CredentialBinding>,
@@ -104,6 +113,19 @@ impl FixedTokenProvider {
     }
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+    pub fn replace_snapshot(
+        current: &Self,
+        candidate: Self,
+        _now: i64,
+    ) -> Result<Self, SnapshotError> {
+        if candidate.revision < current.revision {
+            return Err(SnapshotError::RevisionDecreased);
+        }
+        if candidate.revision == current.revision && candidate.credentials != current.credentials {
+            return Err(SnapshotError::RevisionRequired);
+        }
+        Ok(candidate)
     }
     pub fn binding_matches(&self, peer_id: &str, principal: &AuthPrincipal) -> bool {
         self.binding_matches_at(peer_id, principal, principal.credential_not_before)
@@ -207,6 +229,52 @@ mod tests {
             revoked: false,
         };
         (FixedTokenProvider::new(2, [binding]), token, id)
+    }
+    #[test]
+    fn snapshot_replacement_is_monotonic_and_idempotent() {
+        let (current, token, id) = provider();
+        let same = FixedTokenProvider::new(
+            2,
+            [CredentialBinding {
+                credential_id: id.clone(),
+                digest: token.digest(),
+                peer_id: "peer".into(),
+                tenant: Tenant::new("tenant").unwrap(),
+                role: Role::Client,
+                scopes: 1,
+                quota_profile: QuotaProfile::new("standard").unwrap(),
+                not_before: 0,
+                expires_at: 100,
+                revoked: false,
+            }],
+        );
+        assert_eq!(
+            FixedTokenProvider::replace_snapshot(&current, same, 0),
+            Ok(current.clone())
+        );
+        assert_eq!(
+            FixedTokenProvider::replace_snapshot(&current, FixedTokenProvider::new(1, []), 0),
+            Err(SnapshotError::RevisionDecreased)
+        );
+        let changed = FixedTokenProvider::new(
+            2,
+            [CredentialBinding {
+                credential_id: id,
+                digest: token.digest(),
+                peer_id: "other".into(),
+                tenant: Tenant::new("tenant").unwrap(),
+                role: Role::Client,
+                scopes: 1,
+                quota_profile: QuotaProfile::new("standard").unwrap(),
+                not_before: 0,
+                expires_at: 100,
+                revoked: false,
+            }],
+        );
+        assert_eq!(
+            FixedTokenProvider::replace_snapshot(&current, changed, 0),
+            Err(SnapshotError::RevisionRequired)
+        );
     }
     #[test]
     fn validates_binding_and_rejects_wrong_peer() {
