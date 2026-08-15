@@ -176,6 +176,11 @@ async fn main() -> io::Result<()> {
     let mut auth_request_id = request_ids.allocate().map_err(io::Error::other)?;
     let mut ping_request_id = request_ids.allocate().map_err(io::Error::other)?;
     let mut auth_state = AuthState::new();
+    if config.mode == RuntimeMode::Product
+        && let Some(exchange) = args.exchange.clone()
+    {
+        swarm.dial(exchange).map_err(io::Error::other)?;
+    }
     if config.mode == RuntimeMode::ConnectivityLab
         && let Some(exchange) = args.exchange
     {

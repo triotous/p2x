@@ -62,12 +62,13 @@ PY
 now=$(date +%s)
 client_peer_binding="$client_peer"
 client_role=client
+client_scopes=open_proxy_stream
 client_revoked=false
 client_not_before=$((now-60))
 client_expires=$((now+3600))
 case "$case_name" in
   wrong-peer) client_peer_binding="$server_peer" ;;
-  wrong-role) client_role=server ;;
+  wrong-role) client_role=server; client_scopes=register_services ;;
   limits) client_peer_binding="$client_peer" ;;
   malformed) client_peer_binding="$client_peer" ;;
   revoked) client_revoked=true ;;
@@ -83,7 +84,7 @@ credentials:
     peer_id: "$client_peer_binding"
     tenant: test
     role: $client_role
-    scopes: [register_services]
+    scopes: [$client_scopes]
     quota_profile: standard
     not_before: $client_not_before
     expires_at: $client_expires
@@ -103,7 +104,7 @@ credentials:
     peer_id: "$client_peer"
     tenant: test
     role: client
-    scopes: [register_services]
+    scopes: [open_proxy_stream]
     quota_profile: standard
     not_before: $((now-60))
     expires_at: $((now+3600))
@@ -118,7 +119,7 @@ exchange_pid=$!
 pids+=("$exchange_pid")
 exchange_addr=""
 for _ in $(seq 1 200); do
-  exchange_addr=$(sed -n 's/.*"event":"listener_ready".*"address":"\([^" ]*\/tcp\/[^" ]*\)".*/\1/p' "$exchange_log" | head -1 || true)
+  exchange_addr=$(jq -r 'select(.event == "listener_ready" and (.address | contains("/tcp/"))) | .address' "$exchange_log" 2>/dev/null | head -1 || true)
   [[ -n "$exchange_addr" ]] && break
   sleep .05
 done
