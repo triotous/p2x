@@ -44,6 +44,7 @@ server_key="$secret_dir/server.key"
 ticket_key="$secret_dir/ticket.key"
 printf '\001' > "$ticket_key"
 head -c 32 /dev/urandom >> "$ticket_key"
+chmod 600 "$ticket_key"
 identity_bin="$root/target/debug/examples/identity-id"
 exchange_peer=$($identity_bin "$exchange_key" --generate)
 client_peer=$($identity_bin "$client_key" --generate)
