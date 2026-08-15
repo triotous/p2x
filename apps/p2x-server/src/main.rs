@@ -176,7 +176,9 @@ async fn main() -> io::Result<()> {
     let mut auth_request_id = request_ids.allocate().map_err(io::Error::other)?;
     let mut ping_request_id = request_ids.allocate().map_err(io::Error::other)?;
     let mut auth_state = AuthState::new();
-    if let Some(exchange) = args.exchange {
+    if config.mode == RuntimeMode::ConnectivityLab
+        && let Some(exchange) = args.exchange
+    {
         let relay_peer = exchange
             .iter()
             .find_map(|part| match part {
@@ -276,7 +278,8 @@ async fn main() -> io::Result<()> {
                             auth_request_id = request_id;
                             swarm.behaviour_mut().auth.send_request(&peer_id, AuthRequest::Authenticate { request_id, credential_id: id.clone(), token_secret: p2x_protocol::TokenSecret::from_bytes(*token.as_bytes()), requested_role: Role::Server, supported_features: 0 });
                         }
-                        if relay_peer_id == Some(peer_id)
+                        if config.mode == RuntimeMode::ConnectivityLab
+                            && relay_peer_id == Some(peer_id)
                             && !reservation_requested
                             && let Some(address) = pending_circuit.clone()
                         {
@@ -291,7 +294,9 @@ async fn main() -> io::Result<()> {
                         }
                     }
                     SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => {
-                        if relay_peer_id == Some(peer_id) && relay_connection_id == Some(connection_id) {
+                        if config.mode == RuntimeMode::ConnectivityLab
+                            && relay_peer_id == Some(peer_id)
+                            && relay_connection_id == Some(connection_id) {
                             reservation.apply(ReservationEvent::ExchangeLost { generation: 1, peer_id, connection_id }).map_err(io::Error::other)?;
                             emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Degraded, exchange_peer_id: &peer_id.to_string(), listener_id: circuit_listener_id.as_ref().map(|_| "circuit"), address: None, generation: 1, renewal: false })?;
                         }
@@ -335,7 +340,7 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::OutboundFailure { error: libp2p::request_response::OutboundFailure::ConnectionClosed, .. })) if credential.is_some() => {
                         auth_state.disconnected();
                     }
-                    SwarmEvent::Behaviour(PeerEvent::Relay(libp2p::relay::client::Event::ReservationReqAccepted { relay_peer_id: peer_id, renewal, .. })) => {
+                    SwarmEvent::Behaviour(PeerEvent::Relay(libp2p::relay::client::Event::ReservationReqAccepted { relay_peer_id: peer_id, renewal, .. })) if config.mode == RuntimeMode::ConnectivityLab => {
                         if let (Some(connection_id), Some(listener_id)) = (relay_connection_id, circuit_listener_id) {
                             reservation.apply(ReservationEvent::ReservationAccepted { generation: 1, peer_id, connection_id, listener_id, renewal }).map_err(io::Error::other)?;
                             let relay = peer_id.to_string();

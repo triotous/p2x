@@ -144,7 +144,7 @@ fi
 log="$out/$component.ndjson"
 P2X_TOKEN="$token" "$root/target/debug/p2x-$component" \
   --identity-file "$key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" \
-  --credential-env P2X_TOKEN --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
+  --credential-env P2X_TOKEN --finite-auth-check --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
   --case-id "$case_name" >"$log" 2>&1 &
 pids+=("$!")
 companion=""
@@ -152,7 +152,7 @@ if [[ "$case_name" == valid-client || "$case_name" == valid-server ]]; then
   if [[ "$component" == client ]]; then companion=server; companion_token="$server_token"; companion_key="$server_key"; else companion=client; companion_token="$client_token"; companion_key="$client_key"; fi
   P2X_TOKEN="$companion_token" "$root/target/debug/p2x-$companion" \
     --identity-file "$companion_key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" \
-    --credential-env P2X_TOKEN --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
+    --credential-env P2X_TOKEN --finite-auth-check --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
     --case-id "$case_name" >"$out/$companion.ndjson" 2>&1 &
   pids+=("$!")
 fi
@@ -170,7 +170,7 @@ esac
 if [[ "$case_name" == wrong-token ]]; then
   kill -INT "${pids[-1]}" 2>/dev/null || true; wait "${pids[-1]}" 2>/dev/null || true
   unset 'pids[-1]'
-  P2X_TOKEN="${token%?}A" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --case-id "$case_name" >"$log" 2>&1 &
+  P2X_TOKEN="${token%?}A" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --finite-auth-check --case-id "$case_name" >"$log" 2>&1 &
   pids+=("$!")
 fi
 for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$log" && break; sleep .05; done
