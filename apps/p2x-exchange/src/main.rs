@@ -34,8 +34,21 @@ async fn main() -> io::Result<()> {
     swarm.listen_on(args.tcp_listen).map_err(io::Error::other)?;
     emitter.event("started", Some(&swarm.local_peer_id().to_string()))?;
     loop {
-        tokio::select! { _ = tokio::signal::ctrl_c() => break, event = swarm.select_next_some() => { if let SwarmEvent::NewListenAddr { address, .. } = event { let advertised = address.with(libp2p::multiaddr::Protocol::P2p(*swarm.local_peer_id()));
-        emitter.event("listen_addr", Some(&advertised.to_string()))?; } } }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            event = swarm.select_next_some() => match event {
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    let advertised = address.with(libp2p::multiaddr::Protocol::P2p(*swarm.local_peer_id()));
+                    emitter.event("listen_addr", Some(&advertised.to_string()))?;
+                }
+                SwarmEvent::Behaviour(event) => emitter.event("relay_event", Some(&format!("{event:?}")))?,
+                SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => emitter.event("connection_established", Some(&format!("peer_id={peer_id} connection_id={connection_id:?}")))?,
+                SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => emitter.event("connection_closed", Some(&format!("peer_id={peer_id} connection_id={connection_id:?} cause={cause:?}")))?,
+                SwarmEvent::IncomingConnectionError { error, .. } => emitter.event("incoming_error", Some(&error.to_string()))?,
+                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => emitter.event("outgoing_error", Some(&format!("peer_id={peer_id:?} error={error}")))?,
+                _ => {}
+            }
+        }
     }
     emitter.terminal("stopped", "shutdown")?;
     Ok(())
