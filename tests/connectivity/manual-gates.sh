@@ -39,6 +39,11 @@ case "${1:-}" in
     jq -e -s 'any(.[]; .event == "terminal" and .result == "passed" and .observed_path == "relay" and .setup_duration_ms <= 20000)' "$artifact_dir/client.ndjson" >/dev/null || { echo "C14 client did not report a passing relay terminal within 20 seconds" >&2; exit 1; }
     jq -e -s 'any(.[]; .event == "probe_completed" and .ack.path == "relay" and .ack.terminal == "ok")' "$artifact_dir/server.ndjson" >/dev/null || { echo "C14 server did not observe a successful relay probe" >&2; exit 1; }
     [[ $(jq -r '.run_id' "$artifact_dir"/{exchange,server,client}.ndjson | sort -u | wc -l | tr -d ' ') -eq 1 ]] || { echo "C14 artifacts do not share one run_id" >&2; exit 1; }
+    expected_run_id=$(jq -r '.run_id' "$artifact_dir/client.ndjson" | head -1)
+    [[ $(sed -n 's/^run_id=//p' "$artifact_dir/environment.txt" | sort -u | wc -l | tr -d ' ') -eq 1 ]] || { echo "C14 environment must record one shared run_id for both hosts" >&2; exit 1; }
+    [[ $(sed -n 's/^run_id=//p' "$artifact_dir/environment.txt" | head -1) == "$expected_run_id" ]] || { echo "C14 environment run_id does not match NDJSON artifacts" >&2; exit 1; }
+    [[ $(grep -Ec '^=== Host [AB]:' "$artifact_dir/environment.txt") -eq 2 ]] || { echo "C14 environment must contain Host A and Host B sections" >&2; exit 1; }
+    [[ $(grep -E '^[0-9a-f]{40}$' "$artifact_dir/environment.txt" | sort -u | wc -l | tr -d ' ') -eq 1 ]] || { echo "C14 hosts must record one shared Git commit" >&2; exit 1; }
     printf '{"schema_version":1,"case":"C14","passed":true,"terminal_code":"probe.ok","artifacts":["exchange.ndjson","server.ndjson","client.ndjson","environment.txt"]}\n' >"$artifact_dir/summary.json"
     cat "$artifact_dir/summary.json"
     ;;
