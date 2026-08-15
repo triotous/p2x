@@ -71,7 +71,9 @@ impl FixedTokenFile {
         let file: Self = crate::yaml::load(path).map_err(|error| match error {
             crate::yaml::YamlError::Io(error) => CredentialConfigError::Io(error),
             crate::yaml::YamlError::Parse(error) => CredentialConfigError::Yaml(error),
-            crate::yaml::YamlError::TooLarge => CredentialConfigError::Invalid("file too large"),
+            crate::yaml::YamlError::TooLarge | crate::yaml::YamlError::Bounds => {
+                CredentialConfigError::Invalid("file too large")
+            }
         })?;
         file.validate()?;
         Ok(file)

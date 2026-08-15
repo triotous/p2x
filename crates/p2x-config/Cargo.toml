@@ -16,6 +16,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_yaml.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+yaml-rust2.workspace = true
 zeroize.workspace = true
 
 [[example]]

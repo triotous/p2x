@@ -119,7 +119,9 @@ impl VerificationKeyFile {
         crate::yaml::load(path).map_err(|error| match error {
             crate::yaml::YamlError::Io(error) => TicketKeyError::ConfigurationIo(error),
             crate::yaml::YamlError::Parse(error) => TicketKeyError::ConfigurationYaml(error),
-            crate::yaml::YamlError::TooLarge => TicketKeyError::InvalidConfiguration,
+            crate::yaml::YamlError::TooLarge | crate::yaml::YamlError::Bounds => {
+                TicketKeyError::InvalidConfiguration
+            }
         })
     }
 }
