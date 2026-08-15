@@ -2,8 +2,10 @@ use clap::Parser;
 use futures::StreamExt;
 use libp2p::{Multiaddr, multiaddr::Protocol, swarm::SwarmEvent};
 use p2x_net::{
-    builder::{SwarmConfig, build_peer_swarm, lab_identity},
+    builder::{PeerEvent, SwarmConfig, build_peer_swarm, lab_identity},
     lifecycle::Emitter,
+    probe_stream::behaviour::ProbeOutput,
+    probe_worker::execute_probe_futures,
 };
 use std::io;
 
@@ -53,9 +55,19 @@ async fn main() -> io::Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             event = swarm.select_next_some() => {
-                if let SwarmEvent::NewListenAddr { address, .. } = event {
-                    let name = if address.to_string().contains("p2p-circuit") { "circuit_ready" } else { "listen_addr" };
-                    emitter.event(name, Some(&address.to_string()))?;
+                match event {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        let name = if address.to_string().contains("p2p-circuit") { "circuit_ready" } else { "listen_addr" };
+                        emitter.event(name, Some(&address.to_string()))?;
+                    }
+                    SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundOpened { mut stream, peer_id, connection_id })) => {
+                        let ack = execute_probe_futures(&mut stream, p2x_net::probe::ProbePath::Relay, format!("{connection_id:?}").bytes().fold(0u64, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte as u64))).await.map_err(io::Error::other)?;
+                        emitter.event("probe_observed", Some(&format!("peer_id={peer_id} connection_id={connection_id:?} path={:?} bytes={}", ack.path, ack.bytes_written)))?;
+                    }
+                    SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundRejected { code, .. })) => {
+                        emitter.event("probe_rejected", Some(code))?;
+                    }
+                    _ => {}
                 }
             }
         }

@@ -2054,6 +2054,7 @@ dependencies = [
  "futures",
  "libp2p",
  "p2x-net",
+ "serde_json",
  "tokio",
  "tracing-subscriber",
 ]
