@@ -102,6 +102,7 @@ async fn main() -> io::Result<()> {
     };
     let mut sessions = AuthSessionLedger::default();
     let mut admission = AdmissionLedger::default();
+    let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
     let config = ExchangeSwarmConfig {
         tcp_listen: args.tcp_listen,
         quic_listen: args.quic_listen,
@@ -117,6 +118,7 @@ async fn main() -> io::Result<()> {
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            _ = maintenance.tick() => { sessions.sweep(chrono_like_now()); admission.sweep(chrono_like_now()); }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { listener_id, address } => {
                     swarm.add_external_address(address.clone());

@@ -393,6 +393,7 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { response: AuthResponse::Authenticated { session_id, request_id, .. }, .. }, .. })) if request_id == auth_request_id => { swarm.behaviour_mut().auth.send_request(&peer, AuthRequest::Ping { request_id: [2; 16], session_id, nonce: 1 }); }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { response: AuthResponse::Pong { request_id, nonce: 1, .. }, .. }, .. })) if credential.is_some() && request_id == [2; 16] => { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?; return Ok(()); }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { response: AuthResponse::Rejected { request_id: Some(request_id), error }, .. }, .. })) if credential.is_some() && request_id == auth_request_id => { emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", error.code.as_str()))?; return Ok(()); }
                     SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => {
                         connections.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?;
                         if let Some(current) = attempt.as_mut() {
