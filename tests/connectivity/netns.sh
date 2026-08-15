@@ -6,6 +6,7 @@ for tool in ip iptables tc ps; do command -v "$tool" >/dev/null || { echo "netns
 [[ ${EUID:-$(id -u)} -eq 0 ]] || { echo "netns cases require root/CAP_NET_ADMIN" >&2; exit 2; }
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
+. "$root/tests/connectivity/common.sh"
 case_id=""
 forward=()
 while [[ $# -gt 0 ]]; do
@@ -17,6 +18,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 case "$case_id" in C02|C03|C04|C05|C06|C07|C08|C09|C10|C11|C12|C13) ;; *) echo "usage: $0 --case C02..C13" >&2; exit 2 ;; esac
+build_linux_binaries
 
 run_id=${P2X_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}
 [[ "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "unsafe run id" >&2; exit 2; }
@@ -108,5 +110,4 @@ for ((index=0; index<${#forward[@]}; index+=2)); do
 done
 
 cd "$root"
-. "$root/tests/connectivity/common.sh"
 run_local_case "$case_id"
