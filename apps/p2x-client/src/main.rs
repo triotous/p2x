@@ -15,7 +15,7 @@ use p2x_net::{
     probe_stream::behaviour::ProbeOutput,
     probe_worker::execute_probe_client_futures_with_timeout,
 };
-use p2x_protocol::{AuthRequest, AuthResponse, Role};
+use p2x_protocol::{AuthRequest, AuthResponse, PublicErrorCode, Role};
 use std::{
     collections::{HashSet, VecDeque},
     io,
@@ -445,6 +445,11 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::OutboundFailure { error: libp2p::request_response::OutboundFailure::Timeout, .. })) if credential.is_some() => {
                         let _ = auth_state.timeout(unix_now());
+                    }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::OutboundFailure { error: libp2p::request_response::OutboundFailure::UnsupportedProtocols, .. })) if credential.is_some() => {
+                        let code = PublicErrorCode::ProtocolCapabilityMismatch;
+                        emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                        return Ok(());
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::OutboundFailure { error: libp2p::request_response::OutboundFailure::ConnectionClosed, .. })) if credential.is_some() => {
                         auth_state.disconnected();

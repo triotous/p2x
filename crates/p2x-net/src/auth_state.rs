@@ -116,6 +116,18 @@ impl AuthState {
             _ => AuthAction::Ignore,
         }
     }
+    pub fn transport_failure(&mut self, code: PublicErrorCode, now: i64) -> AuthAction {
+        if matches!(
+            code,
+            PublicErrorCode::ProtocolCapabilityMismatch
+                | PublicErrorCode::ProtocolUnsupportedVersion
+        ) {
+            self.phase = AuthPhase::Terminal(code);
+            return AuthAction::Terminal(code);
+        }
+        self.enter_backoff(now);
+        AuthAction::Retry
+    }
     pub fn rejected(
         &mut self,
         request_id: Option<[u8; 16]>,
@@ -242,5 +254,11 @@ mod tests {
             AuthAction::Terminal(PublicErrorCode::AuthInvalidCredential)
         );
         assert_eq!(state.connected([4; 16], 2), AuthAction::Ignore);
+        state.disconnected();
+        state.connected(AUTH, 3);
+        assert_eq!(
+            state.transport_failure(PublicErrorCode::ProtocolCapabilityMismatch, 3),
+            AuthAction::Terminal(PublicErrorCode::ProtocolCapabilityMismatch)
+        );
     }
 }

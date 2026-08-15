@@ -6,9 +6,9 @@ The authenticated control protocol is `/p2x/auth/1`. The exchange supports inbou
 
 Frames contain a four-byte big-endian payload length followed by exactly that many bytes. Empty frames and frames larger than 4096 bytes are rejected before payload allocation. Decode failures are local errors and attacker-controlled text is never returned.
 
-Version 1 supports `Authenticate` and `Ping` requests, and `Authenticated`, `Pong`, and `Rejected` responses. The transport event's authenticated `PeerId` is authoritative; credentials are not allowed to carry a peer identity.
+Version 1 supports `Authenticate` and `Ping` requests, and `Authenticated`, `Pong`, and `Rejected` responses. The transport event's authenticated `PeerId` is authoritative; credentials are not allowed to carry a peer identity. One auth request is allowed per peer and 128 inbound requests are allowed globally; established connections, source-IP connections, sessions, and failure buckets are also bounded. Overload is rejected instead of queued.
 
-The exchange runtime accepts `--credential-file <path>` for a validated digest-only fixed-token snapshot. Clients and servers accept `--credential-env <NAME>`; the environment value is parsed as `p2x1.<credential-id>.<base64url-no-pad-32-byte-secret>`. With a credential configured, an established pinned exchange connection starts Authenticate, then sends one correlated Ping after Authenticated. Without these options, the existing explicit connectivity-lab probe flow remains available.
+The exchange runtime accepts `--credential-file <path>` for a validated digest-only fixed-token snapshot. Clients and servers accept `--credential-env <NAME>`; the environment value is parsed as `p2x1.<credential-id>.<base64url-no-pad-32-byte-secret>`. With a credential configured, an established pinned exchange connection starts Authenticate, then sends one correlated Ping after Authenticated. Request and response IDs are checked against the current state; stale responses are ignored. Transport timeout and disconnect paths use bounded exponential backoff, while invalid credentials and incompatible protocol capabilities are terminal. Readiness is emitted only after the matching Pong. Without these options, the existing explicit connectivity-lab probe flow remains available.
 
 ## Public errors
 
@@ -18,7 +18,7 @@ Only the code and retryability cross the wire. Internal causes remain local diag
 
 ## Ticket boundary
 
-Ticket claims and envelopes use canonical binary encoding and Ed25519 signatures. Claims are limited to 1024 bytes and envelopes to 2048 bytes. The signing context is `p2x-ticket-v1\0`; the committed test vector is `crates/p2x-protocol/testdata/ticket-v1.json`.
+Ticket claims and envelopes use canonical binary encoding and Ed25519 signatures. Claims are limited to 1024 bytes and envelopes to 2048 bytes. Tenant and upstream identifiers are bounded identifiers; v1 requires `OPEN_PROXY_STREAM` and `max_streams: 1`. The signing context is `p2x-ticket-v1\0`; the committed test vector is `crates/p2x-protocol/testdata/ticket-v1.json`. Verification rings accept only canonical lowercase key IDs whose public key hashes to that ID, and enforce activation/retirement windows.
 
 ## Current phase boundary
 
