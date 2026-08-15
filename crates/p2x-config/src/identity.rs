@@ -38,10 +38,7 @@ pub fn load_or_create_identity(config: &IdentityConfig) -> Result<LoadedIdentity
         Err(SecretFileError::Io(error))
             if error.kind() == std::io::ErrorKind::NotFound && config.generate_if_missing =>
         {
-            let key = Keypair::ed25519_from_bytes(
-                libp2p_identity::ed25519::Keypair::generate().to_bytes(),
-            )
-            .map_err(|_| IdentityError::InvalidEncoding)?;
+            let key = Keypair::generate_ed25519();
             let bytes = key
                 .to_protobuf_encoding()
                 .map_err(|_| IdentityError::InvalidEncoding)?;
