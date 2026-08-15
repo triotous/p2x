@@ -157,6 +157,25 @@ mod tests {
         }
     }
     #[test]
+    fn committed_vector_reproduces_exact_bytes() {
+        let c = claims();
+        let signer = TicketSigner::from_seed([9; 32]);
+        let encoded = c.encode().unwrap();
+        let ticket = signer.sign(&c).unwrap();
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/ticket-v1.json")).unwrap();
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(hex(&encoded), vector["claims_hex"]);
+        assert_eq!(hex(&ticket), vector["envelope_hex"]);
+        assert_eq!(hex(&signer.key_id), vector["key_id_hex"]);
+    }
+
+    #[test]
     fn signs_and_rejects_mutation() {
         let signer = TicketSigner::from_seed([9; 32]);
         let ticket = signer.sign(&claims()).unwrap();
