@@ -103,6 +103,22 @@ impl AuthSessionLedger {
             .filter(|(peer, session)| !provider.binding_matches(peer, &session.principal))
             .map(|(peer, _)| peer.clone())
             .collect::<Vec<_>>();
+        self.remove_revoked(revoked)
+    }
+    pub fn replace_snapshot_at(
+        &mut self,
+        provider: &FixedTokenProvider,
+        now: i64,
+    ) -> Vec<SessionAction> {
+        let revoked = self
+            .sessions
+            .iter()
+            .filter(|(peer, session)| !provider.binding_matches_at(peer, &session.principal, now))
+            .map(|(peer, _)| peer.clone())
+            .collect::<Vec<_>>();
+        self.remove_revoked(revoked)
+    }
+    fn remove_revoked(&mut self, revoked: Vec<String>) -> Vec<SessionAction> {
         for peer in &revoked {
             self.sessions.remove(peer);
         }
@@ -118,13 +134,7 @@ impl AuthSessionLedger {
             .filter(|(_, session)| session.principal.authorization_revision < revision)
             .map(|(peer, _)| peer.clone())
             .collect::<Vec<_>>();
-        for peer in &revoked {
-            self.sessions.remove(peer);
-        }
-        revoked
-            .into_iter()
-            .map(SessionAction::PrincipalRevoked)
-            .collect()
+        self.remove_revoked(revoked)
     }
     pub fn sweep(&mut self, now: i64) {
         self.sessions.retain(|_, session| session.expires_at > now);
@@ -150,8 +160,39 @@ mod tests {
             scopes: 1,
             quota_profile: QuotaProfile::new("q").unwrap(),
             authorization_revision: revision,
+            credential_not_before: 0,
             credential_expires_at: 100,
+            credential_digest: TokenDigest::from_bytes([9; 32]),
         }
+    }
+    #[test]
+    fn snapshot_replacement_detects_digest_changes() {
+        let id = CredentialId::new("id").unwrap();
+        let binding = |digest| CredentialBinding {
+            credential_id: id.clone(),
+            digest: TokenDigest::from_bytes(digest),
+            peer_id: "peer".into(),
+            tenant: Tenant::new("t").unwrap(),
+            role: Role::Client,
+            scopes: 1,
+            quota_profile: QuotaProfile::new("q").unwrap(),
+            not_before: 0,
+            expires_at: 100,
+            revoked: false,
+        };
+        let provider = FixedTokenProvider::new(1, [binding([9; 32])]);
+        let mut ledger = AuthSessionLedger::new(1);
+        ledger.connection_established("peer");
+        assert!(matches!(
+            ledger.authenticate(principal(1), [1; 16], 1),
+            SessionAction::Authenticated(_)
+        ));
+        assert!(ledger.replace_snapshot_at(&provider, 2).is_empty());
+        let changed = FixedTokenProvider::new(2, [binding([8; 32])]);
+        assert_eq!(
+            ledger.replace_snapshot_at(&changed, 2),
+            vec![SessionAction::PrincipalRevoked("peer".into())]
+        );
     }
     #[test]
     fn replacement_expiry_and_close_are_bounded() {

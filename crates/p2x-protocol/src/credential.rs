@@ -50,6 +50,17 @@ impl fmt::Debug for TokenSecret {
 }
 
 pub struct TokenDigest([u8; 32]);
+impl PartialEq for TokenDigest {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for TokenDigest {}
+impl Clone for TokenDigest {
+    fn clone(&self) -> Self {
+        Self(self.0)
+    }
+}
 impl TokenDigest {
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)

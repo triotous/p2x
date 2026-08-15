@@ -12,7 +12,9 @@ pub struct AuthPrincipal {
     pub scopes: u32,
     pub quota_profile: QuotaProfile,
     pub authorization_revision: u64,
+    pub credential_not_before: i64,
     pub credential_expires_at: i64,
+    pub credential_digest: TokenDigest,
 }
 pub struct CredentialBinding {
     pub credential_id: CredentialId,
@@ -92,6 +94,9 @@ impl FixedTokenProvider {
         self.revision
     }
     pub fn binding_matches(&self, peer_id: &str, principal: &AuthPrincipal) -> bool {
+        self.binding_matches_at(peer_id, principal, principal.credential_not_before)
+    }
+    pub fn binding_matches_at(&self, peer_id: &str, principal: &AuthPrincipal, now: i64) -> bool {
         self.credentials
             .get(&principal.credential_id)
             .is_some_and(|binding| {
@@ -101,7 +106,11 @@ impl FixedTokenProvider {
                     && binding.scopes == principal.scopes
                     && binding.quota_profile == principal.quota_profile
                     && !binding.revoked
+                    && now >= binding.not_before
+                    && now < binding.expires_at
+                    && binding.not_before == principal.credential_not_before
                     && binding.expires_at == principal.credential_expires_at
+                    && binding.digest.as_bytes() == principal.credential_digest.as_bytes()
                     && self.revision == principal.authorization_revision
             })
     }
@@ -140,7 +149,9 @@ impl FixedTokenProvider {
             scopes: binding.scopes,
             quota_profile: binding.quota_profile.clone(),
             authorization_revision: self.revision,
+            credential_not_before: binding.not_before,
             credential_expires_at: binding.expires_at,
+            credential_digest: binding.digest.clone(),
         })
     }
 }
