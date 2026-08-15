@@ -16,25 +16,28 @@ pub fn load<T: DeserializeOwned>(path: &Path) -> Result<T, YamlError> {
         return Err(YamlError::TooLarge);
     }
     let bytes = fs::read(path)?;
-    validate_document(&bytes)?;
-    Ok(serde_yaml::from_slice(&bytes)?)
-}
-fn validate_document(bytes: &[u8]) -> Result<(), YamlError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| {
-        YamlError::Parse(serde_yaml::from_str::<serde_yaml::Value>("!invalid").unwrap_err())
+    let mut documents = serde_yaml::Deserializer::from_slice(&bytes);
+    let first = documents.next().ok_or_else(|| {
+        YamlError::Parse(serde_yaml::from_str::<serde_yaml::Value>("").unwrap_err())
     })?;
-    let documents = text.lines().filter(|line| line.trim() == "---").count();
-    if documents > 1
-        || text.lines().any(|line| {
-            let t = line.trim_start();
-            t.starts_with("<<:") || t.contains(" *") || t.contains(" &")
-        })
-    {
+    let value = T::deserialize(first)?;
+    if documents.next().is_some() {
         return Err(YamlError::Parse(
             serde_yaml::from_str::<serde_yaml::Value>("[invalid").unwrap_err(),
         ));
     }
-    Ok(())
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        YamlError::Parse(serde_yaml::from_str::<serde_yaml::Value>("[invalid").unwrap_err())
+    })?;
+    if text.lines().any(|line| {
+        let t = line.trim_start();
+        t.starts_with("<<:") || t.contains("&") || t.contains("*")
+    }) {
+        return Err(YamlError::Parse(
+            serde_yaml::from_str::<serde_yaml::Value>("[invalid").unwrap_err(),
+        ));
+    }
+    Ok(value)
 }
 #[cfg(test)]
 mod tests {

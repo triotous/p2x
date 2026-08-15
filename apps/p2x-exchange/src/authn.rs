@@ -39,6 +39,8 @@ pub struct FixedTokenProvider {
 }
 impl FixedTokenProvider {
     pub fn from_config(file: &p2x_config::credential::FixedTokenFile) -> Result<Self, AuthFailure> {
+        file.validate()
+            .map_err(|_| AuthFailure::InvalidCredential)?;
         let mut bindings = Vec::with_capacity(file.credentials.len());
         for record in &file.credentials {
             let digest: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD

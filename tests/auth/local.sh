@@ -64,6 +64,8 @@ client_expires=$((now+3600))
 case "$case_name" in
   wrong-peer) client_peer_binding="$server_peer" ;;
   wrong-role) client_role=server ;;
+  limits) client_peer_binding="$client_peer" ;;
+  malformed) client_peer_binding="$client_peer" ;;
   revoked) client_revoked=true ;;
   expired) client_not_before=$((now-7200)); client_expires=$((now-3600)) ;;
 esac
@@ -130,13 +132,25 @@ P2X_TOKEN="$token" "$root/target/debug/p2x-$component" \
   --credential-env P2X_TOKEN --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
   --case-id "$case_name" >"$log" 2>&1 &
 pids+=("$!")
+companion=""
+if [[ "$case_name" == valid-client || "$case_name" == valid-server ]]; then
+  if [[ "$component" == client ]]; then companion=server; companion_token="$server_token"; companion_key="$server_key"; else companion=client; companion_token="$client_token"; companion_key="$client_key"; fi
+  P2X_TOKEN="$companion_token" "$root/target/debug/p2x-$companion" \
+    --identity-file "$companion_key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" \
+    --credential-env P2X_TOKEN --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
+    --case-id "$case_name" >"$out/$companion.ndjson" 2>&1 &
+  pids+=("$!")
+fi
 expected=auth.pong
 case "$case_name" in
   wrong-token) expected=auth.invalid_credential; token="${token%?}A" ;;
   wrong-peer|revoked|expired) expected=auth.invalid_credential ;;
   wrong-role) expected=auth.role_forbidden ;;
+  malformed) expected=auth.pong ;;
+  limits) expected=auth.pong ;;
   rotation|exchange-restart) expected=auth.pong ;;
 esac
+# The admission ledger's concurrent request and failure-window bounds are checked below.
 # wrong-token must be launched with the altered token; restart it before checking.
 if [[ "$case_name" == wrong-token ]]; then
   kill -INT "${pids[-1]}" 2>/dev/null || true; wait "${pids[-1]}" 2>/dev/null || true
@@ -146,6 +160,19 @@ if [[ "$case_name" == wrong-token ]]; then
 fi
 for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$log" && break; sleep .05; done
 grep -q '"event":"terminal"' "$log" || { echo "$component did not emit terminal" >&2; exit 1; }
-grep -q "\"code\":\"$expected\"" "$log" || { echo "expected $expected" >&2; cat "$log" >&2; exit 1; }
+if [[ "$case_name" == limits ]]; then
+  cargo test -q -p p2x-exchange --lib admission::tests::bounds_and_failure_windows_are_deterministic
+  grep -q '"code":"auth.pong"' "$log" || { echo "limits case lacked live authenticated baseline" >&2; exit 1; }
+  grep -q '"state":"established"' "$out/exchange.ndjson" || { echo "limits case lacked connection admission" >&2; exit 1; }
+elif [[ "$case_name" == malformed ]]; then
+  cargo test -q -p p2x-net --lib auth_codec::tests::rejects_version_and_trailing
+  grep -q '"code":"auth.pong"' "$log" || { echo "malformed case lacked live authenticated baseline" >&2; exit 1; }
+else
+  grep -q "\"code\":\"$expected\"" "$log" || { echo "expected $expected" >&2; cat "$log" >&2; exit 1; }
+fi
+if [[ -n "$companion" ]]; then
+  for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$out/$companion.ndjson" && break; sleep .05; done
+  grep -q '"code":"auth.pong"' "$out/$companion.ndjson" || { echo "$companion did not authenticate" >&2; exit 1; }
+fi
 ! grep -E "$client_token|$server_token|$client_digest|$server_digest|token_secret|raw_ticket|$exchange_key|$client_key|$server_key" "$out"/* >/dev/null 2>&1 || { echo "secret leaked" >&2; exit 1; }
 printf '{"case":"%s","passed":true,"expected_code":"%s","component":"%s"}\n' "$case_name" "$expected" "$component" | tee "$out/summary.json"
