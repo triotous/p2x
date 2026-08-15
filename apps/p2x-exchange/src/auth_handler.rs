@@ -54,7 +54,11 @@ pub fn handle_request(
                         error: PublicError::new(PublicErrorCode::ExchangeOverloaded, true),
                     },
                 },
-                Err(_) => AuthResponse::Rejected {
+                Err(crate::authn::AuthFailure::ForbiddenRole) => AuthResponse::Rejected {
+                    request_id: Some(request_id),
+                    error: PublicError::new(PublicErrorCode::AuthRoleForbidden, false),
+                },
+                Err(crate::authn::AuthFailure::InvalidCredential) => AuthResponse::Rejected {
                     request_id: Some(request_id),
                     error: PublicError::new(PublicErrorCode::AuthInvalidCredential, false),
                 },
