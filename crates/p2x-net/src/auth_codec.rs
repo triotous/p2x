@@ -74,3 +74,61 @@ impl Codec for AuthCodec {
         write(io, &body).await
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::executor::block_on;
+    use futures::io::Cursor;
+    use p2x_protocol::{CredentialId, Role};
+    #[test]
+    fn request_round_trip_and_secret_is_wire_only() {
+        let request = AuthRequest::Authenticate {
+            request_id: [1; 16],
+            credential_id: CredentialId::new("id").unwrap(),
+            token_secret: [7; 32],
+            requested_role: Role::Client,
+            supported_features: 0,
+        };
+        let mut wire = Vec::new();
+        block_on(AuthCodec::write_request(
+            &mut AuthCodec,
+            &libp2p::StreamProtocol::new(AUTH_PROTOCOL),
+            &mut wire,
+            request,
+        ))
+        .unwrap();
+        assert!(wire.len() <= MAX_AUTH_FRAME + 4);
+        let decoded = block_on(AuthCodec::read_request(
+            &mut AuthCodec,
+            &libp2p::StreamProtocol::new(AUTH_PROTOCOL),
+            &mut Cursor::new(wire),
+        ))
+        .unwrap();
+        assert!(format!("{decoded:?}").contains("REDACTED"));
+    }
+    #[test]
+    fn rejects_zero_and_oversized_frames() {
+        for body in [vec![0, 0, 0, 0], {
+            let mut value = (MAX_AUTH_FRAME as u32 + 1).to_be_bytes().to_vec();
+            value.extend_from_slice(&[0; MAX_AUTH_FRAME + 1]);
+            value
+        }] {
+            let result = block_on(read(&mut Cursor::new(body)));
+            assert!(result.is_err());
+        }
+    }
+    #[test]
+    fn rejects_trailing_json() {
+        let body = br#"{\"Ping\":{}} trailing"#;
+        let mut wire = (body.len() as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(body);
+        assert!(
+            block_on(AuthCodec::read_request(
+                &mut AuthCodec,
+                &libp2p::StreamProtocol::new(AUTH_PROTOCOL),
+                &mut Cursor::new(wire)
+            ))
+            .is_err()
+        );
+    }
+}
