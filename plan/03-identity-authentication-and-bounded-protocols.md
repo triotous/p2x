@@ -547,6 +547,8 @@ After local tests pass, the owner performs and records:
 - Static checks, fuzz smoke, live auth cases, secret scans, and required connectivity regressions pass with zero leaked logical resources.
 - No registry, resolve, relay admission, or proxy implementation can execute without an `AuthPrincipal`; their actual handlers remain for Plans 04 and later.
 
-## 7. Open Decision Required
+## 7. Repository License Status
 
-The approved product license family is AGPL, but the repository still has no precise SPDX choice. The owner must select either `AGPL-3.0-only` or `AGPL-3.0-or-later` before Phase 1 is distributed and before removing the current cargo-deny exception for unpublished workspace packages. That choice determines the root `LICENSE`, package `license` fields, notices, and source-offer wording; implementation must not guess it.
+The repository license remains intentionally undecided. Phase 1 may continue as private, unpublished workspace code with `publish = false` and the current cargo-deny exception for unpublished packages. Before P2X is distributed, the owner must select a license and add the matching root `LICENSE`, package SPDX fields, and required notices.
+
+AGPL is not the current default. RustDesk remains a conceptual/behavioral reference only, and no RustDesk source may be copied, adapted, linked, or imported under this plan. If a future implementation proposes using RustDesk source, pause before import, obtain explicit owner approval, perform a license/derivative-work review, and then declare the applicable AGPL SPDX expression and compliance materials if that use requires AGPL.

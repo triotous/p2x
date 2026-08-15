@@ -38,7 +38,7 @@ The spike is successful only when all of the following are supported by repeatab
 - Production metrics endpoints, dashboards, deployment manifests, dynamic configuration, or multi-exchange support.
 - Active-stream migration. If the selected direct or relay connection dies after the probe stream is committed, that stream fails; only a later stream may select another path.
 - AutoNAT, rendezvous, UPnP, WebRTC, custom STUN/TURN, or copied RustDesk/`peer-gateway` traversal code.
-- Selecting the repository's final `AGPL-3.0-only` versus `AGPL-3.0-or-later` SPDX expression. The spike must set `publish = false`, must not distribute artifacts, and must not copy RustDesk code while that repository-wide decision remains pending.
+- Selecting the repository's final license. The spike must set `publish = false`, must not distribute artifacts, and must not copy or adapt RustDesk source while the repository license remains undecided. AGPL is considered only if future approved RustDesk source use requires it; it is not the current default.
 
 ## 2. Confirmed Evidence and Provisional Decisions
 

@@ -71,7 +71,7 @@ These findings are product evidence, not a mandate to reuse the previous code.
 - The official DCUtR example establishes an initial relayed connection, learns observed addresses, and attempts direct TCP/QUIC connectivity.
 - Circuit Relay v2 provides identified, end-to-end encrypted relay connections and resource limits.
 - AutoNAT can classify broad public/private reachability, but its result must not be treated as a per-address or permanent NAT truth.
-- RustDesk demonstrates the operationally proven pattern of persistent rendezvous registration, direct-preferred connection setup, and a relay fallback. P2X accepts AGPL licensing obligations but will use RustDesk as architecture research by default. Copy RustDesk code only when a concrete implementation need justifies it, and then preserve source provenance, copyright notices, license text, and modification records.
+- RustDesk demonstrates the operationally proven pattern of persistent rendezvous registration, direct-preferred connection setup, and a relay fallback. P2X currently uses RustDesk only for conceptual and behavioral research; this does not select AGPL as the P2X license. Do not copy, adapt, link, or import RustDesk source unless a concrete need is approved and the resulting license obligations are reviewed and declared first.
 
 ## 3. Product Definition
 
@@ -479,7 +479,7 @@ The connectivity plane is libp2p:
 | WebRTC/ICE | Strong NAT traversal but adds SDP/ICE/data-channel concepts and integration complexity for a native Rust service; revisit only if libp2p matrix results are inadequate |
 | Custom QUIC + STUN + TURN-like relay | Maximum control but recreates identity, candidate exchange, synchronization, relay, multiplexing, and security protocol work |
 | TCP-only reverse tunnel | Reliable reachability but all application bytes use exchange; violates direct-preferred cost/latency goal |
-| RustDesk protocol/code fork | Remote-desktop semantics do not match service registry/proxy needs, and importing its protocol stack would create unnecessary coupling; use its behavior as research and copy only a specifically justified portion under the approved AGPL policy |
+| RustDesk protocol/code fork | Remote-desktop semantics do not match service registry/proxy needs, and importing its protocol stack would create unnecessary coupling and licensing obligations; use its behavior only as research unless a separately approved source-use and license decision is made first |
 
 ## 12. Component Architecture
 
@@ -804,7 +804,7 @@ Recommendation: ship v1 with explicit active-stream reset semantics and fast rec
 14. Restrict metrics/admin listeners to operator networks or separate authentication.
 15. Treat relay as non-anonymous: all participants and exchange know peer IDs.
 16. Define credential revocation behavior for existing registrations, tickets, circuits, and streams.
-17. Run dependency, AGPL/source-provenance, license, and advisory checks in CI.
+17. Run dependency-license, source-provenance, and advisory checks in CI; add AGPL compliance checks only if AGPL-covered source is later approved for use.
 
 ### 17.3 Threats to cover in Stage 2
 
@@ -1184,7 +1184,7 @@ This is a dependency-ordered product breakdown, not yet a coding plan. Each phas
 
 ### Phase 0 — Decisions, workspace, and connectivity proof
 
-- Record the approved decisions in §28 as ADR constraints for libp2p, fixed-token authentication, proxy scope, stream recovery, single-instance exchange, AGPL compliance, and platform support.
+- Record the approved decisions in §28 as ADR constraints for libp2p, fixed-token authentication, proxy scope, stream recovery, single-instance exchange, the currently undecided repository license, conditional third-party source compliance, and platform support.
 - Bootstrap Rust workspace with three binaries and shared crates.
 - Pin toolchain, lint/format/test/security/license CI.
 - Complete all architecture spikes in §23.1.
@@ -1309,7 +1309,7 @@ Each Stage 2 document should name concrete crates/modules/types, implementation 
 | Identity/key loss or silent regeneration | Peer takeover/outage | Durable restrictive storage, explicit generation, backup/rotation/revocation procedure |
 | Linux bridge/rootless or macOS VM-backed container networking invalidates direct tests | False failures/success claims | Linux host/network namespace lab, native macOS validation, relay-required macOS-container tests, and runtime environment warnings |
 | Dependency/protocol changes in libp2p | Compatibility/build risk | Pin release after spike, protocol compatibility tests, planned upgrade cadence |
-| RustDesk code is copied without provenance or notices | AGPL/source-compliance risk | P2X accepts AGPL obligations; default to conceptual reuse, and require explicit source attribution, notices, license text, and modification tracking for copied code |
+| RustDesk code is copied or adapted before a license decision | Unexpected AGPL/source-compliance obligations | Keep RustDesk use conceptual by default; prohibit source import until the owner approves the need, license impact, exact provenance, notices, modification tracking, and corresponding-source obligations |
 
 ## 27. Product Acceptance Criteria
 
@@ -1389,7 +1389,7 @@ Why it matters: active-active exchange changes reservation addresses, registry c
 
 ### 28.6 Project license and reference-code policy
 
-**Decision:** AGPL obligations are accepted. Do not import RustDesk source by default; use it as a behavioral/architectural reference. If copying becomes necessary, copy only the justified portion and record the exact source revision/file, copyright, license notice, modifications, and corresponding-source obligations. Stage 2 must select the precise SPDX identifier and add repository license/notice files before implementation is distributed.
+**Decision (updated 2026-08-15):** the P2X repository license remains intentionally undecided. RustDesk may be used only as a conceptual or behavioral reference under the current plan; that research does not make P2X an AGPL project. Do not copy, adapt, link, or import RustDesk source unless the owner first approves the concrete need and a license review determines and records the obligations. If that future use requires AGPL, declare the precise AGPL SPDX expression and add all required license, copyright, provenance, modification, and corresponding-source materials before the code is imported or distributed. If no RustDesk source is used, select the P2X license independently before distribution.
 
 ### 28.7 Expected scale and SLOs
 

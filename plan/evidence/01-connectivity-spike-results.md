@@ -9,7 +9,7 @@
 - Network baseline: `libp2p = 0.56.0`; exact resolved components are frozen in `Cargo.lock`.
 - Platform observed here: native macOS (`Darwin`), same-host exchange/server/client processes.
 - Static verification: formatting, workspace tests (42 library unit tests plus the exact-connection integration test), Clippy with warnings denied, and `cargo deny check` all passed.
-- Dependency adjudication: Zlib is explicitly allowed; unpublished workspace packages are ignored until the repository SPDX choice is made. RUSTSEC-2026-0118 is unreachable because DNSSEC features are absent. RUSTSEC-2026-0119 and RUSTSEC-2024-0436 have narrow, removal-conditioned ignores in `deny.toml`; `cargo deny check` reports all four checks `ok`.
+- Dependency adjudication: Zlib is explicitly allowed; unpublished workspace packages are ignored while the repository license remains intentionally undecided. No AGPL license is currently selected and no RustDesk source is included. RUSTSEC-2026-0118 is unreachable because DNSSEC features are absent. RUSTSEC-2026-0119 and RUSTSEC-2024-0436 have narrow, removal-conditioned ignores in `deny.toml`; `cargo deny check` reports all four checks `ok`.
 
 ## Native local observations
 

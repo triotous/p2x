@@ -155,7 +155,7 @@ Every gate case writes raw per-process NDJSON, environment/topology, resource sa
 Keep `cargo-deny 0.20.2` pinned and correct [`deny.toml`](../deny.toml) deliberately:
 
 - allow the OSI-approved `Zlib` dependency license;
-- while the repository's exact AGPL SPDX choice remains intentionally unresolved, configure cargo-deny to ignore unpublished private workspace packages rather than assigning a guessed license; remove that exception when the repository license is selected;
+- while the repository license remains intentionally undecided, configure cargo-deny to ignore unpublished private workspace packages rather than assigning a guessed license; remove that exception when the repository license is selected. Do not assume AGPL unless later approved third-party source use requires it;
 - use `cargo tree -e features -i hickory-proto` to document whether each hickory advisory is reachable under the committed features, then resolve it through the smallest compatible dependency change or a narrowly scoped, owner-reviewed ignore with reachability rationale and removal condition;
 - resolve the `paste` unmaintained advisory through an available upstream dependency update, or document a narrowly scoped temporary ignore and tracked removal condition; do not add a blanket advisory ignore.
 
