@@ -1,6 +1,6 @@
 use clap::Parser;
 use futures::StreamExt;
-use libp2p::{Multiaddr, swarm::SwarmEvent};
+use libp2p::{Multiaddr, multiaddr::Protocol, swarm::SwarmEvent};
 use p2x_net::{
     builder::{SwarmConfig, build_peer_swarm, lab_identity},
     lifecycle::Emitter,
@@ -13,6 +13,9 @@ struct Args {
     identity_seed: Option<u64>,
     #[arg(long, default_value = "/ip4/127.0.0.1/tcp/0")]
     tcp_listen: Multiaddr,
+    /// Exchange relay address, including its /p2p/<peer-id> component.
+    #[arg(long)]
+    exchange: Option<Multiaddr>,
 }
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -22,6 +25,29 @@ async fn main() -> io::Result<()> {
     let key = lab_identity(args.identity_seed).map_err(io::Error::other)?;
     let mut swarm = build_peer_swarm(key, SwarmConfig::default()).map_err(io::Error::other)?;
     swarm.listen_on(args.tcp_listen).map_err(io::Error::other)?;
+    if let Some(exchange) = args.exchange {
+        let relay_peer = exchange
+            .iter()
+            .find_map(|part| match part {
+                Protocol::P2p(peer) => Some(peer),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "exchange address needs /p2p/<peer>",
+                )
+            })?;
+        swarm.dial(exchange.clone()).map_err(io::Error::other)?;
+        let circuit = exchange
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(*swarm.local_peer_id()));
+        emitter.event(
+            "relay_dial",
+            Some(&format!("relay={relay_peer} circuit={circuit}")),
+        )?;
+        swarm.listen_on(circuit).map_err(io::Error::other)?;
+    }
     emitter.event("started", Some(&swarm.local_peer_id().to_string()))?;
     loop {
         tokio::select! { _ = tokio::signal::ctrl_c() => break, event = swarm.select_next_some() => { if let SwarmEvent::NewListenAddr { address, .. } = event { emitter.event("listen_addr", Some(&address.to_string()))?; } } }

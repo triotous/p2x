@@ -18,6 +18,8 @@ struct Args {
     identity_seed: Option<u64>,
     #[arg(long)]
     exchange: Option<Multiaddr>,
+    #[arg(long)]
+    server: Option<Multiaddr>,
     #[arg(long, value_enum, default_value_t = Path::Relay)]
     path: Path,
 }
@@ -37,6 +39,9 @@ async fn main() -> io::Result<()> {
         )),
     )?;
     if let Some(address) = args.exchange {
+        swarm.dial(address).map_err(io::Error::other)?;
+    }
+    if let Some(address) = args.server {
         swarm.dial(address).map_err(io::Error::other)?;
     }
     loop {

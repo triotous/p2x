@@ -126,7 +126,7 @@ impl PathAttempt {
             return self.fail(PathFailure::SetupExpired);
         }
         match event.kind {
-            PathEventKind::Begin { relay, direct } => {
+            PathEventKind::Begin { relay, direct } if matches!(self.state, PathState::Absent) => {
                 if let Some(direct) = direct {
                     self.commit(PathDecision::Direct(direct));
                     self.open_committed().into_iter().collect()
@@ -269,6 +269,9 @@ impl PathAttempt {
         self.state = PathState::Committed { decision };
     }
     fn fail(&mut self, reason: PathFailure) -> Vec<PathAction> {
+        if matches!(self.state, PathState::Failed { .. }) {
+            return vec![];
+        }
         self.state = PathState::Failed { reason };
         vec![PathAction::Finish(reason)]
     }

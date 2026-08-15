@@ -82,6 +82,9 @@ impl ConnectionBook {
             record.closing = false;
             return;
         }
+        if self.records.len() >= MAX_CONNECTION_LIFECYCLES {
+            return;
+        }
         self.next_sequence += 1;
         let confirmed = self.pending_dcutr.remove(&key).is_some();
         self.records.insert(
@@ -135,9 +138,17 @@ impl ConnectionBook {
         let key = (peer_id, connection_id);
         self.records.remove(&key);
         self.pending_dcutr.remove(&key);
-        if self.tombstones.len() < MAX_CONNECTION_LIFECYCLES {
-            self.tombstones.insert(key, now + TOMBSTONE_TTL);
+        self.sweep(now);
+        if self.tombstones.len() >= MAX_CONNECTION_LIFECYCLES
+            && let Some(oldest) = self
+                .tombstones
+                .iter()
+                .min_by_key(|(_, expiry)| **expiry)
+                .map(|(key, _)| *key)
+        {
+            self.tombstones.remove(&oldest);
         }
+        self.tombstones.insert(key, now + TOMBSTONE_TTL);
     }
     pub fn mark_ping(&mut self, peer_id: PeerId, connection_id: ConnectionId, now: Instant) {
         if let Some(r) = self.records.get_mut(&(peer_id, connection_id)) {
