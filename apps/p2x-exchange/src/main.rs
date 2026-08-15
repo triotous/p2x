@@ -127,6 +127,16 @@ async fn main() -> io::Result<()> {
             "product mode requires --identity-file",
         ));
     };
+    if let Some(ticket_key) = ticket_key.as_ref() {
+        let transport_public = key
+            .public()
+            .try_into_ed25519()
+            .map_err(|_| io::Error::other("transport identity is not Ed25519"))?
+            .to_bytes();
+        ticket_key
+            .ensure_separate_from(&transport_public)
+            .map_err(io::Error::other)?;
+    }
     let mut sessions = AuthSessionLedger::default();
     let mut admission = AdmissionLedger::default();
     let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));

@@ -1,5 +1,5 @@
 use serde::de::{DeserializeOwned, DeserializeSeed, MapAccess, SeqAccess, Visitor};
-use std::{fmt, fs, path::Path};
+use std::{fmt, fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt, path::Path};
 use thiserror::Error;
 pub const MAX_YAML_FILE: u64 = 512 * 1024;
 #[derive(Debug, Error)]
@@ -104,10 +104,17 @@ fn invalid_yaml() -> serde_yaml::Error {
     serde_yaml::from_str::<serde_yaml::Value>("[invalid").unwrap_err()
 }
 pub fn load<T: DeserializeOwned>(path: &Path) -> Result<T, YamlError> {
-    if fs::metadata(path)?.len() > MAX_YAML_FILE {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_YAML_FILE + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_YAML_FILE {
         return Err(YamlError::TooLarge);
     }
-    let bytes = fs::read(path)?;
     let text = std::str::from_utf8(&bytes).map_err(|_| YamlError::Parse(invalid_yaml()))?;
     if text.lines().any(|line| {
         let t = line.trim_start();

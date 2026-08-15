@@ -103,6 +103,8 @@ struct Args {
     suppress_dcutr_result: bool,
     #[arg(long, default_value_t = false)]
     recover_after_failure: bool,
+    #[arg(long)]
+    finite_auth_check: bool,
 }
 
 struct WorkerResult {
@@ -438,7 +440,7 @@ async fn main() -> io::Result<()> {
                             swarm.behaviour_mut().auth.send_request(&peer, AuthRequest::Ping { request_id: ping_id, session_id, nonce });
                         }
                     }
-                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { response: AuthResponse::Pong { request_id, nonce, .. }, .. }, .. })) if credential.is_some() && request_id == ping_request_id && auth_state.pong(request_id, nonce) == AuthAction::Ready => { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?; return Ok(()); }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { response: AuthResponse::Pong { request_id, nonce, .. }, .. }, .. })) if credential.is_some() && request_id == ping_request_id && auth_state.pong(request_id, nonce) == AuthAction::Ready => { if args.finite_auth_check { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?; return Ok(()); } emitter.emit(&LifecycleRecord::OperationalError { code: "auth.ready", message: "authenticated readiness established" })?; }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { response: AuthResponse::Rejected { request_id, error }, .. }, .. })) if credential.is_some() && auth_state.rejected(request_id, error.code, unix_now()) != AuthAction::Ignore => {
                         if matches!(auth_state.phase(), p2x_net::auth_state::AuthPhase::Terminal(_)) {
                             emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", error.code.as_str()))?;

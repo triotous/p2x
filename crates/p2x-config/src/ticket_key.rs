@@ -8,6 +8,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum TicketKeyError {
+    #[error("ticket signing key must differ from transport key")]
+    KeySeparation,
     #[error("ticket key file failed")]
     File(#[from] SecretFileError),
     #[error("ticket key is invalid")]
@@ -33,6 +35,13 @@ impl std::fmt::Debug for TicketKey {
     }
 }
 impl TicketKey {
+    pub fn ensure_separate_from(&self, transport_public_key: &[u8]) -> Result<(), TicketKeyError> {
+        if self.public().as_bytes() == transport_public_key {
+            return Err(TicketKeyError::KeySeparation);
+        }
+        Ok(())
+    }
+
     pub fn load(path: &Path) -> Result<Self, TicketKeyError> {
         let b = read_secret_file(path)?;
         if b.first() != Some(&1) || b.len() != 33 {
@@ -192,6 +201,12 @@ mod tests {
         assert!(ring.get(key.key_id(), 9).is_none());
         assert!(ring.get(key.key_id(), 10).is_some());
         assert!(ring.get(key.key_id(), 20).is_none());
+    }
+    #[test]
+    fn key_separation_is_enforced() {
+        let key = TicketKey::from_seed([9; 32]);
+        assert!(key.ensure_separate_from(key.public().as_bytes()).is_err());
+        assert!(key.ensure_separate_from(&[0; 32]).is_ok());
     }
     #[test]
     fn key_id_is_stable_and_debug_redacts() {

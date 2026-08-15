@@ -188,8 +188,21 @@ impl AuthState {
         }
         self.timeout(now)
     }
-    pub fn disconnected(&mut self) {
+    pub fn disconnected(&mut self) -> AuthAction {
+        if matches!(
+            self.phase,
+            AuthPhase::Authenticated { .. }
+                | AuthPhase::Authenticating { .. }
+                | AuthPhase::AwaitingPong { .. }
+        ) {
+            self.phase = AuthPhase::Disconnected;
+            return AuthAction::Retry;
+        }
         self.phase = AuthPhase::Disconnected;
+        AuthAction::Ignore
+    }
+    pub fn ready(&self) -> bool {
+        matches!(self.phase, AuthPhase::Authenticated { .. })
     }
     fn enter_backoff(&mut self, now: i64) {
         self.attempts = self.attempts.saturating_add(1);
@@ -254,7 +267,7 @@ mod tests {
             AuthAction::Terminal(PublicErrorCode::AuthInvalidCredential)
         );
         assert_eq!(state.connected([4; 16], 2), AuthAction::Ignore);
-        state.disconnected();
+        assert_eq!(state.disconnected(), AuthAction::Ignore);
         state.connected(AUTH, 3);
         assert_eq!(
             state.transport_failure(PublicErrorCode::ProtocolCapabilityMismatch, 3),
