@@ -42,8 +42,17 @@ impl AdmissionLedger {
         Admission::Accepted
     }
     pub fn admit_peer_connection(&mut self, peer: &str) -> Admission {
+        self.admit_peer_connection_from(peer, "<unknown>")
+    }
+    pub fn admit_peer_connection_from(&mut self, peer: &str, ip: &str) -> Admission {
         if self.peer_connections.get(peer).copied().unwrap_or(0) >= 2 {
             self.connections = self.connections.saturating_sub(1);
+            if let Some(n) = self.ip_connections.get_mut(ip) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    self.ip_connections.remove(ip);
+                }
+            }
             return Admission::Rejected(PublicErrorCode::LimitAuthConnections);
         }
         *self.peer_connections.entry(peer.to_owned()).or_default() += 1;
@@ -149,10 +158,11 @@ mod tests {
         }
         assert_eq!(peers.admit_connection_from("ip3"), Admission::Accepted);
         assert_eq!(
-            peers.admit_peer_connection("p"),
+            peers.admit_peer_connection_from("p", "ip3"),
             Admission::Rejected(PublicErrorCode::LimitAuthConnections)
         );
         assert_eq!(peers.connections(), 2);
+        assert_eq!(peers.ip_connections("ip3"), 0);
         assert_eq!(a.begin_auth("p", 0), Admission::Accepted);
         assert_eq!(
             a.begin_auth("p", 0),
@@ -168,5 +178,12 @@ mod tests {
             Admission::Rejected(PublicErrorCode::LimitAuthRequests)
         );
         assert_eq!(a.begin_auth("p", FAILURE_WINDOW), Admission::Accepted);
+        let mut bounded = AdmissionLedger::default();
+        for n in 0..MAX_FAILURE_BUCKETS {
+            bounded.finish_auth(&format!("peer{n}"), true, 0);
+        }
+        assert_eq!(bounded.failures.len(), MAX_FAILURE_BUCKETS);
+        bounded.finish_auth("overflow", true, 0);
+        assert_eq!(bounded.failures.len(), MAX_FAILURE_BUCKETS);
     }
 }
