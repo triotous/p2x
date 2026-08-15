@@ -139,17 +139,12 @@ async fn main() -> io::Result<()> {
             "product mode requires --credential-env",
         ));
     }
-    let credential = args
-        .credential_env
-        .as_deref()
-        .map(|env_name| {
-            p2x_config::credential::CredentialRef {
+    let credential_ref =
+        args.credential_env
+            .as_deref()
+            .map(|env_name| p2x_config::credential::CredentialRef {
                 env_name: env_name.to_owned(),
-            }
-            .read()
-            .map_err(io::Error::other)
-        })
-        .transpose()?;
+            });
     let config = PeerSwarmConfig {
         tcp_listen: args.tcp_listen,
         quic_listen: args.quic_listen,
@@ -161,6 +156,7 @@ async fn main() -> io::Result<()> {
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
     start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
+    let mut credential: Option<(p2x_protocol::CredentialId, p2x_protocol::TokenSecret)> = None;
     let mut relay_peer_id = exchange_trust.as_ref().map(|trust| trust.peer_id);
     let mut relay_connection_id = None;
     let mut circuit_listener_id = None;
@@ -277,11 +273,16 @@ async fn main() -> io::Result<()> {
                         connection_paths.insert(connection_id, path);
                         let peer = peer_id.to_string();
                         emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Established, path: Some(path), reason: None })?;
-                        if relay_peer_id == Some(peer_id) && let Some((id, token)) = credential.as_ref()
-                            && let AuthAction::Authenticate { request_id } = auth_state.connected(auth_request_id, unix_now())
-                        {
+                        if relay_peer_id == Some(peer_id) {
+                            if credential.is_none() {
+                                credential = credential_ref.as_ref().map(|reference| reference.read().map_err(io::Error::other)).transpose()?;
+                            }
+                            if let Some((id, token)) = credential.as_ref()
+                                && let AuthAction::Authenticate { request_id } = auth_state.connected(auth_request_id, unix_now())
+                            {
                             auth_request_id = request_id;
-                            swarm.behaviour_mut().auth.send_request(&peer_id, AuthRequest::Authenticate { request_id, credential_id: id.clone(), token_secret: p2x_protocol::TokenSecret::from_bytes(*token.as_bytes()), requested_role: Role::Server, supported_features: 0 });
+                                swarm.behaviour_mut().auth.send_request(&peer_id, AuthRequest::Authenticate { request_id, credential_id: id.clone(), token_secret: p2x_protocol::TokenSecret::from_bytes(*token.as_bytes()), requested_role: Role::Server, supported_features: 0 });
+                            }
                         }
                         if config.mode == RuntimeMode::ConnectivityLab
                             && relay_peer_id == Some(peer_id)

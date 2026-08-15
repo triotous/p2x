@@ -26,6 +26,13 @@ struct ConnectionRecord {
     peer: String,
     ip: String,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RequestRecord {
+    connection_id: ConnectionId,
+    peer: String,
+    ip: String,
+    failed: bool,
+}
 #[derive(Default)]
 pub struct AdmissionLedger {
     connections: HashMap<ConnectionId, ConnectionRecord>,
@@ -34,6 +41,7 @@ pub struct AdmissionLedger {
     inflight: usize,
     peer_inflight: HashMap<String, usize>,
     failures: HashMap<String, FailureBucket>,
+    requests: HashMap<String, RequestRecord>,
 }
 impl AdmissionLedger {
     pub fn admit_connection(
@@ -62,15 +70,17 @@ impl AdmissionLedger {
         *self.peer_connections.entry(peer.to_owned()).or_default() += 1;
         Admission::Accepted
     }
-    pub fn close_connection(&mut self, connection_id: ConnectionId) {
-        let Some(record) = self.connections.remove(&connection_id) else {
-            return;
-        };
-        decrement(&mut self.ip_connections, &record.ip);
-        decrement(&mut self.peer_connections, &record.peer);
-    }
-    pub fn begin_auth(&mut self, connection_id: ConnectionId, now: i64) -> Admission {
+    pub fn begin_auth(
+        &mut self,
+        request_id: impl ToString,
+        connection_id: ConnectionId,
+        now: i64,
+    ) -> Admission {
         self.sweep(now);
+        let request_id = request_id.to_string();
+        if self.requests.contains_key(&request_id) {
+            return Admission::Rejected(PublicErrorCode::LimitAuthRequests);
+        }
         let Some(record) = self.connections.get(&connection_id).cloned() else {
             return Admission::Rejected(PublicErrorCode::LimitAuthConnections);
         };
@@ -95,16 +105,60 @@ impl AdmissionLedger {
             }
         }
         self.inflight += 1;
-        *self.peer_inflight.entry(record.peer).or_default() += 1;
+        *self.peer_inflight.entry(record.peer.clone()).or_default() += 1;
+        self.requests.insert(
+            request_id,
+            RequestRecord {
+                connection_id,
+                peer: record.peer,
+                ip: record.ip,
+                failed: false,
+            },
+        );
         Admission::Accepted
     }
-    pub fn finish_auth(&mut self, connection_id: ConnectionId, failed: bool, now: i64) {
-        let Some(record) = self.connections.get(&connection_id).cloned() else {
+    pub fn mark_response(&mut self, request_id: impl ToString, failed: bool) {
+        let request_id = request_id.to_string();
+        if let Some(record) = self.requests.get_mut(&request_id) {
+            record.failed = failed;
+        }
+    }
+    pub fn response_delivered(&mut self, request_id: impl ToString, now: i64) {
+        let request_id = request_id.to_string();
+        let Some(record) = self.requests.remove(&request_id) else {
             return;
         };
+        self.release_request(&record, now);
+    }
+    pub fn close_connection(&mut self, connection_id: ConnectionId) {
+        let request_ids = self
+            .requests
+            .iter()
+            .filter(|(_, record)| record.connection_id == connection_id)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for request_id in request_ids {
+            self.response_delivered(request_id, 0);
+        }
+        let Some(record) = self.connections.remove(&connection_id) else {
+            return;
+        };
+        decrement(&mut self.ip_connections, &record.ip);
+        decrement(&mut self.peer_connections, &record.peer);
+    }
+    pub fn shutdown(&mut self, now: i64) {
+        let requests = self.requests.keys().cloned().collect::<Vec<_>>();
+        for request_id in requests {
+            self.response_delivered(request_id, now);
+        }
+        self.connections.clear();
+        self.peer_connections.clear();
+        self.ip_connections.clear();
+    }
+    fn release_request(&mut self, record: &RequestRecord, now: i64) {
         self.inflight = self.inflight.saturating_sub(1);
         decrement(&mut self.peer_inflight, &record.peer);
-        if failed {
+        if record.failed {
             for key in [
                 Self::peer_failure_key(&record.peer),
                 Self::ip_failure_key(&record.ip),
@@ -185,12 +239,29 @@ mod tests {
         let mut ledger = AdmissionLedger::default();
         let id = ConnectionId::new_unchecked(7);
         assert_eq!(
-            ledger.begin_auth(id, 0),
+            ledger.begin_auth("1", id, 0),
             Admission::Rejected(PublicErrorCode::LimitAuthConnections)
         );
         ledger.admit_connection(id, "peer", "ip");
-        assert_eq!(ledger.begin_auth(id, 0), Admission::Accepted);
-        ledger.finish_auth(id, true, 0);
+        assert_eq!(ledger.begin_auth("2", id, 0), Admission::Accepted);
+        ledger.mark_response("2", true);
+        ledger.response_delivered("2", 0);
         assert_eq!(ledger.inflight(), 0);
+    }
+    #[test]
+    fn response_delivery_and_close_release_each_request_once() {
+        let mut ledger = AdmissionLedger::default();
+        let connection = ConnectionId::new_unchecked(8);
+        ledger.admit_connection(connection, "peer", "ip");
+        let request = 3;
+        assert_eq!(
+            ledger.begin_auth(request, connection, 0),
+            Admission::Accepted
+        );
+        ledger.mark_response(request, true);
+        ledger.close_connection(connection);
+        ledger.response_delivered(request, 0);
+        assert_eq!(ledger.inflight(), 0);
+        assert_eq!(ledger.connections(), 0);
     }
 }
