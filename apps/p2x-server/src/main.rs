@@ -29,6 +29,7 @@ async fn main() -> io::Result<()> {
     swarm.listen_on(args.tcp_listen).map_err(io::Error::other)?;
     let mut relay_peer_id = None;
     let mut pending_circuit = None;
+    let mut reservation_requested = false;
     if let Some(exchange) = args.exchange {
         let relay_peer = exchange
             .iter()
@@ -72,9 +73,11 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
                         emitter.event("connection_established", Some(&format!("peer_id={peer_id} connection_id={connection_id:?}")))?;
                         if relay_peer_id == Some(peer_id)
+                            && !reservation_requested
                             && let Some(address) = pending_circuit.clone()
                         {
                             swarm.listen_on(address).map_err(io::Error::other)?;
+                            reservation_requested = true;
                             emitter.event("reservation_requested", Some(&peer_id.to_string()))?;
                         }
                     }
