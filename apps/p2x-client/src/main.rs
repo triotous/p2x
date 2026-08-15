@@ -58,6 +58,8 @@ struct Args {
     #[arg(long)]
     exchange: Option<Multiaddr>,
     #[arg(long)]
+    exchange_peer_id: Option<String>,
+    #[arg(long)]
     credential_env: Option<String>,
     #[arg(long)]
     server: Option<Multiaddr>,
@@ -193,6 +195,38 @@ async fn main() -> io::Result<()> {
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
     start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
     let server_address = args.server.clone();
+    if credential.is_some() {
+        let exchange = args.exchange.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "credential mode requires --exchange",
+            )
+        })?;
+        let configured = args.exchange_peer_id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "credential mode requires --exchange-peer-id",
+            )
+        })?;
+        let address_peer = exchange
+            .iter()
+            .find_map(|part| match part {
+                libp2p::multiaddr::Protocol::P2p(peer) => Some(peer.to_string()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "exchange address needs /p2p/<peer>",
+                )
+            })?;
+        if address_peer != configured {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "exchange pin does not match address",
+            ));
+        }
+    }
     let target_peer = args.server.as_ref().and_then(|address| {
         address.iter().fold(None, |last, part| match part {
             libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
@@ -204,12 +238,15 @@ async fn main() -> io::Result<()> {
         peer_id: &local_peer,
     })?;
     let expected_exchange = args
-        .exchange
-        .as_ref()
-        .and_then(|address| {
-            address.iter().find_map(|part| match part {
-                libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
-                _ => None,
+        .exchange_peer_id
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+        .or_else(|| {
+            args.exchange.as_ref().and_then(|address| {
+                address.iter().find_map(|part| match part {
+                    libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
+                    _ => None,
+                })
             })
         })
         .or_else(|| {

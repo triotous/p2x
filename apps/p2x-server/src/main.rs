@@ -38,6 +38,8 @@ struct Args {
     #[arg(long)]
     exchange: Option<Multiaddr>,
     #[arg(long)]
+    exchange_peer_id: Option<String>,
+    #[arg(long)]
     credential_env: Option<String>,
     #[arg(long)]
     artifact: Option<PathBuf>,
@@ -87,13 +89,48 @@ async fn main() -> io::Result<()> {
             .map_err(io::Error::other)
         })
         .transpose()?;
+    if credential.is_some() {
+        let exchange = args.exchange.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "credential mode requires --exchange",
+            )
+        })?;
+        let configured = args.exchange_peer_id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "credential mode requires --exchange-peer-id",
+            )
+        })?;
+        let address_peer = exchange
+            .iter()
+            .find_map(|part| match part {
+                Protocol::P2p(peer) => Some(peer.to_string()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "exchange address needs /p2p/<peer>",
+                )
+            })?;
+        if address_peer != configured {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "exchange pin does not match address",
+            ));
+        }
+    }
     let config = PeerSwarmConfig {
         tcp_listen: args.tcp_listen,
         quic_listen: args.quic_listen,
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
     start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
-    let mut relay_peer_id = None;
+    let mut relay_peer_id = args
+        .exchange_peer_id
+        .as_deref()
+        .and_then(|v| v.parse().ok());
     let mut relay_connection_id = None;
     let mut circuit_listener_id = None;
     let mut reservation = ReservationContext::new(0);
