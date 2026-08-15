@@ -5,7 +5,7 @@ pub mod frame;
 pub mod ids;
 pub mod ticket;
 
-pub use auth::{AuthRequest, AuthResponse, Role, Scope};
+pub use auth::{AuthRequest, AuthResponse, KNOWN_AUTH_FEATURES_V1, Role, Scope};
 pub use credential::{TokenDigest, TokenSecret};
 pub use error::{PublicError, PublicErrorCode};
-pub use ids::{CredentialId, QuotaProfile, Tenant};
+pub use ids::{CorrelationIdExhausted, CorrelationIdGenerator, CredentialId, QuotaProfile, Tenant};

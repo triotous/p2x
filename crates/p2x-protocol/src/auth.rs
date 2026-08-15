@@ -1,8 +1,11 @@
+use crate::credential::TokenSecret;
 use crate::{
     error::PublicError,
     ids::{CredentialId, QuotaProfile, Tenant},
 };
 use serde::{Deserialize, Serialize};
+
+pub const KNOWN_AUTH_FEATURES_V1: u64 = 0;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Role {
     Client,
@@ -23,12 +26,11 @@ impl Scope {
         }
     }
 }
-#[derive(Deserialize, Serialize)]
 pub enum AuthRequest {
     Authenticate {
         request_id: [u8; 16],
         credential_id: CredentialId,
-        token_secret: [u8; 32],
+        token_secret: TokenSecret,
         requested_role: Role,
         supported_features: u64,
     },

@@ -80,7 +80,7 @@ async fn run_auth_round_trip(quic: bool) {
                         peer.behaviour_mut().auth.send_request(&exchange_peer, AuthRequest::Authenticate {
                             request_id: authenticate_id,
                             credential_id: p2x_protocol::CredentialId::new("test").unwrap(),
-                            token_secret: [7; 32],
+                            token_secret: p2x_protocol::TokenSecret::from_bytes([7; 32]),
                             requested_role: Role::Client,
                             supported_features: 0,
                         });

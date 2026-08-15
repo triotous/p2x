@@ -1,5 +1,36 @@
 use std::fmt;
 use thiserror::Error;
+
+#[derive(Debug, Error, Eq, PartialEq)]
+#[error("request correlation ID exhausted")]
+pub struct CorrelationIdExhausted;
+
+#[derive(Clone, Debug)]
+pub struct CorrelationIdGenerator {
+    next: u128,
+    exhausted: bool,
+}
+impl CorrelationIdGenerator {
+    pub const fn new(start: u128) -> Self {
+        Self {
+            next: start,
+            exhausted: false,
+        }
+    }
+
+    pub fn allocate(&mut self) -> Result<[u8; 16], CorrelationIdExhausted> {
+        if self.exhausted {
+            return Err(CorrelationIdExhausted);
+        }
+        let value = self.next;
+        if value == u128::MAX {
+            self.exhausted = true;
+        } else {
+            self.next += 1;
+        }
+        Ok(value.to_be_bytes())
+    }
+}
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum IdError {
     #[error("invalid identifier")]
@@ -43,3 +74,16 @@ macro_rules! id {
 id!(CredentialId, 64);
 id!(Tenant, 64);
 id!(QuotaProfile, 64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn correlation_ids_are_checked_big_endian_and_fail_closed() {
+        let mut generator = CorrelationIdGenerator::new(u128::MAX - 1);
+        assert_eq!(generator.allocate().unwrap(), (u128::MAX - 1).to_be_bytes());
+        assert_eq!(generator.allocate().unwrap(), u128::MAX.to_be_bytes());
+        assert_eq!(generator.allocate(), Err(CorrelationIdExhausted));
+    }
+}

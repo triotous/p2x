@@ -4,10 +4,10 @@ use crate::{
 };
 use p2x_protocol::{AuthRequest, AuthResponse, PublicError, PublicErrorCode};
 
-fn random_session_id() -> [u8; 16] {
+fn random_session_id() -> Result<[u8; 16], PublicErrorCode> {
     let mut id = [0; 16];
-    getrandom::fill(&mut id).expect("OS randomness unavailable");
-    id
+    getrandom::fill(&mut id).map_err(|_| PublicErrorCode::ExchangeOverloaded)?;
+    Ok(id)
 }
 
 pub fn handle_request(
@@ -25,36 +25,37 @@ pub fn handle_request(
             requested_role,
             ..
         } => {
-            let result = provider.authenticate(
-                peer_id,
-                &credential_id,
-                &p2x_protocol::TokenSecret::from_bytes(token_secret),
-                requested_role,
-                now,
-            );
+            let result =
+                provider.authenticate(peer_id, &credential_id, &token_secret, requested_role, now);
             match result {
-                Ok(principal) => match sessions.authenticate(principal, random_session_id(), now) {
-                    SessionAction::Authenticated(session) => AuthResponse::Authenticated {
-                        request_id,
-                        session_id: session.session_id,
-                        tenant: session.principal.tenant,
-                        role: session.principal.role,
-                        scopes: session.principal.scopes,
-                        quota_profile: session.principal.quota_profile,
-                        authorization_revision: session.principal.authorization_revision,
-                        expires_at: session.expires_at,
-                        exchange_features: 0,
-                    },
-                    SessionAction::Rejected(code) => AuthResponse::Rejected {
-                        request_id: Some(request_id),
-                        error: PublicError::new(code, true),
-                    },
-                    SessionAction::Removed(_) | SessionAction::PrincipalRevoked(_) => {
-                        AuthResponse::Rejected {
+                Ok(principal) => match random_session_id() {
+                    Ok(session_id) => match sessions.authenticate(principal, session_id, now) {
+                        SessionAction::Authenticated(session) => AuthResponse::Authenticated {
+                            request_id,
+                            session_id: session.session_id,
+                            tenant: session.principal.tenant,
+                            role: session.principal.role,
+                            scopes: session.principal.scopes,
+                            quota_profile: session.principal.quota_profile,
+                            authorization_revision: session.principal.authorization_revision,
+                            expires_at: session.expires_at,
+                            exchange_features: 0,
+                        },
+                        SessionAction::Rejected(code) => AuthResponse::Rejected {
                             request_id: Some(request_id),
-                            error: PublicError::new(PublicErrorCode::ExchangeOverloaded, true),
+                            error: PublicError::new(code, true),
+                        },
+                        SessionAction::Removed(_) | SessionAction::PrincipalRevoked(_) => {
+                            AuthResponse::Rejected {
+                                request_id: Some(request_id),
+                                error: PublicError::new(PublicErrorCode::ExchangeOverloaded, true),
+                            }
                         }
-                    }
+                    },
+                    Err(_) => AuthResponse::Rejected {
+                        request_id: Some(request_id),
+                        error: PublicError::new(PublicErrorCode::ExchangeOverloaded, true),
+                    },
                 },
                 Err(crate::authn::AuthFailure::ForbiddenRole) => AuthResponse::Rejected {
                     request_id: Some(request_id),
@@ -121,7 +122,7 @@ mod tests {
             AuthRequest::Authenticate {
                 request_id: [1; 16],
                 credential_id: id,
-                token_secret: *token.as_bytes(),
+                token_secret: p2x_protocol::TokenSecret::from_bytes(*token.as_bytes()),
                 requested_role: Role::Client,
                 supported_features: 0,
             },

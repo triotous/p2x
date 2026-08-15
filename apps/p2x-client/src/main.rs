@@ -40,11 +40,6 @@ fn forced_path_matches(path: Path, observed_path: ProbePath) -> bool {
     )
 }
 
-fn random_request_id() -> [u8; 16] {
-    let mut id = [0; 16];
-    getrandom::fill(&mut id).expect("OS randomness unavailable");
-    id
-}
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -316,8 +311,9 @@ async fn main() -> io::Result<()> {
     let mut churn_redial_pending = false;
     let mut forced_opened_connections = HashSet::new();
     let mut attempt: Option<PathAttempt> = None;
-    let mut auth_request_id = random_request_id();
-    let mut ping_request_id = random_request_id();
+    let mut request_ids = p2x_protocol::CorrelationIdGenerator::new(1);
+    let mut auth_request_id = request_ids.allocate().map_err(io::Error::other)?;
+    let mut ping_request_id = request_ids.allocate().map_err(io::Error::other)?;
     let mut auth_state = AuthState::new();
     let mut maintenance = tokio::time::interval(std::time::Duration::from_millis(100));
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerResult>(128);
@@ -332,10 +328,10 @@ async fn main() -> io::Result<()> {
                     drive_path_actions(probe_mut(&mut swarm)?, attempt, peer_id, &emitter, actions, &mut launched)?;
                 }
                 if let Some((id, token)) = credential.as_ref()
-                    && let AuthAction::Authenticate { request_id } = auth_state.tick(random_request_id(), unix_now())
+                    && let AuthAction::Authenticate { request_id } = auth_state.tick(request_ids.allocate().map_err(io::Error::other)?, unix_now())
                 {
                     auth_request_id = request_id;
-                    swarm.behaviour_mut().auth.send_request(&expected_exchange, AuthRequest::Authenticate { request_id, credential_id: id.clone(), token_secret: *token.as_bytes(), requested_role: Role::Client, supported_features: 0 });
+                    swarm.behaviour_mut().auth.send_request(&expected_exchange, AuthRequest::Authenticate { request_id, credential_id: id.clone(), token_secret: p2x_protocol::TokenSecret::from_bytes(*token.as_bytes()), requested_role: Role::Client, supported_features: 0 });
                 }
                 emitter.emit(&LifecycleRecord::Resources { connections: connections.len(), pending_opens: swarm.behaviour().probe_stream.as_ref().map_or(0, |probe| probe.pending_count()), workers: 0, tasks: 0 })?;
             }
@@ -409,7 +405,7 @@ async fn main() -> io::Result<()> {
                             && let AuthAction::Authenticate { request_id } = auth_state.connected(auth_request_id, unix_now())
                         {
                             auth_request_id = request_id;
-                            swarm.behaviour_mut().auth.send_request(&peer_id, AuthRequest::Authenticate { request_id, credential_id: id.clone(), token_secret: *token.as_bytes(), requested_role: Role::Client, supported_features: 0 });
+                            swarm.behaviour_mut().auth.send_request(&peer_id, AuthRequest::Authenticate { request_id, credential_id: id.clone(), token_secret: p2x_protocol::TokenSecret::from_bytes(*token.as_bytes()), requested_role: Role::Client, supported_features: 0 });
                         }
                         if target_peer == Some(peer_id) {
                             if let Err(error) = connections.on_connection_established(peer_id, connection_id, &endpoint, std::time::Instant::now()) {
@@ -437,7 +433,7 @@ async fn main() -> io::Result<()> {
                         }
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { response: AuthResponse::Authenticated { session_id, request_id, .. }, .. }, .. })) => {
-                        if let AuthAction::Ping { request_id: ping_id, session_id, nonce } = auth_state.authenticated(request_id, session_id, { ping_request_id = random_request_id(); ping_request_id }, 1, unix_now()) {
+                        if let AuthAction::Ping { request_id: ping_id, session_id, nonce } = auth_state.authenticated(request_id, session_id, { ping_request_id = request_ids.allocate().map_err(io::Error::other)?; ping_request_id }, 1, unix_now()) {
                             ping_request_id = ping_id;
                             swarm.behaviour_mut().auth.send_request(&peer, AuthRequest::Ping { request_id: ping_id, session_id, nonce });
                         }
