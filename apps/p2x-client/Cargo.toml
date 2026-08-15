@@ -9,6 +9,7 @@ p2x-config = { path = "../../crates/p2x-config" }
 p2x-protocol = { path = "../../crates/p2x-protocol" }
 clap.workspace = true
 futures.workspace = true
+getrandom.workspace = true
 libp2p.workspace = true
 p2x-net = { path = "../../crates/p2x-net" }
 serde_json.workspace = true

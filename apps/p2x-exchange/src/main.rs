@@ -36,6 +36,8 @@ struct Args {
     #[arg(long)]
     identity_seed: Option<u64>,
     #[arg(long)]
+    unsafe_connectivity_lab: bool,
+    #[arg(long)]
     identity_file: Option<PathBuf>,
     #[arg(long)]
     generate_identity: bool,
@@ -97,8 +99,13 @@ async fn main() -> io::Result<()> {
             io::ErrorKind::InvalidInput,
             "authenticated exchange requires --identity-file",
         ));
-    } else {
+    } else if args.unsafe_connectivity_lab {
         lab_identity(args.identity_seed).map_err(io::Error::other)?
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "product mode requires --identity-file",
+        ));
     };
     let mut sessions = AuthSessionLedger::default();
     let mut admission = AdmissionLedger::default();

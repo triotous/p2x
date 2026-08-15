@@ -36,7 +36,7 @@ start_services() {
     if declare -F cleanup_topology >/dev/null 2>&1; then cleanup_topology; fi
   }
   trap cleanup TERM INT EXIT
-  local exchange_args=(--identity-seed 1 --tcp-listen "$exchange_tcp_listen" --quic-listen "$exchange_quic_listen")
+  local exchange_args=(--unsafe-connectivity-lab --identity-seed 1 --tcp-listen "$exchange_tcp_listen" --quic-listen "$exchange_quic_listen")
   [[ "$exchange_tcp_listen" == *"/127.0.0.1/"* ]] || exchange_args+=(--unsafe-lab-public-relay)
   [[ "$case_id" == C09 ]] && exchange_args+=(--relay-profile limit-test)
   P2X_RUN_ID="$RUN_ID" "${EXCHANGE_CMD[@]}" "${exchange_args[@]}" >"$OUT/exchange.ndjson" 2>&1 &
@@ -51,7 +51,7 @@ start_services() {
     sleep 0.1
   done
   [[ -n "${exchange_addr:-}" ]] || { echo 'exchange did not become ready' >&2; return 2; }
-  local server_args=(--identity-seed 2 --exchange "$exchange_addr" --tcp-listen "$server_tcp_listen" --quic-listen "$server_quic_listen")
+  local server_args=(--unsafe-connectivity-lab --identity-seed 2 --exchange "$exchange_addr" --tcp-listen "$server_tcp_listen" --quic-listen "$server_quic_listen")
   [[ "$case_id" == C08 ]] && server_args+=(--drop-first-probe)
   P2X_RUN_ID="$RUN_ID" "${SERVER_CMD[@]}" "${server_args[@]}" >"$OUT/server.ndjson" 2>&1 &
   pids+=("$!")
@@ -62,19 +62,19 @@ start_services() {
   done
   [[ -n "${circuit_addr:-}" ]] || { echo 'server relay circuit did not become ready' >&2; return 2; }
   if [[ "$case_id" == C09 ]]; then
-    P2X_RUN_ID="$RUN_ID" "${SERVER_CMD[@]}" --identity-seed 4 --exchange "$exchange_addr" --tcp-listen "$server_tcp_listen" --quic-listen "$server_quic_listen" >"$OUT/server-second.ndjson" 2>&1 &
+    P2X_RUN_ID="$RUN_ID" "${SERVER_CMD[@]}" --unsafe-connectivity-lab --identity-seed 4 --exchange "$exchange_addr" --tcp-listen "$server_tcp_listen" --quic-listen "$server_quic_listen" >"$OUT/server-second.ndjson" 2>&1 &
     pids+=("$!")
     for _ in $(seq 1 100); do
       grep -q '"event":"listener_ready".*p2p-circuit' "$OUT/server-second.ndjson" && break
       sleep 0.1
     done
     grep -q '"event":"listener_ready".*p2p-circuit' "$OUT/server-second.ndjson" || { echo 'C09 second reservation was not admitted' >&2; return 2; }
-    P2X_RUN_ID="$RUN_ID" "${SERVER_CMD[@]}" --identity-seed 5 --exchange "$exchange_addr" --tcp-listen "$server_tcp_listen" --quic-listen "$server_quic_listen" >"$OUT/server-excess.ndjson" 2>&1 &
+    P2X_RUN_ID="$RUN_ID" "${SERVER_CMD[@]}" --unsafe-connectivity-lab --identity-seed 5 --exchange "$exchange_addr" --tcp-listen "$server_tcp_listen" --quic-listen "$server_quic_listen" >"$OUT/server-excess.ndjson" 2>&1 &
     pids+=("$!")
     sleep 2
     if grep -q '"event":"listener_ready".*p2p-circuit' "$OUT/server-excess.ndjson"; then echo 'C09 excess reservation was incorrectly admitted' >&2; return 2; fi
   fi
-  local client_args=(--identity-seed 3 --server "$circuit_addr")
+  local client_args=(--unsafe-connectivity-lab --identity-seed 3 --server "$circuit_addr")
   case "$case_id" in
     C01) ;;
     C02|C03) client_args+=(--path direct) ;;
@@ -95,7 +95,7 @@ start_services() {
     C05-direct)
       server_peer=$(sed -n 's/.*"event":"started","peer_id":"\([^"]*\)".*/\1/p' "$OUT/server.ndjson" | head -1)
       direct_addr=$(sed -n 's/.*"event":"listener_ready".*"address":"\([^" ]*\/tcp\/[^" ]*\)".*/\1/p' "$OUT/server.ndjson" | head -1)
-      client_args=(--identity-seed 3 --server "$direct_addr/p2p/$server_peer" --path direct)
+      client_args=(--unsafe-connectivity-lab --identity-seed 3 --server "$direct_addr/p2p/$server_peer" --path direct)
       ;;
   esac
   client_args+=(--tcp-listen "$client_tcp_listen" --quic-listen "$client_quic_listen")
@@ -107,7 +107,7 @@ start_services() {
     second_streams=$((P2X_STREAMS - 64))
     [[ "$second_streams" -gt 64 ]] && second_streams=64
     SECOND_CLIENT_LOG="$OUT/client-second.ndjson"
-    P2X_RUN_ID="$RUN_ID" "${CLIENT_CMD[@]}" --identity-seed 6 --server "$circuit_addr" --count "$second_streams" --concurrency "$second_streams" --tcp-listen "$client_tcp_listen" --quic-listen "$client_quic_listen" >"$SECOND_CLIENT_LOG" 2>&1 &
+    P2X_RUN_ID="$RUN_ID" "${CLIENT_CMD[@]}" --unsafe-connectivity-lab --identity-seed 6 --server "$circuit_addr" --count "$second_streams" --concurrency "$second_streams" --tcp-listen "$client_tcp_listen" --quic-listen "$client_quic_listen" >"$SECOND_CLIENT_LOG" 2>&1 &
     pids+=("$!")
   fi
   if [[ "$case_id" == C07 ]]; then
@@ -124,7 +124,7 @@ start_services() {
       sleep 0.01
     done
     grep -q '"event":"path_selected"' "$OUT/client.ndjson" || { echo 'C11 large transfer did not start' >&2; return 2; }
-    P2X_RUN_ID="$RUN_ID" "${CLIENT_CMD[@]}" --identity-seed 6 --server "$circuit_addr" --path "${P2X_PATH:-relay}" --case-id C11-nonce --tcp-listen "$client_tcp_listen" --quic-listen "$client_quic_listen" >"$OUT/nonce-client.ndjson" 2>&1 &
+    P2X_RUN_ID="$RUN_ID" "${CLIENT_CMD[@]}" --unsafe-connectivity-lab --identity-seed 6 --server "$circuit_addr" --path "${P2X_PATH:-relay}" --case-id C11-nonce --tcp-listen "$client_tcp_listen" --quic-listen "$client_quic_listen" >"$OUT/nonce-client.ndjson" 2>&1 &
     pids+=("$!")
     for _ in $(seq 1 500); do
       grep -q '"event":"terminal".*"result":"passed"' "$OUT/nonce-client.ndjson" && break
