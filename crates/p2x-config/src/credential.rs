@@ -50,7 +50,11 @@ impl FixedTokenFile {
         if fs::metadata(path)?.len() > 512 * 1024 {
             return Err(CredentialConfigError::Invalid("file too large"));
         }
-        let file: Self = serde_yaml::from_slice(&fs::read(path)?)?;
+        let file: Self = crate::yaml::load(path).map_err(|error| match error {
+            crate::yaml::YamlError::Io(error) => CredentialConfigError::Io(error),
+            crate::yaml::YamlError::Parse(error) => CredentialConfigError::Yaml(error),
+            crate::yaml::YamlError::TooLarge => CredentialConfigError::Invalid("file too large"),
+        })?;
         file.validate()?;
         Ok(file)
     }
@@ -78,6 +82,22 @@ impl FixedTokenFile {
                 || record.quota_profile.len() > 64
             {
                 return Err(CredentialConfigError::Invalid("credential binding"));
+            }
+            let mut seen_scopes = 0u32;
+            for scope in &record.scopes {
+                let bit = match scope.as_str() {
+                    "register_services" => 1,
+                    "reserve_relay" => 2,
+                    "open_proxy_stream" => 4,
+                    _ => return Err(CredentialConfigError::Invalid("scope")),
+                };
+                if seen_scopes & bit != 0 {
+                    return Err(CredentialConfigError::Invalid("duplicate scope"));
+                }
+                seen_scopes |= bit;
+            }
+            if matches!(record.role, CredentialRole::Client) && seen_scopes & 2 != 0 {
+                return Err(CredentialConfigError::Invalid("role scope"));
             }
             let digest = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(&record.token_sha256)
