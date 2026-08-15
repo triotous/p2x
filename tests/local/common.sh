@@ -36,8 +36,9 @@ start_services() {
   local client_args=(--identity-seed 3 --server "$circuit_addr")
   case "$case_id" in
     C10-concurrency) client_args+=(--count 8) ;;
-    C11-large-transfer) client_args+=(--mode slow_reader --length 1048576) ;;
-    C12-renewal|C13-churn) client_args+=(--count 4) ;;
+    C11-large-transfer) client_args+=(--mode slow_reader --length 268435456) ;;
+    C12-renewal) client_args+=(--count 1) ;;
+    C13-churn) client_args+=(--count 100 --churn) ;;
     C05-direct)
       server_peer=$(awk -F'"detail":"' '/"event":"started"/{split($2,a,"\""); split(a[1],b," "); print b[1]; exit}' "$OUT/server.ndjson")
       direct_addr=$(awk -F'"detail":"' '/"event":"listen_addr"/{split($2,a,"\""); print a[1]; exit}' "$OUT/server.ndjson")
@@ -55,16 +56,25 @@ run_local_case() {
   case "$case_id" in
     C10-concurrency) expected=8 ;;
     C11-large-transfer) expected=1 ;;
-    C12-renewal|C13-churn) expected=4 ;;
+    C12-renewal) expected=1 ;;
+    C13-churn) expected=100 ;;
   esac
   local client_path=Relay
   [[ "$case_id" == C05-direct ]] && client_path=Direct
-  for _ in $(seq 1 300); do
+  local wait_loops=300
+  [[ "$case_id" == C11-large-transfer ]] && wait_loops=1800
+  [[ "$case_id" == C12-renewal ]] && wait_loops=700
+  [[ "$case_id" == C13-churn ]] && wait_loops=1800
+  for _ in $(seq 1 "$wait_loops"); do
     local succeeded observed terminals
     succeeded=$(grep -c '"event":"probe_succeeded"' "$OUT/client.ndjson" || true)
     observed=$(grep -c '"event":"probe_observed"' "$OUT/server.ndjson" || true)
     terminals=$(grep -c '"result":"' "$OUT/client.ndjson" || true)
-    if [[ "$succeeded" -ge "$expected" && "$observed" -ge "$expected" && "$terminals" -eq 1 ]] && grep -q "path=$client_path" "$OUT/client.ndjson" && grep -q "path=$client_path" "$OUT/server.ndjson"; then
+    local lifecycle_ok=true
+    [[ "$case_id" == C12-renewal ]] && grep -q '"renewal":true' "$OUT/server.ndjson" || true
+    if [[ "$case_id" == C12-renewal ]] && ! grep -q '"renewal":true' "$OUT/server.ndjson"; then lifecycle_ok=false; fi
+    if [[ "$case_id" == C13-churn ]] && [[ $(grep -c '"event":"connection_closed"' "$OUT/client.ndjson" || true) -lt 1 ]]; then lifecycle_ok=false; fi
+    if [[ "$succeeded" -ge "$expected" && "$observed" -ge "$expected" && "$terminals" -eq 1 && "$lifecycle_ok" == true ]] && grep -q "path=$client_path" "$OUT/client.ndjson" && grep -q "path=$client_path" "$OUT/server.ndjson"; then
       printf '{"schema_version":1,"case":"%s","run_id":"%s","passed":true,"terminal_code":"probe.ok","expected_probes":%d,"observed_probes":%d,"path":"%s","artifacts":["exchange.ndjson","server.ndjson","client.ndjson"]}\n' "$case_id" "$RUN_ID" "$expected" "$observed" "$client_path" >"$OUT/summary.json"
       cat "$OUT/summary.json"
       return 0

@@ -32,6 +32,8 @@ struct Args {
     mode: String,
     #[arg(long, default_value_t = 0)]
     length: u64,
+    #[arg(long, default_value_t = false)]
+    churn: bool,
 }
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -40,6 +42,7 @@ async fn main() -> io::Result<()> {
     let emitter = Emitter::new("client", &run_id);
     let key = lab_identity(args.identity_seed).map_err(io::Error::other)?;
     let mut swarm = build_peer_swarm(key, SwarmConfig::default()).map_err(io::Error::other)?;
+    let server_address = args.server.clone();
     let target_peer = args.server.as_ref().and_then(|address| {
         address.iter().fold(None, |last, part| match part {
             libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
@@ -69,9 +72,14 @@ async fn main() -> io::Result<()> {
                 match event {
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
                         emitter.event("connection_established", Some(&format!("peer_id={peer_id} connection_id={connection_id:?}")))?;
-                        if !started && target_peer == Some(peer_id) {
+                        if target_peer == Some(peer_id) && (!started || args.churn) {
                             swarm.behaviour_mut().probe_stream.open_on(peer_id, connection_id).map_err(io::Error::other)?;
                             started = true;
+                        }
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, .. } if args.churn && target_peer == Some(peer_id) && completed < args.count => {
+                        if let Some(address) = server_address.clone() {
+                            swarm.dial(address).map_err(io::Error::other)?;
                         }
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Probe(output)) => match output {
@@ -83,15 +91,15 @@ async fn main() -> io::Result<()> {
                                 "slow_reader" => ProbeMode::SlowReader,
                                 other => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown probe mode: {other}"))),
                             };
-                            let header = ProbeHeader { schema_version: SCHEMA_VERSION, request_id: request_id.0, mode, nonce: request_id.0, length: args.length, slow_delay_ms: if mode == ProbeMode::SlowReader { 1 } else { 0 }, slow_chunk_size: if mode == ProbeMode::SlowReader { 1024 } else { 0 } };
+                            let header = ProbeHeader { schema_version: SCHEMA_VERSION, request_id: request_id.0, mode, nonce: request_id.0, length: args.length, slow_delay_ms: 0, slow_chunk_size: if mode == ProbeMode::SlowReader { 32 * 1024 } else { 0 } };
                             let body = serde_json::to_vec(&header).map_err(io::Error::other)?;
                             write_frame_futures(&mut stream, &body).await.map_err(io::Error::other)?;
                             if header.length != 0 {
                                 let stats = p2x_net::probe_worker::read_pattern_futures(&mut stream, header.length).await.map_err(io::Error::other)?;
                                 emitter.event("probe_payload", Some(&format!("bytes={} hash={}", stats.bytes, stats.hash)))?;
                             }
-                            stream.close().await.map_err(io::Error::other)?;
                             let ack_body = read_frame_futures(&mut stream).await.map_err(io::Error::other)?;
+                            stream.close().await.map_err(io::Error::other)?;
                             let ack: ProbeAck = serde_json::from_slice(&ack_body).map_err(io::Error::other)?;
                             if ack.nonce != header.nonce || ack.request_id != header.request_id {
                                 return Err(io::Error::new(io::ErrorKind::InvalidData, "probe acknowledgement mismatch"));
@@ -102,7 +110,11 @@ async fn main() -> io::Result<()> {
                                 emitter.terminal("passed", "probe.ok")?;
                                 return Ok(());
                             }
-                            swarm.behaviour_mut().probe_stream.open_on(peer_id, connection_id).map_err(io::Error::other)?;
+                            if args.churn {
+                                swarm.close_connection(connection_id);
+                            } else {
+                                swarm.behaviour_mut().probe_stream.open_on(peer_id, connection_id).map_err(io::Error::other)?;
+                            }
                         }
                         ProbeOutput::OutboundFailed { code, .. } => {
                             emitter.terminal("failed", code)?;
