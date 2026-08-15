@@ -5,8 +5,12 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
+p2x-protocol = { path = "../p2x-protocol" }
 libc.workspace = true
 libp2p-identity = { workspace = true, features = ["peerid", "rand"] }
+serde = { workspace = true, features = ["derive"] }
+serde_yaml.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
