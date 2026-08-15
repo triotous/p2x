@@ -27,6 +27,8 @@ async fn main() -> io::Result<()> {
     let key = lab_identity(args.identity_seed).map_err(io::Error::other)?;
     let mut swarm = build_peer_swarm(key, SwarmConfig::default()).map_err(io::Error::other)?;
     swarm.listen_on(args.tcp_listen).map_err(io::Error::other)?;
+    let mut relay_peer_id = None;
+    let mut pending_circuit = None;
     if let Some(exchange) = args.exchange {
         let relay_peer = exchange
             .iter()
@@ -42,6 +44,8 @@ async fn main() -> io::Result<()> {
             })?;
         swarm.dial(exchange.clone()).map_err(io::Error::other)?;
         let circuit = exchange.with(Protocol::P2pCircuit);
+        relay_peer_id = Some(relay_peer);
+        pending_circuit = Some(circuit.clone());
         let advertised = circuit.clone().with(Protocol::P2p(*swarm.local_peer_id()));
         emitter.event(
             "relay_dial",
@@ -65,6 +69,12 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
                         emitter.event("connection_established", Some(&format!("peer_id={peer_id} connection_id={connection_id:?}")))?;
+                        if relay_peer_id == Some(peer_id)
+                            && let Some(address) = pending_circuit.take()
+                        {
+                            swarm.listen_on(address).map_err(io::Error::other)?;
+                            emitter.event("reservation_requested", Some(&peer_id.to_string()))?;
+                        }
                     }
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                         emitter.event("connection_error", Some(&format!("peer_id={peer_id:?} error={error}")))?;
