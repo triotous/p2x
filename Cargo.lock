@@ -2078,6 +2078,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "p2x-config"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libp2p-identity",
+ "sha2",
+ "thiserror 2.0.20",
+ "zeroize",
+]
+
+[[package]]
 name = "p2x-exchange"
 version = "0.1.0"
 dependencies = [
