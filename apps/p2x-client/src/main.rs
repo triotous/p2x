@@ -8,7 +8,7 @@ use libp2p::{
 use p2x_net::{
     AttemptId, PathAction, PathAttempt, PathDecision, PathEvent, PathEventKind,
     auth_state::{AuthAction, AuthState},
-    builder::{PeerSwarmConfig, build_peer_swarm, lab_identity, start_peer_listeners},
+    builder::{PeerSwarmConfig, RuntimeMode, build_peer_swarm, lab_identity, start_peer_listeners},
     connection_book::{ConnectionBook, PathKind},
     lifecycle::{ConnectionState, Emitter, LifecycleRecord, TerminalResult, stable_hash},
     probe::{ProbeAck, ProbeHeader, ProbeMode, ProbePath, ProbeTerminal, SCHEMA_VERSION},
@@ -117,6 +117,16 @@ struct WorkerResult {
     result: Result<ProbeAck, p2x_net::probe::ProbeError>,
 }
 
+fn probe_mut(
+    swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
+) -> io::Result<&mut p2x_net::probe_stream::behaviour::ProbeStreamBehaviour> {
+    swarm
+        .behaviour_mut()
+        .probe_stream
+        .as_mut()
+        .ok_or_else(|| io::Error::other("probe is unavailable in product mode"))
+}
+
 fn drive_path_actions(
     behaviour: &mut p2x_net::probe_stream::behaviour::ProbeStreamBehaviour,
     attempt: &mut PathAttempt,
@@ -217,6 +227,11 @@ async fn main() -> io::Result<()> {
     let config = PeerSwarmConfig {
         tcp_listen: args.tcp_listen,
         quic_listen: args.quic_listen,
+        mode: if args.unsafe_connectivity_lab {
+            RuntimeMode::ConnectivityLab
+        } else {
+            RuntimeMode::Product
+        },
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
     start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
@@ -323,7 +338,7 @@ async fn main() -> io::Result<()> {
                 connections.sweep(now);
                 if let (Some(peer_id), Some(attempt)) = (target_peer, attempt.as_mut()) {
                     let actions = attempt.apply(PathEvent { attempt_id: attempt.id, now, kind: PathEventKind::DirectDeadlineElapsed });
-                    drive_path_actions(&mut swarm.behaviour_mut().probe_stream, attempt, peer_id, &emitter, actions, &mut launched)?;
+                    drive_path_actions(probe_mut(&mut swarm)?, attempt, peer_id, &emitter, actions, &mut launched)?;
                 }
                 if let Some((id, token)) = credential.as_ref()
                     && let AuthAction::Authenticate { request_id } = auth_state.tick(random_request_id(), unix_now())
@@ -331,7 +346,7 @@ async fn main() -> io::Result<()> {
                     auth_request_id = request_id;
                     swarm.behaviour_mut().auth.send_request(&expected_exchange, AuthRequest::Authenticate { request_id, credential_id: id.clone(), token_secret: *token.as_bytes(), requested_role: Role::Client, supported_features: 0 });
                 }
-                emitter.emit(&LifecycleRecord::Resources { connections: connections.len(), pending_opens: swarm.behaviour().probe_stream.pending_count(), workers: 0, tasks: 0 })?;
+                emitter.emit(&LifecycleRecord::Resources { connections: connections.len(), pending_opens: swarm.behaviour().probe_stream.as_ref().map_or(0, |probe| probe.pending_count()), workers: 0, tasks: 0 })?;
             }
             Some(worker) = worker_rx.recv() => {
                 let peer = worker.peer_id.to_string();
@@ -368,7 +383,7 @@ async fn main() -> io::Result<()> {
                             started = false;
                             churn_redial_pending = true;
                         } else if launched < args.count && !matches!(args.path, Path::Both) {
-                            let request_id = swarm.behaviour_mut().probe_stream.open_on(worker.peer_id, worker.connection_id).map_err(io::Error::other)?;
+                            let request_id = probe_mut(&mut swarm)?.open_on(worker.peer_id, worker.connection_id).map_err(io::Error::other)?;
                             launched += 1;
                             emitter.emit(&LifecycleRecord::PathSelected { request_id: request_id.0, connection_id_hash: stable_hash(worker.connection_id), selected_path: worker.selected_path })?;
                         }
@@ -417,7 +432,7 @@ async fn main() -> io::Result<()> {
                                 && launched < args.count
                                 && forced_opened_connections.insert(connection_id)
                             {
-                                let request_id = swarm.behaviour_mut().probe_stream.open_on(peer_id, connection_id).map_err(io::Error::other)?;
+                                let request_id = probe_mut(&mut swarm)?.open_on(peer_id, connection_id).map_err(io::Error::other)?;
                                 launched += 1;
                                 emitter.emit(&LifecycleRecord::PathSelected { request_id: request_id.0, connection_id_hash: stable_hash(connection_id), selected_path: observed_path })?;
                                 started = true;
@@ -425,7 +440,7 @@ async fn main() -> io::Result<()> {
                                 let current = attempt.get_or_insert_with(|| PathAttempt::with_id(AttemptId(1), std::time::Instant::now()));
                                 let direct = connections.direct(peer_id).map(|record| record.connection_id);
                                 let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::Begin { relay: Some(connection_id), direct } });
-                                drive_path_actions(&mut swarm.behaviour_mut().probe_stream, current, peer_id, &emitter, actions, &mut launched)?;
+                                drive_path_actions(probe_mut(&mut swarm)?, current, peer_id, &emitter, actions, &mut launched)?;
                                 started = true;
                             }
                         }
@@ -458,7 +473,7 @@ async fn main() -> io::Result<()> {
                         connections.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?;
                         if let Some(current) = attempt.as_mut() {
                             let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ConnectionClosed(connection_id) });
-                            drive_path_actions(&mut swarm.behaviour_mut().probe_stream, current, peer_id, &emitter, actions, &mut launched)?;
+                            drive_path_actions(probe_mut(&mut swarm)?, current, peer_id, &emitter, actions, &mut launched)?;
                         }
                         let peer = peer_id.to_string();
                         let reason = format!("{cause:?}");
@@ -473,9 +488,9 @@ async fn main() -> io::Result<()> {
                             let mut stream = stream;
                             if let Some(current) = attempt.as_mut() {
                                 let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ExactOpenSucceeded { request_id, connection: connection_id } });
-                                drive_path_actions(&mut swarm.behaviour_mut().probe_stream, current, peer_id, &emitter, actions, &mut launched)?;
+                                drive_path_actions(probe_mut(&mut swarm)?, current, peer_id, &emitter, actions, &mut launched)?;
                                 let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::PayloadAccepted });
-                                drive_path_actions(&mut swarm.behaviour_mut().probe_stream, current, peer_id, &emitter, actions, &mut launched)?;
+                                drive_path_actions(probe_mut(&mut swarm)?, current, peer_id, &emitter, actions, &mut launched)?;
                             }
                             let mode = match args.mode.as_str() {
                                 "nonce_echo" => ProbeMode::NonceEcho,
@@ -486,7 +501,7 @@ async fn main() -> io::Result<()> {
                             let header = ProbeHeader { schema_version: SCHEMA_VERSION, request_id: request_id.0, mode, nonce: request_id.0, length: args.length, slow_delay_ms: if mode == ProbeMode::SlowReader { args.slow_delay_ms } else { 0 }, slow_chunk_size: if mode == ProbeMode::SlowReader { args.slow_chunk_size } else { 0 } };
                             let selected_path = connections.get(peer_id, connection_id).map(|record| match record.path { PathKind::Relay { .. } => ProbePath::Relay, _ => ProbePath::Direct }).unwrap_or(ProbePath::Relay);
                             while !matches!(args.path, Path::Both) && launched < args.count && launched < args.concurrency {
-                                let next = swarm.behaviour_mut().probe_stream.open_on(peer_id, connection_id).map_err(io::Error::other)?;
+                                let next = probe_mut(&mut swarm)?.open_on(peer_id, connection_id).map_err(io::Error::other)?;
                                 launched += 1;
                                 emitter.emit(&LifecycleRecord::PathSelected { request_id: next.0, connection_id_hash: stable_hash(connection_id), selected_path })?;
                             }
@@ -500,7 +515,7 @@ async fn main() -> io::Result<()> {
                         ProbeOutput::OutboundFailed { request_id, peer_id, connection_id, code } => {
                             if let Some(current) = attempt.as_mut() {
                                 let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ExactOpenFailed { request_id, connection: connection_id } });
-                                drive_path_actions(&mut swarm.behaviour_mut().probe_stream, current, peer_id, &emitter, actions, &mut launched)?;
+                                drive_path_actions(probe_mut(&mut swarm)?, current, peer_id, &emitter, actions, &mut launched)?;
                             }
                             if args.recover_after_failure && !recovery_attempted {
                                 recovery_attempted = true;
@@ -531,19 +546,19 @@ async fn main() -> io::Result<()> {
                                     && launched < args.count
                                     && forced_opened_connections.insert(connection_id)
                                 {
-                                    let request_id = swarm.behaviour_mut().probe_stream.open_on(event.remote_peer_id, connection_id).map_err(io::Error::other)?;
+                                    let request_id = probe_mut(&mut swarm)?.open_on(event.remote_peer_id, connection_id).map_err(io::Error::other)?;
                                     launched += 1;
                                     emitter.emit(&LifecycleRecord::PathSelected { request_id: request_id.0, connection_id_hash: stable_hash(connection_id), selected_path: ProbePath::Direct })?;
                                     started = true;
                                 } else if let Some(current) = attempt.as_mut() {
                                     let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::DirectReady(connection_id) });
-                                    drive_path_actions(&mut swarm.behaviour_mut().probe_stream, current, event.remote_peer_id, &emitter, actions, &mut launched)?;
+                                    drive_path_actions(probe_mut(&mut swarm)?, current, event.remote_peer_id, &emitter, actions, &mut launched)?;
                                 }
                             }
                             Err(error) => {
                                 if let Some(current) = attempt.as_mut() {
                                     let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::DcutrFailed });
-                                    drive_path_actions(&mut swarm.behaviour_mut().probe_stream, current, event.remote_peer_id, &emitter, actions, &mut launched)?;
+                                    drive_path_actions(probe_mut(&mut swarm)?, current, event.remote_peer_id, &emitter, actions, &mut launched)?;
                                 }
                                 let message = error.to_string(); emitter.emit(&LifecycleRecord::OperationalError { code: "dcutr.failed", message: &message })?;
                             }

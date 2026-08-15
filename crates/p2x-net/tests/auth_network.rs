@@ -19,6 +19,7 @@ async fn run_auth_round_trip(quic: bool) {
     let peer_config = PeerSwarmConfig {
         tcp_listen: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
         quic_listen: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
+        mode: p2x_net::builder::RuntimeMode::Product,
     };
     let mut exchange = build_exchange_swarm(
         libp2p::identity::Keypair::generate_ed25519(),

@@ -19,6 +19,13 @@ pub const PING_INTERVAL_SECONDS: u64 = 15;
 pub const PING_TIMEOUT_SECONDS: u64 = 5;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RuntimeMode {
+    #[default]
+    Product,
+    ConnectivityLab,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RelayProfile {
     #[default]
     DefaultLab,
@@ -89,6 +96,7 @@ pub struct ExchangeSwarmConfig {
     pub quic_listen: Multiaddr,
     pub allow_public: bool,
     pub relay_profile: RelayProfile,
+    pub mode: RuntimeMode,
 }
 
 impl Default for ExchangeSwarmConfig {
@@ -100,6 +108,7 @@ impl Default for ExchangeSwarmConfig {
                 .expect("valid QUIC default"),
             allow_public: false,
             relay_profile: RelayProfile::DefaultLab,
+            mode: RuntimeMode::Product,
         }
     }
 }
@@ -108,6 +117,7 @@ impl Default for ExchangeSwarmConfig {
 pub struct PeerSwarmConfig {
     pub tcp_listen: Multiaddr,
     pub quic_listen: Multiaddr,
+    pub mode: RuntimeMode,
 }
 
 impl Default for PeerSwarmConfig {
@@ -117,7 +127,14 @@ impl Default for PeerSwarmConfig {
             quic_listen: "/ip4/127.0.0.1/udp/0/quic-v1"
                 .parse()
                 .expect("valid QUIC default"),
+            mode: RuntimeMode::Product,
         }
+    }
+}
+
+impl PeerSwarmConfig {
+    pub fn is_connectivity_lab(&self) -> bool {
+        self.mode == RuntimeMode::ConnectivityLab
     }
 }
 
@@ -197,7 +214,7 @@ fn listener_ip(address: &Multiaddr) -> Option<IpAddr> {
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "ExchangeEvent", prelude = "libp2p::swarm::derive_prelude")]
 pub struct ExchangeBehaviour {
-    pub relay: relay::Behaviour,
+    pub relay: libp2p::swarm::behaviour::toggle::Toggle<relay::Behaviour>,
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
     pub auth: libp2p::request_response::Behaviour<AuthCodec>,
@@ -237,11 +254,11 @@ impl From<ping::Event> for ExchangeEvent {
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "PeerEvent", prelude = "libp2p::swarm::derive_prelude")]
 pub struct PeerBehaviour {
-    pub relay_client: relay::client::Behaviour,
-    pub dcutr: dcutr::Behaviour,
+    pub relay_client: libp2p::swarm::behaviour::toggle::Toggle<relay::client::Behaviour>,
+    pub dcutr: libp2p::swarm::behaviour::toggle::Toggle<dcutr::Behaviour>,
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
-    pub probe_stream: ProbeStreamBehaviour,
+    pub probe_stream: libp2p::swarm::behaviour::toggle::Toggle<ProbeStreamBehaviour>,
     pub auth: libp2p::request_response::Behaviour<AuthCodec>,
 }
 #[derive(Debug)]
@@ -314,7 +331,10 @@ pub fn build_exchange_swarm(
         .with_dns()
         .map_err(|e| BuildError::Builder(e.to_string()))?
         .with_behaviour(|_| ExchangeBehaviour {
-            relay: relay::Behaviour::new(peer_id, config.relay_profile.config()),
+            relay: libp2p::swarm::behaviour::toggle::Toggle::from(
+                (config.mode == RuntimeMode::ConnectivityLab)
+                    .then(|| relay::Behaviour::new(peer_id, config.relay_profile.config())),
+            ),
             identify: identify::Behaviour::new(
                 identify::Config::new(IDENTIFY_PROTOCOL.to_owned(), public_key)
                     .with_push_listen_addr_updates(true),
@@ -376,8 +396,13 @@ pub fn build_peer_swarm(
         })
         .map_err(|e| BuildError::Builder(e.to_string()))?
         .with_behaviour(|_, relay_client| PeerBehaviour {
-            relay_client,
-            dcutr: dcutr::Behaviour::new(peer_id),
+            relay_client: libp2p::swarm::behaviour::toggle::Toggle::from(
+                (config.mode == RuntimeMode::ConnectivityLab).then_some(relay_client),
+            ),
+            dcutr: libp2p::swarm::behaviour::toggle::Toggle::from(
+                (config.mode == RuntimeMode::ConnectivityLab)
+                    .then(|| dcutr::Behaviour::new(peer_id)),
+            ),
             identify: identify::Behaviour::new(
                 identify::Config::new(IDENTIFY_PROTOCOL.to_owned(), public_key)
                     .with_push_listen_addr_updates(true),
@@ -387,12 +412,14 @@ pub fn build_peer_swarm(
                     .with_interval(Duration::from_secs(PING_INTERVAL_SECONDS))
                     .with_timeout(Duration::from_secs(PING_TIMEOUT_SECONDS)),
             ),
-            probe_stream: ProbeStreamBehaviour::default(),
+            probe_stream: libp2p::swarm::behaviour::toggle::Toggle::from(
+                (config.mode == RuntimeMode::ConnectivityLab).then(ProbeStreamBehaviour::default),
+            ),
             auth: libp2p::request_response::Behaviour::with_codec(
                 AuthCodec,
                 [(
                     libp2p::StreamProtocol::new(AUTH_PROTOCOL),
-                    libp2p::request_response::ProtocolSupport::Full,
+                    libp2p::request_response::ProtocolSupport::Outbound,
                 )],
                 libp2p::request_response::Config::default()
                     .with_request_timeout(Duration::from_secs(AUTH_REQUEST_TIMEOUT_SECONDS)),
@@ -447,6 +474,45 @@ fn start_listeners<B: NetworkBehaviour>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn product_and_lab_surfaces_are_distinct() {
+        let product = build_exchange_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            &ExchangeSwarmConfig::default(),
+        )
+        .unwrap();
+        assert!(!product.behaviour().relay.is_enabled());
+        let lab = build_exchange_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            &ExchangeSwarmConfig {
+                mode: RuntimeMode::ConnectivityLab,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(lab.behaviour().relay.is_enabled());
+
+        let product = build_peer_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            &PeerSwarmConfig::default(),
+        )
+        .unwrap();
+        assert!(!product.behaviour().probe_stream.is_enabled());
+        assert!(!product.behaviour().relay_client.is_enabled());
+        assert!(!product.behaviour().dcutr.is_enabled());
+        let lab = build_peer_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            &PeerSwarmConfig {
+                mode: RuntimeMode::ConnectivityLab,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(lab.behaviour().probe_stream.is_enabled());
+        assert!(lab.behaviour().relay_client.is_enabled());
+        assert!(lab.behaviour().dcutr.is_enabled());
+    }
+
     #[test]
     fn protocol_surface_is_exact() {
         assert_eq!(MAX_STREAMS, 256);

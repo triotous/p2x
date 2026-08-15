@@ -9,7 +9,10 @@ use libp2p::{
 use p2x_net::{
     ReservationContext, ReservationEvent,
     auth_state::{AuthAction, AuthState},
-    builder::{PeerEvent, PeerSwarmConfig, build_peer_swarm, lab_identity, start_peer_listeners},
+    builder::{
+        PeerEvent, PeerSwarmConfig, RuntimeMode, build_peer_swarm, lab_identity,
+        start_peer_listeners,
+    },
     connection_book::ConnectionBook,
     lifecycle::{
         ConnectionState, Emitter, LifecycleRecord, ReservationState as LifecycleReservationState,
@@ -59,6 +62,16 @@ fn random_request_id() -> [u8; 16] {
     getrandom::fill(&mut id).expect("OS randomness unavailable");
     id
 }
+fn probe_mut(
+    swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
+) -> io::Result<&mut p2x_net::probe_stream::behaviour::ProbeStreamBehaviour> {
+    swarm
+        .behaviour_mut()
+        .probe_stream
+        .as_mut()
+        .ok_or_else(|| io::Error::other("probe is unavailable in product mode"))
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -150,6 +163,11 @@ async fn main() -> io::Result<()> {
     let config = PeerSwarmConfig {
         tcp_listen: args.tcp_listen,
         quic_listen: args.quic_listen,
+        mode: if args.unsafe_connectivity_lab {
+            RuntimeMode::ConnectivityLab
+        } else {
+            RuntimeMode::Product
+        },
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
     start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
@@ -219,11 +237,11 @@ async fn main() -> io::Result<()> {
                     if let Some(peer_id) = relay_peer_id { swarm.behaviour_mut().auth.send_request(&peer_id, AuthRequest::Authenticate { request_id, credential_id: id.clone(), token_secret: *token.as_bytes(), requested_role: Role::Server, supported_features: 0 }); }
                 }
                 let connections = connection_book.as_ref().map(ConnectionBook::len).unwrap_or(connection_paths.len());
-                emitter.emit(&LifecycleRecord::Resources { connections, pending_opens: swarm.behaviour().probe_stream.pending_count(), workers: worker_admission.admitted(), tasks: worker_admission.admitted() })?;
+                emitter.emit(&LifecycleRecord::Resources { connections, pending_opens: swarm.behaviour().probe_stream.as_ref().map_or(0, |probe| probe.pending_count()), workers: worker_admission.admitted(), tasks: worker_admission.admitted() })?;
             }
             Some(worker) = worker_rx.recv() => {
                 let released = worker_admission.release(worker.peer_id);
-                swarm.behaviour_mut().probe_stream.inbound_release(worker.peer_id);
+                probe_mut(&mut swarm)?.inbound_release(worker.peer_id);
                 if !released {
                     return Err(io::Error::other("worker permit released more than once"));
                 }
@@ -340,7 +358,7 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundOpened { mut stream, peer_id, connection_id })) => {
                         if args.drop_first_probe && !first_probe_dropped {
                             first_probe_dropped = true;
-                            swarm.behaviour_mut().probe_stream.inbound_release(peer_id);
+                            probe_mut(&mut swarm)?.inbound_release(peer_id);
                             swarm.close_connection(connection_id);
                             emitter.emit(&LifecycleRecord::OperationalError { code: "probe.fault_drop_first", message: "selected connection closed during payload" })?;
                             drop(stream);
@@ -348,7 +366,7 @@ async fn main() -> io::Result<()> {
                         }
                         let path = connection_paths.get(&connection_id).copied().unwrap_or(ProbePath::Relay);
                         if let Err(error) = worker_admission.admit(peer_id) {
-                            swarm.behaviour_mut().probe_stream.inbound_release(peer_id);
+                            probe_mut(&mut swarm)?.inbound_release(peer_id);
                             let message = error.to_string(); emitter.emit(&LifecycleRecord::OperationalError { code: "probe.admission_rejected", message: &message })?;
                             continue;
                         }

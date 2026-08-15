@@ -13,7 +13,7 @@ use p2x_exchange::{
 };
 use p2x_net::{
     builder::{
-        ExchangeSwarmConfig, RelayProfile, build_exchange_swarm, lab_identity,
+        ExchangeSwarmConfig, RelayProfile, RuntimeMode, build_exchange_swarm, lab_identity,
         start_exchange_listeners,
     },
     lifecycle::{ConnectionState, Emitter, LifecycleRecord, TerminalResult, stable_hash},
@@ -137,6 +137,11 @@ async fn main() -> io::Result<()> {
         quic_listen: args.quic_listen,
         allow_public: args.unsafe_lab_public_relay,
         relay_profile: args.relay_profile.into(),
+        mode: if args.unsafe_connectivity_lab {
+            RuntimeMode::ConnectivityLab
+        } else {
+            RuntimeMode::Product
+        },
     };
     let mut swarm = build_exchange_swarm(key, &config).map_err(io::Error::other)?;
     start_exchange_listeners(&mut swarm, &config).map_err(io::Error::other)?;
