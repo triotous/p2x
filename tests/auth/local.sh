@@ -41,18 +41,21 @@ trap cleanup TERM INT EXIT
 exchange_key="$secret_dir/exchange.key"
 client_key="$secret_dir/client.key"
 server_key="$secret_dir/server.key"
+ticket_key="$secret_dir/ticket.key"
+printf '\001' > "$ticket_key"
+head -c 32 /dev/urandom >> "$ticket_key"
 identity_bin="$root/target/debug/examples/identity-id"
 exchange_peer=$($identity_bin "$exchange_key" --generate)
 client_peer=$($identity_bin "$client_key" --generate)
 server_peer=$($identity_bin "$server_key" --generate)
-read -r client_token client_digest server_token server_digest < <(python3 - <<'PY'
+read -r client_token client_digest server_token server_digest rotation_token rotation_digest < <(python3 - <<'PY'
 import base64, hashlib
 prefix=b'p2x-fixed-token-v1\0'
-def make(raw):
+def make(name, raw):
     token=base64.urlsafe_b64encode(raw).decode().rstrip('=')
     digest=base64.urlsafe_b64encode(hashlib.sha256(prefix+raw).digest()).decode().rstrip('=')
-    return 'p2x1.' + ('client' if raw[0] == 1 else 'server') + '.' + token, digest
-print(*make(bytes([1])+bytes(range(1,32))), *make(bytes([2])+bytes(range(1,32))))
+    return 'p2x1.' + name + '.' + token, digest
+print(*make('client', bytes([1])+bytes(range(1,32))), *make('server', bytes([2])+bytes(range(1,32))), *make('rotation', bytes([3])+bytes(range(1,32))))
 PY
 )
 now=$(date +%s)
@@ -94,13 +97,24 @@ credentials:
     not_before: $((now-60))
     expires_at: $((now+3600))
     revoked: false
+  - credential_id: rotation
+    token_sha256: "$rotation_digest"
+    peer_id: "$client_peer"
+    tenant: test
+    role: client
+    scopes: [register_services]
+    quota_profile: standard
+    not_before: $((now-60))
+    expires_at: $((now+3600))
+    revoked: false
 EOF
 exchange_log="$out/exchange.ndjson"
 P2X_RUN_ID="$run_id" "$root/target/debug/p2x-exchange" \
-  --identity-file "$exchange_key" --credential-file "$credentials_file" \
+  --identity-file "$exchange_key" --credential-file "$credentials_file" --ticket-key-file "$ticket_key" \
   --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
   >"$exchange_log" 2>&1 &
-pids+=("$!")
+exchange_pid=$!
+pids+=("$exchange_pid")
 exchange_addr=""
 for _ in $(seq 1 200); do
   exchange_addr=$(sed -n 's/.*"event":"listener_ready".*"address":"\([^" ]*\/tcp\/[^" ]*\)".*/\1/p' "$exchange_log" | head -1 || true)
@@ -114,7 +128,7 @@ if [[ "$case_name" == pin-mismatch ]]; then
   P2X_TOKEN="$client_token" "$root/target/debug/p2x-client" --identity-file "$client_key" \
     --exchange "$exchange_addr" --exchange-peer-id "$bad_pin" --credential-env P2X_TOKEN \
     --case-id "$case_name" >"$out/client.ndjson" 2>&1 && { echo "pin mismatch unexpectedly succeeded" >&2; exit 1; } || true
-  ! grep -E "$client_token|$server_token|$client_digest|$server_digest|token_secret|raw_ticket|$exchange_key|$client_key|$server_key" "$out"/* >/dev/null 2>&1 || { echo "secret leaked" >&2; exit 1; }
+  ! grep -E "$client_token|$server_token|$rotation_token|$client_digest|$server_digest|$rotation_digest|token_secret|raw_ticket|$exchange_key|$client_key|$server_key" "$out"/* >/dev/null 2>&1 || { echo "secret leaked" >&2; exit 1; }
   printf '{"case":"%s","passed":true,"code":"auth.exchange_identity_mismatch","auth_requests":0}\n' "$case_name" | tee "$out/summary.json"
   exit 0
 fi
@@ -174,5 +188,23 @@ if [[ -n "$companion" ]]; then
   for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$out/$companion.ndjson" && break; sleep .05; done
   grep -q '"code":"auth.pong"' "$out/$companion.ndjson" || { echo "$companion did not authenticate" >&2; exit 1; }
 fi
-! grep -E "$client_token|$server_token|$client_digest|$server_digest|token_secret|raw_ticket|$exchange_key|$client_key|$server_key" "$out"/* >/dev/null 2>&1 || { echo "secret leaked" >&2; exit 1; }
+if [[ "$case_name" == rotation ]]; then
+  P2X_TOKEN="$rotation_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --case-id rotation-second --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/rotation-second.ndjson" 2>&1 &
+  pids+=("$!")
+  for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$out/rotation-second.ndjson" && break; sleep .05; done
+  grep -q '"code":"auth.pong"' "$out/rotation-second.ndjson" || { echo "rotated credential did not authenticate" >&2; exit 1; }
+fi
+if [[ "$case_name" == exchange-restart ]]; then
+  kill -INT "$exchange_pid" 2>/dev/null || true; wait "$exchange_pid" 2>/dev/null || true
+  P2X_RUN_ID="$run_id-restart" "$root/target/debug/p2x-exchange" --identity-file "$exchange_key" --credential-file "$credentials_file" --ticket-key-file "$ticket_key" --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/exchange-restart.ndjson" 2>&1 &
+  exchange_pid=$!; pids+=("$exchange_pid")
+  restart_addr=""
+  for _ in $(seq 1 200); do restart_addr=$(sed -n 's/.*"event":"listener_ready".*"address":"\([^" ]*\/tcp\/[^" ]*\)".*/\1/p' "$out/exchange-restart.ndjson" | head -1 || true); [[ -n "$restart_addr" ]] && break; sleep .05; done
+  [[ -n "$restart_addr" ]] || { echo "restarted exchange did not become ready" >&2; exit 1; }
+  P2X_TOKEN="$client_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$restart_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --case-id restart-second --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/restart-second.ndjson" 2>&1 &
+  pids+=("$!")
+  for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$out/restart-second.ndjson" && break; sleep .05; done
+  grep -q '"code":"auth.pong"' "$out/restart-second.ndjson" || { echo "restarted exchange did not re-authenticate" >&2; exit 1; }
+fi
+! grep -E "$client_token|$server_token|$rotation_token|$client_digest|$server_digest|$rotation_digest|token_secret|raw_ticket|$exchange_key|$client_key|$server_key" "$out"/* >/dev/null 2>&1 || { echo "secret leaked" >&2; exit 1; }
 printf '{"case":"%s","passed":true,"expected_code":"%s","component":"%s"}\n' "$case_name" "$expected" "$component" | tee "$out/summary.json"

@@ -52,6 +52,8 @@ struct Args {
     #[arg(long)]
     credential_file: Option<PathBuf>,
     #[arg(long)]
+    ticket_key_file: Option<PathBuf>,
+    #[arg(long)]
     artifact: Option<PathBuf>,
     #[arg(long, default_value = "lifecycle")]
     case_id: String,
@@ -79,6 +81,12 @@ async fn main() -> io::Result<()> {
         Some(path) => Emitter::with_artifact("exchange", &run_id, path)?,
         None => Emitter::new("exchange", &run_id),
     };
+    let ticket_key = args
+        .ticket_key_file
+        .as_deref()
+        .map(p2x_config::ticket_key::TicketKey::load)
+        .transpose()
+        .map_err(io::Error::other)?;
     let provider = args
         .credential_file
         .as_deref()
@@ -87,6 +95,12 @@ async fn main() -> io::Result<()> {
         .map(|file| FixedTokenProvider::from_config(&file))
         .transpose()
         .map_err(io::Error::other)?;
+    if provider.is_some() && ticket_key.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "authenticated exchange requires --ticket-key-file",
+        ));
+    }
     let key = if let Some(path) = args.identity_file.as_ref() {
         p2x_config::identity::load_or_create_identity(&p2x_config::identity::IdentityConfig {
             path: path.clone(),
