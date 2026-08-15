@@ -1,7 +1,8 @@
 use base64::Engine;
 use libp2p_identity::PeerId;
 use p2x_protocol::{CredentialId, QuotaProfile, Tenant, TokenDigest, TokenSecret};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::Visitor};
+use std::fmt;
 use std::str::FromStr;
 use std::{env, fs, path::Path};
 use thiserror::Error;
@@ -25,7 +26,24 @@ pub struct CredentialRecord {
     pub quota_profile: String,
     pub not_before: i64,
     pub expires_at: i64,
+    #[serde(deserialize_with = "strict_bool")]
     pub revoked: bool,
+}
+fn strict_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct StrictBool;
+    impl<'de> Visitor<'de> for StrictBool {
+        type Value = bool;
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a YAML boolean")
+        }
+        fn visit_bool<E>(self, value: bool) -> Result<bool, E> {
+            Ok(value)
+        }
+    }
+    deserializer.deserialize_bool(StrictBool)
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

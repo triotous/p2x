@@ -24,6 +24,8 @@ pub struct ConnectionTicketClaimsV1 {
 pub enum TicketError {
     #[error("invalid ticket")]
     Invalid,
+    #[error("ticket expired")]
+    Expired,
     #[error("ticket exceeds bound")]
     TooLarge,
 }
@@ -288,6 +290,12 @@ pub fn verify_and_validate(
 ) -> Result<(), TicketError> {
     verify_envelope(e, key_id, key)?;
     let (_, c, _) = decode_envelope(e)?;
+    if expected.clock_skew < 0 || expected.clock_skew > 30 {
+        return Err(TicketError::Invalid);
+    }
+    if c.expires_at < expected.now.saturating_sub(expected.clock_skew) {
+        return Err(TicketError::Expired);
+    }
     if c.issuer_exchange_peer_id != expected.issuer_exchange_peer_id
         || c.client_peer_id != expected.client_peer_id
         || c.server_peer_id != expected.server_peer_id
@@ -299,7 +307,6 @@ pub fn verify_and_validate(
         || c.permissions != expected.permissions
         || c.max_streams != expected.max_streams
         || c.not_before > expected.now.saturating_add(expected.clock_skew)
-        || c.expires_at < expected.now.saturating_sub(expected.clock_skew)
     {
         return Err(TicketError::Invalid);
     }
