@@ -1,14 +1,14 @@
 # Two-host C14 runbook
 
-C14 is a manual gate and cannot be claimed from this repository alone. Run on two native hosts on separate networks after the lab lifecycle is complete.
+C14 requires two native hosts on separate networks. Use one run ID and copy the three NDJSON files plus `environment.txt` into one `C14-relay` artifact directory before validation.
 
-1. Capture `uname -a`, `rustc --version`, `cargo --version`, `git rev-parse HEAD`, and the public interface names. Do not record seeds or private keys.
-2. Permit the exchange listener TCP and UDP ports in both host firewalls. Permit the client/server listener ports only as required by the chosen topology.
-3. On host A, run `cargo run --release -p p2x-exchange -- --identity-seed 1 --tcp-listen /ip4/0.0.0.0/tcp/4001 --unsafe-lab-public-relay`, saving stdout/stderr below `target/p2x-spike/<run-id>/`.
-4. On host B, run `cargo run --release -p p2x-server -- --identity-seed 2 --tcp-listen /ip4/0.0.0.0/tcp/4002`, saving logs and its structured readiness line.
-5. On either host, run `cargo run --release -p p2x-client -- --identity-seed 3 --exchange <exchange-address> --path relay`, saving the structured terminal result.
-6. Assert JSON contains `passed`, `terminal_code`, client-selected path, server-observed path, timing, and both local connection-ID hashes. The two peers' local connection IDs must not be compared for equality.
-7. Record whether a direct path was observed. Relay success is required; direct success is topology-dependent and must be reported honestly.
-8. Redact seeds, private keys, payloads, and reusable identities before committing summaries. Stop all three processes and remove only this run's firewall rules and processes.
+1. On both hosts, check out the same clean commit and record `uname -a`, `rustc --version`, `cargo --version`, `cargo deny --version`, `git rev-parse HEAD`, `git status --short`, public interface names, and relevant firewall/NAT notes in `environment.txt`. Do not record private keys or reusable identities.
+2. Permit host A inbound TCP/4001 and UDP/4001. Permit host B inbound TCP/4002 and UDP/4002 only if testing direct reachability; relay success must not depend on those peer ports.
+3. On host A, set `P2X_RUN_ID` and run `tests/two-host/C14-relay/start-exchange.sh`. Replace the emitted `0.0.0.0` component with host A's reachable address and export the complete `/p2p/<exchange-peer>` multiaddress as `P2X_EXCHANGE_ADDR` on host B.
+4. On host B, set the same `P2X_RUN_ID` and `P2X_EXCHANGE_ADDR`, then run `tests/two-host/C14-relay/start-server.sh`. Export its typed `listener_ready` circuit address as `P2X_SERVER_CIRCUIT` on the client host.
+5. From the other physical network, set the same `P2X_RUN_ID` and `P2X_SERVER_CIRCUIT`, then run `tests/two-host/C14-relay/run-client.sh`.
+6. Stop exchange and server with SIGINT so each writes its terminal record. Copy `exchange.ndjson`, `server.ndjson`, `client.ndjson`, and `environment.txt` into one directory.
+7. Run `tests/connectivity/manual-gates.sh --c14-validate <artifact-directory>`. It requires exactly one passing relay terminal and a matching server-observed relay probe. Record any direct path observation separately; direct success is topology-dependent.
+8. Redact public IPs if required by project policy, seeds, private keys, and reusable identity material before committing the scrubbed summary. Preserve raw failures outside version control.
 
-This runbook is not evidence that C14 passed; the scrubbed raw result and environment capture are required before updating the ADR.
+The validator creates `summary.json` only when the mandatory relay evidence is complete. Until that summary is reviewed with the Linux matrix, ADR 0001 stays `Deferred`.
