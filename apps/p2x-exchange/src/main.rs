@@ -6,7 +6,10 @@ use libp2p::{
     swarm::SwarmEvent,
 };
 use p2x_exchange::{
-    auth_handler::handle_request, auth_sessions::AuthSessionLedger, authn::FixedTokenProvider,
+    admission::{Admission, AdmissionLedger},
+    auth_handler::handle_request,
+    auth_sessions::AuthSessionLedger,
+    authn::FixedTokenProvider,
 };
 use p2x_net::{
     builder::{
@@ -98,6 +101,7 @@ async fn main() -> io::Result<()> {
         lab_identity(args.identity_seed).map_err(io::Error::other)?
     };
     let mut sessions = AuthSessionLedger::default();
+    let mut admission = AdmissionLedger::default();
     let config = ExchangeSwarmConfig {
         tcp_listen: args.tcp_listen,
         quic_listen: args.quic_listen,
@@ -122,7 +126,12 @@ async fn main() -> io::Result<()> {
                     emitter.emit(&LifecycleRecord::ListenerReady { listener_id: &listener_id, address: &advertised })?;
                 }
                 SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, .. }, .. })) => {
+                    let peer_name = peer.to_string();
+                    if admission.begin_auth(&peer_name, chrono_like_now()) != Admission::Accepted { continue; }
+                    let failed = matches!(&request, p2x_protocol::AuthRequest::Authenticate { .. });
                     let response = if let Some(provider) = provider.as_ref() { handle_request(provider, &mut sessions, &peer.to_string(), request, chrono_like_now()) } else { AuthResponse::Rejected { request_id: None, error: PublicError::new(PublicErrorCode::AuthSessionRequired, false) } };
+                    let rejected = matches!(response, AuthResponse::Rejected { .. });
+                    admission.finish_auth(&peer_name, rejected && failed, chrono_like_now());
                     swarm.behaviour_mut().auth.send_response(channel, response).map_err(|_| io::Error::other("auth response channel closed"))?;
                 },
                 SwarmEvent::Behaviour(event) => { let message = format!("{event:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "relay.event", message: &message })?; }

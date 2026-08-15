@@ -11,6 +11,12 @@ pub const AUTH_PROTOCOL: &str = "/p2x/auth/1";
 const VERSION: u8 = 1;
 #[derive(Clone, Default)]
 pub struct AuthCodec;
+pub fn decode_auth_request(bytes: &[u8]) -> io::Result<AuthRequest> {
+    decode_request(bytes)
+}
+pub fn decode_auth_response(bytes: &[u8]) -> io::Result<AuthResponse> {
+    decode_response(bytes)
+}
 
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "malformed auth message")
