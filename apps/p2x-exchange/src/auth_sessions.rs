@@ -64,6 +64,14 @@ impl AuthSessionLedger {
         session_id: [u8; 16],
         now: i64,
     ) -> SessionAction {
+        if self
+            .sessions
+            .get(peer_id)
+            .is_some_and(|session| session.expires_at <= now)
+        {
+            self.sessions.remove(peer_id);
+            return SessionAction::Rejected(PublicErrorCode::AuthSessionExpired);
+        }
         self.sweep(now);
         match self.sessions.get(peer_id) {
             Some(session) if session.session_id == session_id => {
@@ -154,6 +162,15 @@ mod tests {
         assert_eq!(ledger.len(), 0);
         ledger.sweep(100);
         assert_eq!(ledger.len(), 0);
+        ledger.connection_established("peer");
+        assert!(matches!(
+            ledger.authenticate(principal(1), [3; 16], 1),
+            SessionAction::Authenticated(_)
+        ));
+        assert!(matches!(
+            ledger.authorize_ping("peer", [3; 16], 100),
+            SessionAction::Rejected(PublicErrorCode::AuthSessionExpired)
+        ));
         assert!(ledger.connection_closed("peer").is_none());
     }
 }

@@ -252,6 +252,19 @@ pub fn verify_envelope(e: &[u8], key_id: [u8; 16], key: &VerifyingKey) -> Result
     key.verify(&m, &sig).map_err(|_| TicketError::Invalid)
 }
 
+pub struct TicketVerifier<'a> {
+    pub key_id: [u8; 16],
+    pub key: &'a VerifyingKey,
+}
+impl<'a> TicketVerifier<'a> {
+    pub fn verify(
+        &self,
+        envelope: &[u8],
+        expected: &TicketValidation<'_>,
+    ) -> Result<(), TicketError> {
+        verify_and_validate(envelope, self.key_id, self.key, expected)
+    }
+}
 pub fn verify_and_validate(
     e: &[u8],
     key_id: [u8; 16],

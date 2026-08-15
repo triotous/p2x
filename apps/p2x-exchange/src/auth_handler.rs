@@ -74,6 +74,10 @@ pub fn handle_request(
                 nonce,
                 exchange_time: now,
             },
+            SessionAction::Rejected(code) => AuthResponse::Rejected {
+                request_id: Some(request_id),
+                error: PublicError::new(code, false),
+            },
             _ => AuthResponse::Rejected {
                 request_id: Some(request_id),
                 error: PublicError::new(PublicErrorCode::AuthSessionRequired, false),
