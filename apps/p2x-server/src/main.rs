@@ -83,7 +83,12 @@ async fn main() -> io::Result<()> {
                         emitter.event("listener_error", Some(&error.to_string()))?;
                     }
                     SwarmEvent::Behaviour(PeerEvent::Relay(relay_event)) => {
+                        let accepted = matches!(relay_event, libp2p::relay::client::Event::ReservationReqAccepted { .. });
                         emitter.event("relay_event", Some(&format!("{relay_event:?}")))?;
+                        if accepted && let Some(address) = pending_circuit.as_ref() {
+                            let advertised = address.clone().with(Protocol::P2p(*swarm.local_peer_id()));
+                            emitter.event("reservation_accepted", Some(&advertised.to_string()))?;
+                        }
                     }
                     SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundOpened { mut stream, peer_id, connection_id })) => {
                         let ack = execute_probe_futures(&mut stream, p2x_net::probe::ProbePath::Relay, format!("{connection_id:?}").bytes().fold(0u64, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte as u64))).await.map_err(io::Error::other)?;
