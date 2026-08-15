@@ -34,6 +34,6 @@ fn main() {
         "claims {}\nticket {}\nkey_id {}",
         hex(&claims),
         hex(&ticket),
-        hex(&s.key_id)
+        hex(&s.key_id())
     );
 }

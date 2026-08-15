@@ -189,7 +189,7 @@ impl ConnectionTicketClaimsV1 {
 }
 pub struct TicketSigner {
     key: SigningKey,
-    pub key_id: [u8; 16],
+    key_id: [u8; 16],
 }
 impl TicketSigner {
     pub fn from_seed(seed: [u8; 32]) -> Self {
@@ -198,6 +198,9 @@ impl TicketSigner {
         let mut id = [0; 16];
         id.copy_from_slice(&d[..16]);
         Self { key, key_id: id }
+    }
+    pub fn key_id(&self) -> [u8; 16] {
+        self.key_id
     }
     pub fn sign(&self, c: &ConnectionTicketClaimsV1) -> Result<Vec<u8>, TicketError> {
         let c = c.encode()?;
@@ -242,6 +245,11 @@ pub fn decode_envelope(
     Ok((id, c, sig))
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedTicket {
+    pub ticket_id: [u8; 16],
+    pub claims: ConnectionTicketClaimsV1,
+}
+
 pub struct TicketValidation<'a> {
     pub issuer_exchange_peer_id: &'a [u8],
     pub client_peer_id: &'a [u8],
@@ -257,7 +265,8 @@ pub struct TicketValidation<'a> {
     pub clock_skew: i64,
 }
 
-pub fn verify_envelope(e: &[u8], key_id: [u8; 16], key: &VerifyingKey) -> Result<(), TicketError> {
+#[cfg(test)]
+fn verify_envelope(e: &[u8], key_id: [u8; 16], key: &VerifyingKey) -> Result<(), TicketError> {
     let (id, c, sig) = decode_envelope(e)?;
     if id != key_id {
         return Err(TicketError::Invalid);
@@ -278,7 +287,7 @@ impl<'a> TicketVerifier<'a> {
         &self,
         envelope: &[u8],
         expected: &TicketValidation<'_>,
-    ) -> Result<(), TicketError> {
+    ) -> Result<VerifiedTicket, TicketError> {
         verify_and_validate(envelope, self.key_id, self.key, expected)
     }
 }
@@ -287,14 +296,25 @@ pub fn verify_and_validate(
     key_id: [u8; 16],
     key: &VerifyingKey,
     expected: &TicketValidation<'_>,
-) -> Result<(), TicketError> {
-    verify_envelope(e, key_id, key)?;
-    let (_, c, _) = decode_envelope(e)?;
+) -> Result<VerifiedTicket, TicketError> {
+    let (envelope_key_id, c, sig) = decode_envelope(e)?;
+    if envelope_key_id != key_id {
+        return Err(TicketError::Invalid);
+    }
+    let bytes = c.encode()?;
+    let mut message = b"p2x-ticket-v1\0".to_vec();
+    message.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    message.extend_from_slice(&bytes);
+    key.verify(&message, &sig)
+        .map_err(|_| TicketError::Invalid)?;
     if expected.clock_skew < 0 || expected.clock_skew > 30 {
         return Err(TicketError::Invalid);
     }
     if c.expires_at < expected.now.saturating_sub(expected.clock_skew) {
         return Err(TicketError::Expired);
+    }
+    if c.not_before > expected.now.saturating_add(expected.clock_skew) {
+        return Err(TicketError::Invalid);
     }
     if c.issuer_exchange_peer_id != expected.issuer_exchange_peer_id
         || c.client_peer_id != expected.client_peer_id
@@ -306,11 +326,13 @@ pub fn verify_and_validate(
         || c.authorization_revision != expected.authorization_revision
         || c.permissions != expected.permissions
         || c.max_streams != expected.max_streams
-        || c.not_before > expected.now.saturating_add(expected.clock_skew)
     {
         return Err(TicketError::Invalid);
     }
-    Ok(())
+    Ok(VerifiedTicket {
+        ticket_id: c.ticket_id,
+        claims: c,
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -319,6 +341,22 @@ mod tests {
         0, 36, 8, 1, 18, 32, 107, 117, 237, 81, 229, 13, 170, 0, 121, 162, 207, 180, 128, 192, 5,
         180, 135, 200, 156, 15, 161, 190, 109, 221, 66, 55, 60, 198, 198, 8, 78, 161,
     ];
+    fn validation() -> TicketValidation<'static> {
+        TicketValidation {
+            issuer_exchange_peer_id: PEER,
+            client_peer_id: PEER,
+            server_peer_id: PEER,
+            tenant: "t",
+            upstream_id: "u",
+            selector_fingerprint: [4; 32],
+            registration_revision: 1,
+            authorization_revision: 2,
+            permissions: 4,
+            max_streams: 1,
+            now: 15,
+            clock_skew: 0,
+        }
+    }
     fn claims() -> ConnectionTicketClaimsV1 {
         ConnectionTicketClaimsV1 {
             issuer_exchange_peer_id: PEER.to_vec(),
@@ -355,23 +393,22 @@ mod tests {
     fn vector_and_mutation() {
         let s = TicketSigner::from_seed([9; 32]);
         let t = s.sign(&claims()).unwrap();
-        verify_envelope(&t, s.key_id, &s.public_key()).unwrap();
+        verify_and_validate(&t, s.key_id(), &s.public_key(), &validation()).unwrap();
         let mut x = t.clone();
         *x.last_mut().unwrap() ^= 1;
-        assert!(verify_envelope(&x, s.key_id, &s.public_key()).is_err());
+        assert!(verify_envelope(&x, s.key_id(), &s.public_key()).is_err());
         for index in 24..t.len() - 64 {
             let mut mutated = t.clone();
             mutated[index] ^= 1;
-            assert!(verify_envelope(&mutated, s.key_id, &s.public_key()).is_err());
+            assert!(verify_envelope(&mutated, s.key_id(), &s.public_key()).is_err());
         }
-        let mut wrong_key = TicketSigner::from_seed([8; 32]);
-        assert!(verify_envelope(&t, wrong_key.key_id, &wrong_key.public_key()).is_err());
-        wrong_key.key_id = s.key_id;
-        assert!(verify_envelope(&t, wrong_key.key_id, &wrong_key.public_key()).is_err());
+        let wrong_key = TicketSigner::from_seed([8; 32]);
+        assert!(verify_envelope(&t, wrong_key.key_id(), &wrong_key.public_key()).is_err());
+        assert!(verify_envelope(&t, s.key_id(), &wrong_key.public_key()).is_err());
         let v: serde_json::Value =
             serde_json::from_str(include_str!("../testdata/ticket-v1.json")).unwrap();
         let h = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         assert_eq!(h(&t), v["envelope_hex"]);
-        assert_eq!(h(&s.key_id), v["key_id_hex"]);
+        assert_eq!(h(&s.key_id()), v["key_id_hex"]);
     }
 }
