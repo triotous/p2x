@@ -13,6 +13,9 @@ pub enum CredentialError {
 
 pub struct TokenSecret(Zeroizing<[u8; 32]>);
 impl TokenSecret {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
     pub fn parse(value: &str) -> Result<(crate::CredentialId, Self), CredentialError> {
         let mut parts = value.split('.');
         let prefix = parts.next();
