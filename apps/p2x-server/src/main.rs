@@ -57,8 +57,12 @@ async fn main() -> io::Result<()> {
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
-                        let name = if address.to_string().contains("p2p-circuit") { "circuit_ready" } else { "listen_addr" };
-                        emitter.event(name, Some(&address.to_string()))?;
+                        emitter.event("listen_addr", Some(&address.to_string()))?;
+                    }
+                    SwarmEvent::ExternalAddrConfirmed { address } => {
+                        if address.to_string().contains("p2p-circuit") {
+                            emitter.event("circuit_ready", Some(&address.to_string()))?;
+                        }
                     }
                     SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundOpened { mut stream, peer_id, connection_id })) => {
                         let ack = execute_probe_futures(&mut stream, p2x_net::probe::ProbePath::Relay, format!("{connection_id:?}").bytes().fold(0u64, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte as u64))).await.map_err(io::Error::other)?;
