@@ -9,6 +9,7 @@ publish = false
 
 [workspace.dependencies]
 base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
 libp2p = { version = "=0.56.0", default-features = false, features = ["dcutr", "dns", "ed25519", "identify", "macros", "noise", "ping", "quic", "relay", "request-response", "tcp", "tokio", "yamux"] }

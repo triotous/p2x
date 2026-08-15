@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+ed25519-dalek.workspace = true
 base64.workspace = true
 libp2p-identity.workspace = true
 serde.workspace = true

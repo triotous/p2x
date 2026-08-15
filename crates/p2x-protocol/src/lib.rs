@@ -3,6 +3,7 @@ pub mod credential;
 pub mod error;
 pub mod frame;
 pub mod ids;
+pub mod ticket;
 
 pub use auth::{AuthRequest, AuthResponse, Role, Scope};
 pub use credential::{TokenDigest, TokenSecret};
