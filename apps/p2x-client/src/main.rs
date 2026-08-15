@@ -207,6 +207,31 @@ async fn main() -> io::Result<()> {
             "product mode requires --identity-file",
         ));
     };
+    let exchange_trust = if args.unsafe_connectivity_lab {
+        None
+    } else {
+        let exchange = args.exchange.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "product mode requires --exchange",
+            )
+        })?;
+        let configured = args.exchange_peer_id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "product mode requires --exchange-peer-id",
+            )
+        })?;
+        Some(
+            p2x_config::trust::validate_exchange_trust(configured, std::slice::from_ref(exchange))
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "auth.exchange_identity_mismatch",
+                    )
+                })?,
+        )
+    };
     if args.credential_env.is_none() && !args.unsafe_connectivity_lab {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -236,38 +261,6 @@ async fn main() -> io::Result<()> {
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
     start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
     let server_address = args.server.clone();
-    if credential.is_some() {
-        let exchange = args.exchange.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "credential mode requires --exchange",
-            )
-        })?;
-        let configured = args.exchange_peer_id.as_deref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "credential mode requires --exchange-peer-id",
-            )
-        })?;
-        let address_peer = exchange
-            .iter()
-            .find_map(|part| match part {
-                libp2p::multiaddr::Protocol::P2p(peer) => Some(peer.to_string()),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "exchange address needs /p2p/<peer>",
-                )
-            })?;
-        if address_peer != configured {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "exchange pin does not match address",
-            ));
-        }
-    }
     let target_peer = args.server.as_ref().and_then(|address| {
         address.iter().fold(None, |last, part| match part {
             libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
@@ -278,10 +271,9 @@ async fn main() -> io::Result<()> {
     emitter.emit(&LifecycleRecord::Started {
         peer_id: &local_peer,
     })?;
-    let expected_exchange = args
-        .exchange_peer_id
-        .as_deref()
-        .and_then(|value| value.parse().ok())
+    let expected_exchange = exchange_trust
+        .as_ref()
+        .map(|trust| trust.peer_id)
         .or_else(|| {
             args.exchange.as_ref().and_then(|address| {
                 address.iter().find_map(|part| match part {
@@ -291,17 +283,16 @@ async fn main() -> io::Result<()> {
             })
         })
         .or_else(|| {
-            args.server.as_ref().and_then(|address| {
-                let mut peer = None;
-                for part in address.iter() {
-                    match part {
-                        libp2p::multiaddr::Protocol::P2p(value) => peer = Some(value),
-                        libp2p::multiaddr::Protocol::P2pCircuit => return peer,
-                        _ => {}
-                    }
-                }
+            if args.unsafe_connectivity_lab {
+                args.server.as_ref().and_then(|address| {
+                    address.iter().find_map(|part| match part {
+                        libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
+                        _ => None,
+                    })
+                })
+            } else {
                 None
-            })
+            }
         })
         .ok_or_else(|| {
             io::Error::new(

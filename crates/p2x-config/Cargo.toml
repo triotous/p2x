@@ -10,6 +10,7 @@ ed25519-dalek.workspace = true
 getrandom.workspace = true
 p2x-protocol = { path = "../p2x-protocol" }
 libc.workspace = true
+libp2p.workspace = true
 libp2p-identity = { workspace = true, features = ["peerid", "rand"] }
 serde = { workspace = true, features = ["derive"] }
 serde_yaml.workspace = true

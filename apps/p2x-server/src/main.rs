@@ -111,6 +111,31 @@ async fn main() -> io::Result<()> {
             "product mode requires --identity-file",
         ));
     };
+    let exchange_trust = if args.unsafe_connectivity_lab {
+        None
+    } else {
+        let exchange = args.exchange.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "product mode requires --exchange",
+            )
+        })?;
+        let configured = args.exchange_peer_id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "product mode requires --exchange-peer-id",
+            )
+        })?;
+        Some(
+            p2x_config::trust::validate_exchange_trust(configured, std::slice::from_ref(exchange))
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "auth.exchange_identity_mismatch",
+                    )
+                })?,
+        )
+    };
     if args.credential_env.is_none() && !args.unsafe_connectivity_lab {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -128,38 +153,6 @@ async fn main() -> io::Result<()> {
             .map_err(io::Error::other)
         })
         .transpose()?;
-    if credential.is_some() {
-        let exchange = args.exchange.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "credential mode requires --exchange",
-            )
-        })?;
-        let configured = args.exchange_peer_id.as_deref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "credential mode requires --exchange-peer-id",
-            )
-        })?;
-        let address_peer = exchange
-            .iter()
-            .find_map(|part| match part {
-                Protocol::P2p(peer) => Some(peer.to_string()),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "exchange address needs /p2p/<peer>",
-                )
-            })?;
-        if address_peer != configured {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "exchange pin does not match address",
-            ));
-        }
-    }
     let config = PeerSwarmConfig {
         tcp_listen: args.tcp_listen,
         quic_listen: args.quic_listen,
@@ -171,10 +164,7 @@ async fn main() -> io::Result<()> {
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
     start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
-    let mut relay_peer_id = args
-        .exchange_peer_id
-        .as_deref()
-        .and_then(|v| v.parse().ok());
+    let mut relay_peer_id = exchange_trust.as_ref().map(|trust| trust.peer_id);
     let mut relay_connection_id = None;
     let mut circuit_listener_id = None;
     let mut reservation = ReservationContext::new(0);
