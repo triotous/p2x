@@ -63,6 +63,11 @@ pub struct VerificationKeyRing {
 }
 impl VerificationKeyRing {
     pub fn add(&mut self, key: VerificationKey) {
+        assert!(
+            key.retires_at
+                .is_none_or(|retire| retire > key.activates_at)
+        );
+        assert!(!self.keys.iter().any(|old| old.key_id == key.key_id));
         self.keys.push(key)
     }
     pub fn get(&self, key_id: [u8; 16], now: i64) -> Option<&VerificationKey> {
@@ -74,6 +79,20 @@ impl VerificationKeyRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ring_observes_activation_and_retirement() {
+        let key = TicketKey::from_seed([9; 32]);
+        let mut ring = VerificationKeyRing::default();
+        ring.add(VerificationKey {
+            key_id: key.key_id,
+            public: key.public(),
+            activates_at: 10,
+            retires_at: Some(20),
+        });
+        assert!(ring.get(key.key_id, 9).is_none());
+        assert!(ring.get(key.key_id, 10).is_some());
+        assert!(ring.get(key.key_id, 20).is_none());
+    }
     #[test]
     fn key_id_is_stable_and_debug_redacts() {
         let k = TicketKey::from_seed([9; 32]);
