@@ -1,0 +1,92 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[non_exhaustive]
+pub enum PublicErrorCode {
+    AuthInvalidCredential,
+    AuthExchangeIdentityMismatch,
+    AuthSessionRequired,
+    AuthSessionExpired,
+    AuthRoleForbidden,
+    AuthTicketInvalid,
+    AuthTicketExpired,
+    ExchangeOverloaded,
+    ExchangeTimeout,
+    LimitAuthConnections,
+    LimitAuthRequests,
+    LimitAuthSessions,
+    ProtocolFrameTooLarge,
+    ProtocolMalformed,
+    ProtocolUnsupportedVersion,
+    ProtocolCapabilityMismatch,
+}
+impl PublicErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthInvalidCredential => "auth.invalid_credential",
+            Self::AuthExchangeIdentityMismatch => "auth.exchange_identity_mismatch",
+            Self::AuthSessionRequired => "auth.session_required",
+            Self::AuthSessionExpired => "auth.session_expired",
+            Self::AuthRoleForbidden => "auth.role_forbidden",
+            Self::AuthTicketInvalid => "auth.ticket_invalid",
+            Self::AuthTicketExpired => "auth.ticket_expired",
+            Self::ExchangeOverloaded => "exchange.overloaded",
+            Self::ExchangeTimeout => "exchange.timeout",
+            Self::LimitAuthConnections => "limit.auth_connections",
+            Self::LimitAuthRequests => "limit.auth_requests",
+            Self::LimitAuthSessions => "limit.auth_sessions",
+            Self::ProtocolFrameTooLarge => "protocol.frame_too_large",
+            Self::ProtocolMalformed => "protocol.malformed",
+            Self::ProtocolUnsupportedVersion => "protocol.unsupported_version",
+            Self::ProtocolCapabilityMismatch => "protocol.capability_mismatch",
+        }
+    }
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "auth.invalid_credential" => Self::AuthInvalidCredential,
+            "auth.exchange_identity_mismatch" => Self::AuthExchangeIdentityMismatch,
+            "auth.session_required" => Self::AuthSessionRequired,
+            "auth.session_expired" => Self::AuthSessionExpired,
+            "auth.role_forbidden" => Self::AuthRoleForbidden,
+            "auth.ticket_invalid" => Self::AuthTicketInvalid,
+            "auth.ticket_expired" => Self::AuthTicketExpired,
+            "exchange.overloaded" => Self::ExchangeOverloaded,
+            "exchange.timeout" => Self::ExchangeTimeout,
+            "limit.auth_connections" => Self::LimitAuthConnections,
+            "limit.auth_requests" => Self::LimitAuthRequests,
+            "limit.auth_sessions" => Self::LimitAuthSessions,
+            "protocol.frame_too_large" => Self::ProtocolFrameTooLarge,
+            "protocol.unsupported_version" => Self::ProtocolUnsupportedVersion,
+            "protocol.capability_mismatch" => Self::ProtocolCapabilityMismatch,
+            _ => Self::ProtocolMalformed,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PublicError {
+    pub code: PublicErrorCode,
+    pub retryable: bool,
+}
+impl PublicError {
+    pub const fn new(code: PublicErrorCode, retryable: bool) -> Self {
+        Self { code, retryable }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn codes_round_trip() {
+        for code in [
+            PublicErrorCode::AuthInvalidCredential,
+            PublicErrorCode::ProtocolMalformed,
+            PublicErrorCode::LimitAuthSessions,
+        ] {
+            assert_eq!(PublicErrorCode::parse(code.as_str()), code);
+        }
+        assert_eq!(
+            PublicErrorCode::parse("secret"),
+            PublicErrorCode::ProtocolMalformed
+        );
+    }
+}
