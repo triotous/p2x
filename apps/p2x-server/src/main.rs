@@ -8,6 +8,7 @@ use libp2p::{
 };
 use p2x_net::{
     ReservationContext, ReservationEvent,
+    auth_state::{AuthAction, AuthState},
     builder::{PeerEvent, PeerSwarmConfig, build_peer_swarm, lab_identity, start_peer_listeners},
     connection_book::ConnectionBook,
     lifecycle::{
@@ -57,6 +58,12 @@ fn random_request_id() -> [u8; 16] {
     let mut id = [0; 16];
     getrandom::fill(&mut id).expect("OS randomness unavailable");
     id
+}
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 struct WorkerResult {
@@ -160,9 +167,9 @@ async fn main() -> io::Result<()> {
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerResult>(128);
     let mut resource_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut first_probe_dropped = false;
-    let auth_request_id = random_request_id();
-    let ping_request_id = random_request_id();
-    let mut auth_started = false;
+    let mut auth_request_id = random_request_id();
+    let mut ping_request_id = random_request_id();
+    let mut auth_state = AuthState::new();
     if let Some(exchange) = args.exchange {
         let relay_peer = exchange
             .iter()
@@ -205,6 +212,12 @@ async fn main() -> io::Result<()> {
             _ = tokio::signal::ctrl_c() => break,
             _ = resource_tick.tick() => {
                 if let Some(book) = connection_book.as_mut() { book.sweep(std::time::Instant::now()); }
+                if let Some((id, token)) = credential.as_ref()
+                    && let AuthAction::Authenticate { request_id } = auth_state.tick(random_request_id(), unix_now())
+                {
+                    auth_request_id = request_id;
+                    if let Some(peer_id) = relay_peer_id { swarm.behaviour_mut().auth.send_request(&peer_id, AuthRequest::Authenticate { request_id, credential_id: id.clone(), token_secret: *token.as_bytes(), requested_role: Role::Server, supported_features: 0 }); }
+                }
                 let connections = connection_book.as_ref().map(ConnectionBook::len).unwrap_or(connection_paths.len());
                 emitter.emit(&LifecycleRecord::Resources { connections, pending_opens: swarm.behaviour().probe_stream.pending_count(), workers: worker_admission.admitted(), tasks: worker_admission.admitted() })?;
             }
@@ -251,7 +264,12 @@ async fn main() -> io::Result<()> {
                         connection_paths.insert(connection_id, path);
                         let peer = peer_id.to_string();
                         emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Established, path: Some(path), reason: None })?;
-                        if relay_peer_id == Some(peer_id) && !auth_started && let Some((id, token)) = credential.as_ref() { auth_started = true; swarm.behaviour_mut().auth.send_request(&peer_id, AuthRequest::Authenticate { request_id: auth_request_id, credential_id: id.clone(), token_secret: *token.as_bytes(), requested_role: Role::Server, supported_features: 0 }); }
+                        if relay_peer_id == Some(peer_id) && let Some((id, token)) = credential.as_ref()
+                            && let AuthAction::Authenticate { request_id } = auth_state.connected(auth_request_id, unix_now())
+                        {
+                            auth_request_id = request_id;
+                            swarm.behaviour_mut().auth.send_request(&peer_id, AuthRequest::Authenticate { request_id, credential_id: id.clone(), token_secret: *token.as_bytes(), requested_role: Role::Server, supported_features: 0 });
+                        }
                         if relay_peer_id == Some(peer_id)
                             && !reservation_requested
                             && let Some(address) = pending_circuit.clone()
@@ -287,9 +305,25 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::ListenerClosed { reason, .. } => {
                         let message = format!("{reason:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "listener.closed", message: &message })?;
                     }
-                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { response: AuthResponse::Authenticated { session_id, request_id, .. }, .. }, .. })) if request_id == auth_request_id => { swarm.behaviour_mut().auth.send_request(&peer, AuthRequest::Ping { request_id: ping_request_id, session_id, nonce: 1 }); }
-                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { response: AuthResponse::Pong { request_id, nonce: 1, .. }, .. }, .. })) if credential.is_some() && request_id == ping_request_id => { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?; return Ok(()); }
-                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { response: AuthResponse::Rejected { request_id: Some(request_id), error }, .. }, .. })) if credential.is_some() && request_id == auth_request_id => { emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", error.code.as_str()))?; return Ok(()); }
+                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { response: AuthResponse::Authenticated { session_id, request_id, .. }, .. }, .. })) => {
+                        if let AuthAction::Ping { request_id: ping_id, session_id, nonce } = auth_state.authenticated(request_id, session_id, { ping_request_id = random_request_id(); ping_request_id }, 1, unix_now()) {
+                            ping_request_id = ping_id;
+                            swarm.behaviour_mut().auth.send_request(&peer, AuthRequest::Ping { request_id: ping_id, session_id, nonce });
+                        }
+                    }
+                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { response: AuthResponse::Pong { request_id, nonce, .. }, .. }, .. })) if credential.is_some() && request_id == ping_request_id && auth_state.pong(request_id, nonce) == AuthAction::Ready => { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?; return Ok(()); }
+                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { response: AuthResponse::Rejected { request_id, error }, .. }, .. })) if credential.is_some() && auth_state.rejected(request_id, error.code, unix_now()) != AuthAction::Ignore => {
+                        if matches!(auth_state.phase(), p2x_net::auth_state::AuthPhase::Terminal(_)) {
+                            emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", error.code.as_str()))?;
+                            return Ok(());
+                        }
+                    }
+                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::OutboundFailure { error: libp2p::request_response::OutboundFailure::Timeout, .. })) if credential.is_some() => {
+                        let _ = auth_state.timeout(unix_now());
+                    }
+                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::OutboundFailure { error: libp2p::request_response::OutboundFailure::ConnectionClosed, .. })) if credential.is_some() => {
+                        auth_state.disconnected();
+                    }
                     SwarmEvent::Behaviour(PeerEvent::Relay(libp2p::relay::client::Event::ReservationReqAccepted { relay_peer_id: peer_id, renewal, .. })) => {
                         if let (Some(connection_id), Some(listener_id)) = (relay_connection_id, circuit_listener_id) {
                             reservation.apply(ReservationEvent::ReservationAccepted { generation: 1, peer_id, connection_id, listener_id, renewal }).map_err(io::Error::other)?;

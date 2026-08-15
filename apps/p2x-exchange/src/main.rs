@@ -156,13 +156,14 @@ async fn main() -> io::Result<()> {
                     let advertised = advertised.to_string();
                     emitter.emit(&LifecycleRecord::ListenerReady { listener_id: &listener_id, address: &advertised })?;
                 }
-                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, .. }, .. })) => {
+                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, .. }, connection_id, .. })) => {
                     let peer_name = peer.to_string();
-                    if admission.begin_auth(&peer_name, chrono_like_now()) != Admission::Accepted { continue; }
+                    let ip = connection_ips.get(&connection_id).map(String::as_str).unwrap_or("<unknown>");
+                    if admission.begin_auth_from(&peer_name, ip, chrono_like_now()) != Admission::Accepted { continue; }
                     let failed = matches!(&request, p2x_protocol::AuthRequest::Authenticate { .. });
                     let response = if let Some(provider) = provider.as_ref() { handle_request(provider, &mut sessions, &peer.to_string(), request, chrono_like_now()) } else { AuthResponse::Rejected { request_id: None, error: PublicError::new(PublicErrorCode::AuthSessionRequired, false) } };
                     let rejected = matches!(response, AuthResponse::Rejected { .. });
-                    admission.finish_auth(&peer_name, rejected && failed, chrono_like_now());
+                    admission.finish_auth_from(&peer_name, ip, rejected && failed, chrono_like_now());
                     swarm.behaviour_mut().auth.send_response(channel, response).map_err(|_| io::Error::other("auth response channel closed"))?;
                 },
                 SwarmEvent::Behaviour(event) => { let message = format!("{event:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "relay.event", message: &message })?; }

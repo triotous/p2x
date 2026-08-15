@@ -1,4 +1,5 @@
 pub mod auth_codec;
+pub mod auth_state;
 pub mod builder;
 pub mod connection_book;
 pub mod lifecycle;

@@ -14,6 +14,7 @@ pub enum SessionAction {
     Authenticated(AuthSession),
     Rejected(PublicErrorCode),
     Removed(String),
+    PrincipalRevoked(String),
 }
 pub struct AuthSessionLedger {
     sessions: HashMap<String, AuthSession>,
@@ -95,13 +96,35 @@ impl AuthSessionLedger {
             .remove(peer_id)
             .map(|_| SessionAction::Removed(peer_id.to_owned()))
     }
-    pub fn replace_snapshot(&mut self, provider: &FixedTokenProvider) {
-        self.sessions
-            .retain(|peer, session| provider.binding_matches(peer, &session.principal));
+    pub fn replace_snapshot(&mut self, provider: &FixedTokenProvider) -> Vec<SessionAction> {
+        let revoked = self
+            .sessions
+            .iter()
+            .filter(|(peer, session)| !provider.binding_matches(peer, &session.principal))
+            .map(|(peer, _)| peer.clone())
+            .collect::<Vec<_>>();
+        for peer in &revoked {
+            self.sessions.remove(peer);
+        }
+        revoked
+            .into_iter()
+            .map(SessionAction::PrincipalRevoked)
+            .collect()
     }
-    pub fn replace_revision(&mut self, revision: u64) {
-        self.sessions
-            .retain(|_, session| session.principal.authorization_revision >= revision);
+    pub fn replace_revision(&mut self, revision: u64) -> Vec<SessionAction> {
+        let revoked = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.principal.authorization_revision < revision)
+            .map(|(peer, _)| peer.clone())
+            .collect::<Vec<_>>();
+        for peer in &revoked {
+            self.sessions.remove(peer);
+        }
+        revoked
+            .into_iter()
+            .map(SessionAction::PrincipalRevoked)
+            .collect()
     }
     pub fn sweep(&mut self, now: i64) {
         self.sessions.retain(|_, session| session.expires_at > now);
@@ -158,7 +181,10 @@ mod tests {
             ledger.authenticate(principal(1), [1; 16], 1),
             SessionAction::Authenticated(_)
         ));
-        ledger.replace_revision(2);
+        assert_eq!(
+            ledger.replace_revision(2),
+            vec![SessionAction::PrincipalRevoked("peer".into())]
+        );
         assert_eq!(ledger.len(), 0);
         ledger.sweep(100);
         assert_eq!(ledger.len(), 0);

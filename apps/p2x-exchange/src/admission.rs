@@ -7,6 +7,8 @@ pub const MAX_FAILURE_BUCKETS: usize = 1024;
 pub const MAX_CONNECTIONS_PER_IP: usize = 8;
 pub const FAILURE_LIMIT: u32 = 10;
 pub const FAILURE_WINDOW: i64 = 60;
+pub const MAX_CONNECTIONS_PER_PEER: usize = 2;
+pub const MAX_INFLIGHT_PER_PEER: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Admission {
@@ -45,7 +47,7 @@ impl AdmissionLedger {
         self.admit_peer_connection_from(peer, "<unknown>")
     }
     pub fn admit_peer_connection_from(&mut self, peer: &str, ip: &str) -> Admission {
-        if self.peer_connections.get(peer).copied().unwrap_or(0) >= 2 {
+        if self.peer_connections.get(peer).copied().unwrap_or(0) >= MAX_CONNECTIONS_PER_PEER {
             self.connections = self.connections.saturating_sub(1);
             if let Some(n) = self.ip_connections.get_mut(ip) {
                 *n = n.saturating_sub(1);
@@ -77,25 +79,42 @@ impl AdmissionLedger {
         }
     }
     pub fn begin_auth(&mut self, peer: &str, now: i64) -> Admission {
+        self.begin_auth_from(peer, "<unknown>", now)
+    }
+    pub fn begin_auth_from(&mut self, peer: &str, ip: &str, now: i64) -> Admission {
         self.sweep(now);
         if self.inflight >= MAX_INFLIGHT {
             return Admission::Rejected(PublicErrorCode::LimitAuthRequests);
         }
-        if self.peer_inflight.get(peer).copied().unwrap_or(0) >= 1 {
+        if self.peer_inflight.get(peer).copied().unwrap_or(0) >= MAX_INFLIGHT_PER_PEER {
             return Admission::Rejected(PublicErrorCode::LimitAuthRequests);
         }
-        if self
-            .failures
-            .get(peer)
-            .is_some_and(|b| b.failures >= FAILURE_LIMIT)
-        {
-            return Admission::Rejected(PublicErrorCode::LimitAuthRequests);
+        for key in [Self::peer_failure_key(peer), Self::ip_failure_key(ip)] {
+            if self
+                .failures
+                .get(&key)
+                .is_some_and(|b| b.failures >= FAILURE_LIMIT)
+            {
+                return Admission::Rejected(PublicErrorCode::LimitAuthRequests);
+            }
+            if !self.failures.contains_key(&key) && self.failures.len() >= MAX_FAILURE_BUCKETS {
+                return Admission::Rejected(PublicErrorCode::ExchangeOverloaded);
+            }
         }
         self.inflight += 1;
         *self.peer_inflight.entry(peer.to_owned()).or_default() += 1;
         Admission::Accepted
     }
+    fn peer_failure_key(peer: &str) -> String {
+        format!("peer:{peer}")
+    }
+    fn ip_failure_key(ip: &str) -> String {
+        format!("ip:{ip}")
+    }
     pub fn finish_auth(&mut self, peer: &str, failed: bool, now: i64) {
+        self.finish_auth_from(peer, "<unknown>", failed, now);
+    }
+    pub fn finish_auth_from(&mut self, peer: &str, ip: &str, failed: bool, now: i64) {
         self.inflight = self.inflight.saturating_sub(1);
         if let Some(n) = self.peer_inflight.get_mut(peer) {
             *n = n.saturating_sub(1);
@@ -104,15 +123,17 @@ impl AdmissionLedger {
             }
         }
         if failed {
-            if !self.failures.contains_key(peer) && self.failures.len() >= MAX_FAILURE_BUCKETS {
-                return;
+            for key in [Self::peer_failure_key(peer), Self::ip_failure_key(ip)] {
+                if !self.failures.contains_key(&key) && self.failures.len() >= MAX_FAILURE_BUCKETS {
+                    continue;
+                }
+                let bucket = self.failures.entry(key).or_default();
+                if bucket.window != now / FAILURE_WINDOW {
+                    bucket.window = now / FAILURE_WINDOW;
+                    bucket.failures = 0;
+                }
+                bucket.failures = bucket.failures.saturating_add(1);
             }
-            let bucket = self.failures.entry(peer.to_owned()).or_default();
-            if bucket.window != now / FAILURE_WINDOW {
-                bucket.window = now / FAILURE_WINDOW;
-                bucket.failures = 0;
-            }
-            bucket.failures = bucket.failures.saturating_add(1);
         }
     }
     pub fn sweep(&mut self, now: i64) {
@@ -179,11 +200,13 @@ mod tests {
         );
         assert_eq!(a.begin_auth("p", FAILURE_WINDOW), Admission::Accepted);
         let mut bounded = AdmissionLedger::default();
-        for n in 0..MAX_FAILURE_BUCKETS {
-            bounded.finish_auth(&format!("peer{n}"), true, 0);
+        for n in 0..MAX_FAILURE_BUCKETS / 2 {
+            bounded.finish_auth_from(&format!("peer{n}"), &format!("ip{n}"), true, 0);
         }
         assert_eq!(bounded.failures.len(), MAX_FAILURE_BUCKETS);
-        bounded.finish_auth("overflow", true, 0);
-        assert_eq!(bounded.failures.len(), MAX_FAILURE_BUCKETS);
+        assert_eq!(
+            bounded.begin_auth_from("overflow", "overflow", 0),
+            Admission::Rejected(PublicErrorCode::ExchangeOverloaded)
+        );
     }
 }
