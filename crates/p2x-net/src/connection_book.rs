@@ -6,7 +6,6 @@ use std::{
 };
 
 pub type ConnectionId = Libp2pConnectionId;
-pub const MAX_PENDING_DCUTR: usize = 128;
 pub const MAX_CONNECTION_LIFECYCLES: usize = 512;
 pub const TOMBSTONE_TTL: Duration = Duration::from_secs(20);
 
@@ -81,16 +80,16 @@ impl ConnectionBook {
             return Ok(());
         }
         let path = classify_connected_point(endpoint);
-        if matches!(path, PathKind::Relay { .. })
-            && !self.valid_relay(endpoint.get_remote_address())
-        {
+        if endpoint.is_relayed() && !self.valid_relay(endpoint.get_remote_address()) {
             return Err(ConnectionBookError::WrongExchange);
         }
         if let Some(Lifecycle::Active(record)) = self.ledger.get_mut(&key) {
             record.closing = false;
             return Ok(());
         }
-        if self.ledger.len() >= MAX_CONNECTION_LIFECYCLES {
+        let replaces_pending =
+            matches!(self.ledger.get(&key), Some(Lifecycle::PendingDcutr { .. }));
+        if !replaces_pending && self.ledger.len() >= MAX_CONNECTION_LIFECYCLES {
             return Err(ConnectionBookError::Capacity);
         }
         self.next_sequence = self
@@ -152,24 +151,30 @@ impl ConnectionBook {
         );
         Ok(())
     }
-    pub fn on_connection_closed(&mut self, peer_id: PeerId, connection_id: ConnectionId) {
-        self.on_connection_closed_at(peer_id, connection_id, Instant::now());
+    pub fn on_connection_closed(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+    ) -> Result<(), ConnectionBookError> {
+        self.on_connection_closed_at(peer_id, connection_id, Instant::now())
     }
     pub fn on_connection_closed_at(
         &mut self,
         peer_id: PeerId,
         connection_id: ConnectionId,
         now: Instant,
-    ) {
+    ) -> Result<(), ConnectionBookError> {
         let key = (peer_id, connection_id);
-        if self.ledger.len() < MAX_CONNECTION_LIFECYCLES || self.ledger.contains_key(&key) {
-            self.ledger.insert(
-                key,
-                Lifecycle::Retired {
-                    expires_at: now + TOMBSTONE_TTL,
-                },
-            );
+        if self.ledger.len() >= MAX_CONNECTION_LIFECYCLES && !self.ledger.contains_key(&key) {
+            return Err(ConnectionBookError::Capacity);
         }
+        self.ledger.insert(
+            key,
+            Lifecycle::Retired {
+                expires_at: now + TOMBSTONE_TTL,
+            },
+        );
+        Ok(())
     }
     pub fn mark_ping(&mut self, peer_id: PeerId, connection_id: ConnectionId, now: Instant) {
         if let Some(Lifecycle::Active(r)) = self.ledger.get_mut(&(peer_id, connection_id)) {
@@ -233,10 +238,11 @@ impl ConnectionBook {
             .filter(|l| matches!(l, Lifecycle::Retired { .. }))
             .count()
     }
+    pub fn lifecycle_count(&self) -> usize {
+        self.ledger.len()
+    }
     fn valid_relay(&self, address: &Multiaddr) -> bool {
-        address
-            .iter()
-            .any(|p| matches!(p, Protocol::P2p(peer) if peer == self.expected_exchange))
+        relay_peer_before_circuit(address) == Some(self.expected_exchange)
     }
 }
 fn transport_rank(path: &PathKind) -> u8 {
@@ -251,21 +257,24 @@ pub fn classify_connected_point(endpoint: &ConnectedPoint) -> PathKind {
 }
 pub fn classify_path(address: &Multiaddr) -> PathKind {
     if address.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
-        address
-            .iter()
-            .find_map(|p| {
-                if let Protocol::P2p(peer) = p {
-                    Some(PathKind::Relay {
-                        exchange_peer_id: peer,
-                    })
-                } else {
-                    None
-                }
-            })
+        relay_peer_before_circuit(address)
+            .map(|exchange_peer_id| PathKind::Relay { exchange_peer_id })
             .unwrap_or(PathKind::UnknownDirect)
     } else {
         PathKind::Direct(classify_address(address))
     }
+}
+
+fn relay_peer_before_circuit(address: &Multiaddr) -> Option<PeerId> {
+    let mut relay = None;
+    for protocol in address.iter() {
+        match protocol {
+            Protocol::P2p(peer) => relay = Some(peer),
+            Protocol::P2pCircuit => return relay,
+            _ => {}
+        }
+    }
+    None
 }
 pub fn classify_address(address: &Multiaddr) -> TransportKind {
     if address.iter().any(|p| matches!(p, Protocol::QuicV1)) {
@@ -310,7 +319,7 @@ mod tests {
         let now = Instant::now();
         let peer = PeerId::random();
         let mut book = ConnectionBook::new(PeerId::random());
-        book.on_connection_closed_at(peer, id(1), now);
+        book.on_connection_closed_at(peer, id(1), now).unwrap();
         book.on_dcutr_succeeded(peer, id(1), now).unwrap();
         assert_eq!(book.pending_count(), 0);
         book.sweep(now + TOMBSTONE_TTL);
@@ -329,5 +338,50 @@ mod tests {
             ),
             Err(ConnectionBookError::WrongExchange)
         );
+    }
+
+    #[test]
+    fn relayed_endpoint_without_identity_is_rejected() {
+        let mut book = ConnectionBook::new(PeerId::random());
+        assert_eq!(
+            book.on_connection_established(
+                PeerId::random(),
+                id(1),
+                &endpoint("/ip4/127.0.0.1/tcp/1/p2p-circuit"),
+                Instant::now(),
+            ),
+            Err(ConnectionBookError::WrongExchange)
+        );
+    }
+
+    #[test]
+    fn pending_slot_can_become_active_at_capacity() {
+        let exchange = PeerId::random();
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let mut book = ConnectionBook::new(exchange);
+        for index in 0..MAX_CONNECTION_LIFECYCLES {
+            book.on_dcutr_succeeded(peer, id(index), now).unwrap();
+        }
+        assert_eq!(book.lifecycle_count(), MAX_CONNECTION_LIFECYCLES);
+        book.on_connection_established(peer, id(0), &endpoint("/ip4/127.0.0.1/tcp/1"), now)
+            .unwrap();
+        assert!(book.is_direct(peer, id(0)));
+        assert_eq!(book.lifecycle_count(), MAX_CONNECTION_LIFECYCLES);
+    }
+
+    #[test]
+    fn full_ledger_rejects_untracked_lifecycle_without_eviction() {
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let mut book = ConnectionBook::new(PeerId::random());
+        for index in 0..MAX_CONNECTION_LIFECYCLES {
+            book.on_connection_closed_at(peer, id(index), now).unwrap();
+        }
+        assert_eq!(
+            book.on_dcutr_succeeded(peer, id(MAX_CONNECTION_LIFECYCLES), now),
+            Err(ConnectionBookError::Capacity)
+        );
+        assert_eq!(book.tombstone_count(), MAX_CONNECTION_LIFECYCLES);
     }
 }

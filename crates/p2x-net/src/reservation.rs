@@ -3,10 +3,10 @@ use std::time::{Duration, Instant};
 
 pub const INITIAL_RETRY: Duration = Duration::from_millis(250);
 pub const MAX_RETRY: Duration = Duration::from_secs(10);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReservationState {
     Disconnected,
-    ExchangeDialing,
     ExchangeConnected,
     ReservationRequested,
     ReservationAccepted,
@@ -14,6 +14,7 @@ pub enum ReservationState {
     Ready,
     Degraded,
 }
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReservationEvent {
     GenerationStarted {
@@ -23,28 +24,77 @@ pub enum ReservationEvent {
     },
     ReservationRequested {
         generation: u64,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
     },
     ReservationAccepted {
         generation: u64,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
         listener_id: ListenerId,
         renewal: bool,
     },
     RelayAddressConfirmed {
         generation: u64,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        listener_id: ListenerId,
         address: Multiaddr,
     },
     ExchangeLost {
         generation: u64,
+        peer_id: PeerId,
         connection_id: ConnectionId,
     },
     ListenerClosed {
         generation: u64,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
         listener_id: ListenerId,
     },
     RelayAddressLost {
         generation: u64,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        listener_id: ListenerId,
+        address: Multiaddr,
+    },
+    RetryElapsed {
+        generation: u64,
+        attempt: u32,
     },
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReservationAction {
+    CreateCircuitListener {
+        generation: u64,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+    },
+    DialExchange {
+        generation: u64,
+    },
+    ScheduleRetry {
+        generation: u64,
+        attempt: u32,
+        deadline: Instant,
+    },
+    PublishReady {
+        generation: u64,
+        address: Multiaddr,
+    },
+    PublishDegraded {
+        generation: u64,
+    },
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum ReservationError {
+    #[error("generation {0} was reused with different identities")]
+    GenerationConflict(u64),
+}
+
 #[derive(Debug)]
 pub struct ReservationContext {
     pub generation: u64,
@@ -58,8 +108,10 @@ pub struct ReservationContext {
     pub renewal_count: u64,
     pub retry_attempt: u32,
     pub retry_deadline: Option<Instant>,
+    requested: bool,
     degraded: bool,
 }
+
 impl ReservationContext {
     pub fn new(generation: u64) -> Self {
         Self {
@@ -74,9 +126,11 @@ impl ReservationContext {
             renewal_count: 0,
             retry_attempt: 0,
             retry_deadline: None,
+            requested: false,
             degraded: false,
         }
     }
+
     pub fn phase(&self) -> ReservationState {
         if self.degraded {
             ReservationState::Degraded
@@ -86,164 +140,389 @@ impl ReservationContext {
             ReservationState::ReservationAccepted
         } else if self.address_confirmed {
             ReservationState::RelayAddressConfirmed
-        } else {
+        } else if self.requested {
+            ReservationState::ReservationRequested
+        } else if self.exchange_connection_id.is_some() {
             ReservationState::ExchangeConnected
+        } else {
+            ReservationState::Disconnected
         }
     }
+
     pub fn is_ready(&self) -> bool {
         !self.degraded && self.accepted && self.address_confirmed
     }
-    pub fn apply_at(&mut self, event: ReservationEvent, now: Instant) {
+
+    pub fn apply(
+        &mut self,
+        event: ReservationEvent,
+    ) -> Result<Vec<ReservationAction>, ReservationError> {
+        self.apply_at(event, Instant::now(), 0)
+    }
+
+    pub fn apply_at(
+        &mut self,
+        event: ReservationEvent,
+        now: Instant,
+        jitter_per_mille: i16,
+    ) -> Result<Vec<ReservationAction>, ReservationError> {
         match event {
             ReservationEvent::GenerationStarted {
                 generation,
                 peer_id,
                 connection_id,
-            } if generation >= self.generation => {
-                self.generation = generation;
-                self.exchange_peer_id = Some(peer_id);
-                self.exchange_connection_id = Some(connection_id);
-                self.listener_id = None;
-                self.canonical_address = None;
-                self.accepted = false;
-                self.address_confirmed = false;
-                self.last_acceptance = None;
-                self.renewal_count = 0;
-                self.degraded = false;
-                self.retry_attempt = 0;
-                self.retry_deadline = None;
+            } => self.start_generation(generation, peer_id, connection_id),
+            ReservationEvent::ReservationRequested {
+                generation,
+                peer_id,
+                connection_id,
+            } if self.matches(generation, peer_id, connection_id) => {
+                self.requested = true;
+                Ok(vec![])
             }
-            ReservationEvent::ReservationRequested { .. } => {}
             ReservationEvent::ReservationAccepted {
                 generation,
+                peer_id,
+                connection_id,
                 listener_id,
                 renewal,
-            } if generation == self.generation => {
+            } if self.matches(generation, peer_id, connection_id)
+                && self
+                    .listener_id
+                    .is_none_or(|current| current == listener_id) =>
+            {
+                let was_ready = self.is_ready();
                 self.listener_id = Some(listener_id);
                 self.accepted = true;
                 self.last_acceptance = Some(now);
                 if renewal {
-                    self.renewal_count += 1;
+                    self.renewal_count = self.renewal_count.saturating_add(1);
                 }
+                Ok(self.publish_if_ready(was_ready))
             }
             ReservationEvent::RelayAddressConfirmed {
                 generation,
+                peer_id,
+                connection_id,
+                listener_id,
                 address,
-            } if generation == self.generation => {
+            } if self.matches(generation, peer_id, connection_id)
+                && self
+                    .listener_id
+                    .is_none_or(|current| current == listener_id) =>
+            {
+                let was_ready = self.is_ready();
+                self.listener_id = Some(listener_id);
                 self.canonical_address = Some(address);
                 self.address_confirmed = true;
-                self.degraded = false;
-                if self.accepted {
-                    self.retry_attempt = 0;
-                    self.retry_deadline = None;
-                }
+                Ok(self.publish_if_ready(was_ready))
             }
             ReservationEvent::ExchangeLost {
                 generation,
+                peer_id,
                 connection_id,
-            } if generation == self.generation
-                && self.exchange_connection_id == Some(connection_id) =>
-            {
-                self.degrade(now)
+            } if self.matches(generation, peer_id, connection_id) => {
+                self.exchange_connection_id = None;
+                self.listener_id = None;
+                self.canonical_address = None;
+                self.accepted = false;
+                self.address_confirmed = false;
+                Ok(self.degrade(now, jitter_per_mille))
             }
             ReservationEvent::ListenerClosed {
                 generation,
+                peer_id,
+                connection_id,
                 listener_id,
-            } if generation == self.generation && self.listener_id == Some(listener_id) => {
-                self.degrade(now)
+            } if self.matches(generation, peer_id, connection_id)
+                && self.listener_id == Some(listener_id) =>
+            {
+                self.listener_id = None;
+                self.canonical_address = None;
+                self.accepted = false;
+                self.address_confirmed = false;
+                Ok(self.degrade(now, jitter_per_mille))
             }
-            ReservationEvent::RelayAddressLost { generation } if generation == self.generation => {
-                self.degrade(now)
+            ReservationEvent::RelayAddressLost {
+                generation,
+                peer_id,
+                connection_id,
+                listener_id,
+                address,
+            } if self.matches(generation, peer_id, connection_id)
+                && self.listener_id == Some(listener_id)
+                && self.canonical_address.as_ref() == Some(&address) =>
+            {
+                self.canonical_address = None;
+                self.address_confirmed = false;
+                Ok(self.degrade(now, jitter_per_mille))
             }
-            _ => {}
+            ReservationEvent::RetryElapsed {
+                generation,
+                attempt,
+            } if generation == self.generation
+                && self.retry_attempt == attempt
+                && self.retry_deadline.is_some_and(|deadline| now >= deadline) =>
+            {
+                self.retry_deadline = None;
+                if let (Some(peer_id), Some(connection_id)) =
+                    (self.exchange_peer_id, self.exchange_connection_id)
+                {
+                    Ok(vec![ReservationAction::CreateCircuitListener {
+                        generation,
+                        peer_id,
+                        connection_id,
+                    }])
+                } else {
+                    Ok(vec![ReservationAction::DialExchange { generation }])
+                }
+            }
+            _ => Ok(vec![]),
         }
     }
-    pub fn apply(&mut self, event: ReservationEvent) {
-        self.apply_at(event, Instant::now());
-    }
-    pub fn retry_delay(&self, jitter_per_mille: u16) -> Duration {
+
+    pub fn retry_delay(&self, jitter_per_mille: i16) -> Duration {
+        let exponent = self.retry_attempt.saturating_sub(1).min(31);
         let base = INITIAL_RETRY
-            .saturating_mul(2u32.saturating_pow(self.retry_attempt.saturating_sub(1)))
+            .saturating_mul(2u32.saturating_pow(exponent))
             .min(MAX_RETRY);
-        let jitter = base.mul_f64((jitter_per_mille.min(200) as f64) / 1000.0);
-        base + jitter
+        let jitter = i32::from(jitter_per_mille.clamp(-200, 200));
+        let micros = base.as_micros() as i128;
+        let adjusted = micros + (micros * i128::from(jitter) / 1000);
+        Duration::from_micros(adjusted.max(0).min(u64::MAX as i128) as u64)
     }
 
-    fn degrade(&mut self, now: Instant) {
+    fn start_generation(
+        &mut self,
+        generation: u64,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+    ) -> Result<Vec<ReservationAction>, ReservationError> {
+        if generation < self.generation {
+            return Ok(vec![]);
+        }
+        if generation == self.generation {
+            match (self.exchange_peer_id, self.exchange_connection_id) {
+                (None, None) => {}
+                (Some(current_peer), Some(current_connection))
+                    if current_peer == peer_id && current_connection == connection_id =>
+                {
+                    return Ok(vec![]);
+                }
+                _ => return Err(ReservationError::GenerationConflict(generation)),
+            }
+        }
+        self.generation = generation;
+        self.exchange_peer_id = Some(peer_id);
+        self.exchange_connection_id = Some(connection_id);
+        self.listener_id = None;
+        self.canonical_address = None;
+        self.accepted = false;
+        self.address_confirmed = false;
+        self.last_acceptance = None;
+        self.renewal_count = 0;
+        self.retry_attempt = 0;
+        self.retry_deadline = None;
+        self.requested = false;
+        self.degraded = false;
+        Ok(vec![ReservationAction::CreateCircuitListener {
+            generation,
+            peer_id,
+            connection_id,
+        }])
+    }
+
+    fn matches(&self, generation: u64, peer_id: PeerId, connection_id: ConnectionId) -> bool {
+        generation == self.generation
+            && self.exchange_peer_id == Some(peer_id)
+            && self.exchange_connection_id == Some(connection_id)
+    }
+
+    fn publish_if_ready(&mut self, was_ready: bool) -> Vec<ReservationAction> {
+        if !self.accepted || !self.address_confirmed {
+            return vec![];
+        }
+        self.degraded = false;
+        self.retry_attempt = 0;
+        self.retry_deadline = None;
+        if !was_ready && let Some(address) = self.canonical_address.clone() {
+            return vec![ReservationAction::PublishReady {
+                generation: self.generation,
+                address,
+            }];
+        }
+        vec![]
+    }
+
+    fn degrade(&mut self, now: Instant, jitter_per_mille: i16) -> Vec<ReservationAction> {
+        if self.degraded && self.retry_deadline.is_some() {
+            return vec![];
+        }
+        let first_degradation = !self.degraded;
         self.degraded = true;
         self.retry_attempt = self.retry_attempt.saturating_add(1);
-        self.retry_deadline = Some(now + self.retry_delay(0));
+        let deadline = now + self.retry_delay(jitter_per_mille);
+        self.retry_deadline = Some(deadline);
+        let mut actions = Vec::new();
+        if first_degradation {
+            actions.push(ReservationAction::PublishDegraded {
+                generation: self.generation,
+            });
+        }
+        actions.push(ReservationAction::ScheduleRetry {
+            generation: self.generation,
+            attempt: self.retry_attempt,
+            deadline,
+        });
+        actions
     }
 }
-pub fn transition(state: ReservationState, event: ReservationEvent) -> ReservationState {
-    let mut c = ReservationContext::new(0);
-    c.degraded = state == ReservationState::Degraded;
-    c.apply(event);
-    c.phase()
-}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn p() -> PeerId {
-        PeerId::random()
+
+    fn id(value: usize) -> ConnectionId {
+        ConnectionId::new_unchecked(value)
     }
-    fn id(n: u8) -> ConnectionId {
-        ConnectionId::new_unchecked(n as usize)
+
+    struct Fixture {
+        peer: PeerId,
+        connection: ConnectionId,
+        listener: ListenerId,
+        address: Multiaddr,
     }
-    fn ready(c: &mut ReservationContext) {
-        c.apply(ReservationEvent::GenerationStarted {
-            generation: 1,
-            peer_id: p(),
-            connection_id: id(1),
-        });
-        c.apply(ReservationEvent::ReservationAccepted {
-            generation: 1,
-            listener_id: ListenerId::next(),
-            renewal: false,
-        });
-        c.apply(ReservationEvent::RelayAddressConfirmed {
-            generation: 1,
+
+    fn fixture() -> Fixture {
+        Fixture {
+            peer: PeerId::random(),
+            connection: id(1),
+            listener: ListenerId::next(),
             address: "/ip4/127.0.0.1/tcp/1/p2p-circuit".parse().unwrap(),
-        });
-    }
-    #[test]
-    fn readiness_is_generation_scoped() {
-        let mut c = ReservationContext::new(0);
-        ready(&mut c);
-        assert!(c.is_ready());
-        c.apply(ReservationEvent::GenerationStarted {
-            generation: 2,
-            peer_id: p(),
-            connection_id: id(3),
-        });
-        assert!(!c.is_ready());
-    }
-    #[test]
-    fn stale_loss_does_not_degrade_new_generation() {
-        let mut c = ReservationContext::new(2);
-        c.apply(ReservationEvent::GenerationStarted {
-            generation: 2,
-            peer_id: p(),
-            connection_id: id(1),
-        });
-        c.apply(ReservationEvent::ExchangeLost {
-            generation: 1,
-            connection_id: id(1),
-        });
-        assert!(!c.degraded);
-    }
-    #[test]
-    fn retry_is_bounded() {
-        let mut c = ReservationContext::new(1);
-        c.apply(ReservationEvent::GenerationStarted {
-            generation: 1,
-            peer_id: p(),
-            connection_id: id(1),
-        });
-        let now = Instant::now();
-        for _ in 0..20 {
-            c.apply_at(ReservationEvent::RelayAddressLost { generation: 1 }, now);
         }
-        assert!(c.retry_deadline.unwrap() <= now + MAX_RETRY);
+    }
+
+    fn start(context: &mut ReservationContext, fixture: &Fixture) {
+        context
+            .apply(ReservationEvent::GenerationStarted {
+                generation: 1,
+                peer_id: fixture.peer,
+                connection_id: fixture.connection,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn acceptance_and_address_commute_and_renewal_does_not_flap() {
+        let fixture = fixture();
+        let mut context = ReservationContext::new(0);
+        start(&mut context, &fixture);
+        context
+            .apply(ReservationEvent::RelayAddressConfirmed {
+                generation: 1,
+                peer_id: fixture.peer,
+                connection_id: fixture.connection,
+                listener_id: fixture.listener,
+                address: fixture.address.clone(),
+            })
+            .unwrap();
+        context
+            .apply(ReservationEvent::ReservationAccepted {
+                generation: 1,
+                peer_id: fixture.peer,
+                connection_id: fixture.connection,
+                listener_id: fixture.listener,
+                renewal: false,
+            })
+            .unwrap();
+        assert!(context.is_ready());
+        context
+            .apply(ReservationEvent::ReservationAccepted {
+                generation: 1,
+                peer_id: fixture.peer,
+                connection_id: fixture.connection,
+                listener_id: fixture.listener,
+                renewal: true,
+            })
+            .unwrap();
+        assert!(context.is_ready());
+        assert_eq!(context.renewal_count, 1);
+    }
+
+    #[test]
+    fn identical_generation_is_idempotent_but_conflict_fails() {
+        let fixture = fixture();
+        let mut context = ReservationContext::new(0);
+        start(&mut context, &fixture);
+        assert!(
+            context
+                .apply(ReservationEvent::GenerationStarted {
+                    generation: 1,
+                    peer_id: fixture.peer,
+                    connection_id: fixture.connection,
+                })
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            context.apply(ReservationEvent::GenerationStarted {
+                generation: 1,
+                peer_id: PeerId::random(),
+                connection_id: fixture.connection,
+            }),
+            Err(ReservationError::GenerationConflict(1))
+        );
+    }
+
+    #[test]
+    fn duplicate_loss_schedules_only_one_retry() {
+        let fixture = fixture();
+        let now = Instant::now();
+        let mut context = ReservationContext::new(0);
+        start(&mut context, &fixture);
+        let loss = ReservationEvent::ListenerClosed {
+            generation: 1,
+            peer_id: fixture.peer,
+            connection_id: fixture.connection,
+            listener_id: fixture.listener,
+        };
+        context.listener_id = Some(fixture.listener);
+        let first = context.apply_at(loss.clone(), now, 0).unwrap();
+        let second = context.apply_at(loss, now, 0).unwrap();
+        assert_eq!(context.retry_attempt, 1);
+        assert!(matches!(
+            first.as_slice(),
+            [
+                ReservationAction::PublishDegraded { .. },
+                ReservationAction::ScheduleRetry { .. }
+            ]
+        ));
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn jitter_covers_both_sides_and_is_capped() {
+        let mut context = ReservationContext::new(1);
+        context.retry_attempt = 1;
+        assert_eq!(context.retry_delay(-200), Duration::from_millis(200));
+        assert_eq!(context.retry_delay(200), Duration::from_millis(300));
+        context.retry_attempt = 20;
+        assert_eq!(context.retry_delay(0), MAX_RETRY);
+    }
+
+    #[test]
+    fn stale_retry_cannot_replace_current_generation() {
+        let fixture = fixture();
+        let mut context = ReservationContext::new(0);
+        start(&mut context, &fixture);
+        assert!(
+            context
+                .apply(ReservationEvent::RetryElapsed {
+                    generation: 0,
+                    attempt: 1,
+                })
+                .unwrap()
+                .is_empty()
+        );
     }
 }

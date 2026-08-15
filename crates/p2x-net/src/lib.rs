@@ -14,4 +14,6 @@ pub use path_selector::{
     AttemptId, PathAction, PathAttempt, PathDecision, PathEvent, PathEventKind, PathFailure,
     PathState,
 };
-pub use reservation::{ReservationContext, ReservationEvent, ReservationState};
+pub use reservation::{
+    ReservationAction, ReservationContext, ReservationError, ReservationEvent, ReservationState,
+};
