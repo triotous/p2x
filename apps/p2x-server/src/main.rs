@@ -2,7 +2,9 @@ use clap::Parser;
 use futures::StreamExt;
 use libp2p::{Multiaddr, multiaddr::Protocol, swarm::SwarmEvent};
 use p2x_net::{
+    ReservationContext, ReservationEvent,
     builder::{PeerEvent, PeerSwarmConfig, build_peer_swarm, lab_identity, start_peer_listeners},
+    connection_book::ConnectionBook,
     lifecycle::{
         ConnectionState, Emitter, LifecycleRecord, ReservationState as LifecycleReservationState,
         TerminalResult, stable_hash,
@@ -53,6 +55,9 @@ async fn main() -> io::Result<()> {
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
     start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
     let mut relay_peer_id = None;
+    let mut relay_connection_id = None;
+    let mut circuit_listener_id = None;
+    let mut reservation = ReservationContext::new(0);
     let mut pending_circuit = None;
     let mut reservation_requested = false;
     let mut connection_paths = HashMap::new();
@@ -88,8 +93,10 @@ async fn main() -> io::Result<()> {
             listener_id: None,
             address: Some(&circuit),
             generation: 1,
+            renewal: false,
         })?;
     }
+    let mut connection_book = relay_peer_id.map(ConnectionBook::new);
     let local_peer = swarm.local_peer_id().to_string();
     emitter.emit(&LifecycleRecord::Started {
         peer_id: &local_peer,
@@ -98,7 +105,9 @@ async fn main() -> io::Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = resource_tick.tick() => {
-                emitter.emit(&LifecycleRecord::Resources { connections: connection_paths.len(), pending_opens: swarm.behaviour().probe_stream.pending_count(), workers: worker_admission.admitted(), tasks: worker_admission.admitted() })?;
+                if let Some(book) = connection_book.as_mut() { book.sweep(std::time::Instant::now()); }
+                let connections = connection_book.as_ref().map(ConnectionBook::len).unwrap_or(connection_paths.len());
+                emitter.emit(&LifecycleRecord::Resources { connections, pending_opens: swarm.behaviour().probe_stream.pending_count(), workers: worker_admission.admitted(), tasks: worker_admission.admitted() })?;
             }
             Some(worker) = worker_rx.recv() => {
                 let released = worker_admission.release(worker.peer_id);
@@ -118,12 +127,15 @@ async fn main() -> io::Result<()> {
                         let listener = format!("{listener_id:?}");
                         let address = address.to_string();
                         emitter.emit(&LifecycleRecord::ListenerReady { listener_id: &listener, address: &address })?;
+                        if address.contains("p2p-circuit") && let (Some(peer_id), Some(connection_id)) = (relay_peer_id, relay_connection_id) {
+                            reservation.apply(ReservationEvent::RelayAddressConfirmed { generation: 1, peer_id, connection_id, listener_id, address: address.parse().map_err(io::Error::other)? }).map_err(io::Error::other)?;
+                        }
                     }
                     SwarmEvent::ExternalAddrConfirmed { address } => {
                         if address.to_string().contains("p2p-circuit") {
                             let relay = relay_peer_id.map(|peer| peer.to_string()).unwrap_or_default();
                             let address = address.to_string();
-                            emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Ready, exchange_peer_id: &relay, listener_id: None, address: Some(&address), generation: 1 })?;
+                            emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Ready, exchange_peer_id: &relay, listener_id: None, address: Some(&address), generation: 1, renewal: false })?;
                         }
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
@@ -132,6 +144,11 @@ async fn main() -> io::Result<()> {
                         } else {
                             p2x_net::probe::ProbePath::Direct
                         };
+                        if let Some(book) = connection_book.as_mut() && let Err(error) = book.on_connection_established(peer_id, connection_id, &endpoint, std::time::Instant::now()) {
+                            swarm.close_connection(connection_id);
+                            let message = error.to_string(); emitter.emit(&LifecycleRecord::OperationalError { code: "connection.rejected", message: &message })?;
+                            continue;
+                        }
                         connection_paths.insert(connection_id, path);
                         let peer = peer_id.to_string();
                         emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Established, path: Some(path), reason: None })?;
@@ -139,13 +156,22 @@ async fn main() -> io::Result<()> {
                             && !reservation_requested
                             && let Some(address) = pending_circuit.clone()
                         {
-                            swarm.listen_on(address).map_err(io::Error::other)?;
+                            relay_connection_id = Some(connection_id);
+                            reservation.apply(ReservationEvent::GenerationStarted { generation: 1, peer_id, connection_id }).map_err(io::Error::other)?;
+                            let listener_id = swarm.listen_on(address).map_err(io::Error::other)?;
+                            circuit_listener_id = Some(listener_id);
+                            reservation.apply(ReservationEvent::ReservationRequested { generation: 1, peer_id, connection_id }).map_err(io::Error::other)?;
                             reservation_requested = true;
                             let relay = peer_id.to_string();
-                            emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Requested, exchange_peer_id: &relay, listener_id: None, address: None, generation: 1 })?;
+                            emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Requested, exchange_peer_id: &relay, listener_id: None, address: None, generation: 1, renewal: false })?;
                         }
                     }
                     SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => {
+                        if relay_peer_id == Some(peer_id) && relay_connection_id == Some(connection_id) {
+                            reservation.apply(ReservationEvent::ExchangeLost { generation: 1, peer_id, connection_id }).map_err(io::Error::other)?;
+                            emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Degraded, exchange_peer_id: &peer_id.to_string(), listener_id: circuit_listener_id.as_ref().map(|_| "circuit"), address: None, generation: 1, renewal: false })?;
+                        }
+                        if let Some(book) = connection_book.as_mut() { book.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?; }
                         connection_paths.remove(&connection_id);
                         let peer = peer_id.to_string();
                         let reason = format!("{cause:?}");
@@ -161,13 +187,14 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::ListenerClosed { reason, .. } => {
                         let message = format!("{reason:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "listener.closed", message: &message })?;
                     }
-                    SwarmEvent::Behaviour(PeerEvent::Relay(relay_event)) => {
-                        let accepted = matches!(relay_event, libp2p::relay::client::Event::ReservationReqAccepted { .. });
-                        if accepted {
-                            let relay = relay_peer_id.map(|peer| peer.to_string()).unwrap_or_default();
-                            emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Accepted, exchange_peer_id: &relay, listener_id: None, address: None, generation: 1 })?;
+                    SwarmEvent::Behaviour(PeerEvent::Relay(libp2p::relay::client::Event::ReservationReqAccepted { relay_peer_id: peer_id, renewal, .. })) => {
+                        if let (Some(connection_id), Some(listener_id)) = (relay_connection_id, circuit_listener_id) {
+                            reservation.apply(ReservationEvent::ReservationAccepted { generation: 1, peer_id, connection_id, listener_id, renewal }).map_err(io::Error::other)?;
+                            let relay = peer_id.to_string();
+                            emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Accepted, exchange_peer_id: &relay, listener_id: Some("circuit"), address: None, generation: 1, renewal })?;
                         }
                     }
+                    SwarmEvent::Behaviour(PeerEvent::Relay(_)) => {}
                     SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundOpened { mut stream, peer_id, connection_id })) => {
                         let path = connection_paths.get(&connection_id).copied().unwrap_or(ProbePath::Relay);
                         if let Err(error) = worker_admission.admit(peer_id) {
@@ -187,6 +214,9 @@ async fn main() -> io::Result<()> {
                         emitter.emit(&LifecycleRecord::OperationalError { code: "probe.inbound_rejected", message: code })?;
                     }
                     SwarmEvent::Behaviour(PeerEvent::Dcutr(event)) => {
+                        if let Ok(connection_id) = event.result && let Some(book) = connection_book.as_mut() {
+                            book.on_dcutr_succeeded(event.remote_peer_id, connection_id, std::time::Instant::now()).map_err(io::Error::other)?;
+                        }
                         let message = format!("{event:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "dcutr.event", message: &message })?;
                     }
                     SwarmEvent::Behaviour(PeerEvent::Identify(event)) => {

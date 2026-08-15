@@ -79,8 +79,9 @@ impl ConnectionBook {
         if matches!(self.ledger.get(&key), Some(Lifecycle::Retired { .. })) {
             return Ok(());
         }
-        let path = classify_connected_point(endpoint);
-        if endpoint.is_relayed() && !self.valid_relay(endpoint.get_remote_address()) {
+        let authoritative_address = authoritative_path_address(endpoint);
+        let path = classify_path(authoritative_address);
+        if endpoint.is_relayed() && !self.valid_relay(authoritative_address) {
             return Err(ConnectionBookError::WrongExchange);
         }
         if let Some(Lifecycle::Active(record)) = self.ledger.get_mut(&key) {
@@ -110,7 +111,7 @@ impl ConnectionBook {
                 } else {
                     EndpointRole::Listener
                 },
-                endpoint_address: endpoint.get_remote_address().clone(),
+                endpoint_address: authoritative_address.clone(),
                 path,
                 sequence: self.next_sequence,
                 established_at: now,
@@ -253,7 +254,23 @@ fn transport_rank(path: &PathKind) -> u8 {
     }
 }
 pub fn classify_connected_point(endpoint: &ConnectedPoint) -> PathKind {
-    classify_path(endpoint.get_remote_address())
+    classify_path(authoritative_path_address(endpoint))
+}
+
+fn authoritative_path_address(endpoint: &ConnectedPoint) -> &Multiaddr {
+    match endpoint {
+        ConnectedPoint::Dialer { address, .. } => address,
+        ConnectedPoint::Listener {
+            local_addr,
+            send_back_addr: _,
+        } if local_addr
+            .iter()
+            .any(|protocol| matches!(protocol, Protocol::P2pCircuit)) =>
+        {
+            local_addr
+        }
+        ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
+    }
 }
 pub fn classify_path(address: &Multiaddr) -> PathKind {
     if address.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
@@ -294,6 +311,12 @@ mod tests {
             address: address.parse().unwrap(),
             role_override: libp2p::core::Endpoint::Dialer,
             port_use: libp2p::core::transport::PortUse::New,
+        }
+    }
+    fn listener_endpoint(local_addr: &str, remote_addr: &str) -> ConnectedPoint {
+        ConnectedPoint::Listener {
+            local_addr: local_addr.parse().unwrap(),
+            send_back_addr: remote_addr.parse().unwrap(),
         }
     }
     fn id(n: usize) -> ConnectionId {
@@ -352,6 +375,26 @@ mod tests {
             ),
             Err(ConnectionBookError::WrongExchange)
         );
+    }
+
+    #[test]
+    fn relayed_listener_validates_its_authoritative_local_circuit() {
+        let exchange = PeerId::random();
+        let peer = PeerId::random();
+        let address = format!("/ip4/127.0.0.1/tcp/1/p2p/{exchange}/p2p-circuit");
+        let remote = format!("/p2p/{peer}");
+        let mut book = ConnectionBook::new(exchange);
+        book.on_connection_established(
+            peer,
+            id(1),
+            &listener_endpoint(&address, &remote),
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            book.get(peer, id(1)).unwrap().path,
+            PathKind::Relay { .. }
+        ));
     }
 
     #[test]

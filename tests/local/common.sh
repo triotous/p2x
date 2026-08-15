@@ -42,10 +42,13 @@ start_services() {
   [[ -n "${circuit_addr:-}" ]] || { echo 'server relay circuit did not become ready' >&2; return 2; }
   local client_args=(--identity-seed 3 --server "$circuit_addr")
   case "$case_id" in
-    C10-concurrency) client_args+=(--count 8) ;;
-    C11-large-transfer) client_args+=(--mode slow_reader --length 268435456) ;;
-    C12-renewal) client_args+=(--count 1) ;;
-    C13-churn) client_args+=(--count 100 --churn) ;;
+    C01) ;;
+    C01-smoke) client_args+=(--path relay) ;;
+    C06|C06-relay) client_args+=(--path relay) ;;
+    C10|C10-concurrency) client_args+=(--count "${P2X_STREAMS:-8}" --concurrency "${P2X_STREAMS:-8}") ;;
+    C11|C11-large-transfer) client_args+=(--mode slow_reader --length "${P2X_BYTES:-268435456}" --path "${P2X_PATH:-relay}") ;;
+    C12|C12-renewal) client_args+=(--count 1 --path relay) ;;
+    C13|C13-churn) client_args+=(--count "${P2X_ITERATIONS:-100}" --churn --path relay) ;;
     C05-direct)
       server_peer=$(sed -n 's/.*"event":"started","peer_id":"\([^"]*\)".*/\1/p' "$OUT/server.ndjson" | head -1)
       direct_addr=$(sed -n 's/.*"event":"listener_ready".*"address":"\([^" ]*\/tcp\/[^" ]*\)".*/\1/p' "$OUT/server.ndjson" | head -1)
@@ -61,26 +64,26 @@ run_local_case() {
   start_services "$case_id"
   local expected=1
   case "$case_id" in
-    C10-concurrency) expected=8 ;;
-    C11-large-transfer) expected=1 ;;
-    C12-renewal) expected=1 ;;
-    C13-churn) expected=100 ;;
+    C10|C10-concurrency) expected=${P2X_STREAMS:-8} ;;
+    C11|C11-large-transfer) expected=1 ;;
+    C12|C12-renewal) expected=1 ;;
+    C13|C13-churn) expected=${P2X_ITERATIONS:-100} ;;
   esac
   local client_path=Relay
-  [[ "$case_id" == C05-direct ]] && client_path=Direct
+  [[ "$case_id" == C01 || "$case_id" == C05-direct || "$case_id" == C07 || "$case_id" == C10 || "$case_id" == C10-concurrency ]] && client_path=Direct
   local wait_loops=300
-  [[ "$case_id" == C11-large-transfer ]] && wait_loops=1800
-  [[ "$case_id" == C12-renewal ]] && wait_loops=700
-  [[ "$case_id" == C13-churn ]] && wait_loops=1800
+  [[ "$case_id" == C11 || "$case_id" == C11-large-transfer ]] && wait_loops=3600
+  [[ "$case_id" == C12 || "$case_id" == C12-renewal ]] && wait_loops=700
+  [[ "$case_id" == C13 || "$case_id" == C13-churn ]] && wait_loops=1800
   for _ in $(seq 1 "$wait_loops"); do
     local succeeded observed terminals
     succeeded=$(grep -c '"event":"probe_completed"' "$OUT/client.ndjson" || true)
     observed=$(grep -c '"event":"probe_completed"' "$OUT/server.ndjson" || true)
     terminals=$(grep -c '"event":"terminal"' "$OUT/client.ndjson" || true)
     local lifecycle_ok=true
-    [[ "$case_id" == C12-renewal ]] && grep -q '"renewal":true' "$OUT/server.ndjson" || true
-    if [[ "$case_id" == C12-renewal ]] && ! grep -q '"renewal":true' "$OUT/server.ndjson"; then lifecycle_ok=false; fi
-    if [[ "$case_id" == C13-churn ]] && [[ $(grep -c '"state":"closed"' "$OUT/client.ndjson" || true) -lt 1 ]]; then lifecycle_ok=false; fi
+    [[ "$case_id" == C12 || "$case_id" == C12-renewal ]] && grep -q '"renewal":true' "$OUT/server.ndjson" || true
+    if [[ "$case_id" == C12 || "$case_id" == C12-renewal ]] && ! grep -q '"renewal":true' "$OUT/server.ndjson"; then lifecycle_ok=false; fi
+    if [[ "$case_id" == C13 || "$case_id" == C13-churn ]] && [[ $(grep -c '"state":"closed"' "$OUT/client.ndjson" || true) -lt 1 ]]; then lifecycle_ok=false; fi
     local json_path
     json_path=$(printf '%s' "$client_path" | tr '[:upper:]' '[:lower:]')
     if [[ "$succeeded" -ge "$expected" && "$observed" -ge "$expected" && "$terminals" -eq 1 && "$lifecycle_ok" == true ]] && grep -q "\"path\":\"$json_path\"" "$OUT/client.ndjson" && grep -q "\"path\":\"$json_path\"" "$OUT/server.ndjson"; then

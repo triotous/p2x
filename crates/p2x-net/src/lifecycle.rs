@@ -47,6 +47,7 @@ pub enum LifecycleRecord<'a> {
         listener_id: Option<&'a str>,
         address: Option<&'a str>,
         generation: u64,
+        renewal: bool,
     },
     PathSelected {
         request_id: u64,
