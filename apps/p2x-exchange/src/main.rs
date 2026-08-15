@@ -1,7 +1,3 @@
-#[cfg(test)]
-mod auth_sessions;
-#[cfg(test)]
-mod authn;
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use libp2p::{Multiaddr, swarm::SwarmEvent};

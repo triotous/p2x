@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 p2x-protocol = { path = "../../crates/p2x-protocol" }
 thiserror.workspace = true
