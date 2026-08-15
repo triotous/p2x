@@ -17,6 +17,16 @@ pub fn decode_auth_request(bytes: &[u8]) -> io::Result<AuthRequest> {
 pub fn decode_auth_response(bytes: &[u8]) -> io::Result<AuthResponse> {
     decode_response(bytes)
 }
+pub fn decode_auth_frame(frame: &[u8]) -> io::Result<AuthRequest> {
+    if frame.len() < 4 {
+        return Err(invalid());
+    }
+    let n = u32::from_be_bytes(frame[..4].try_into().map_err(|_| invalid())?) as usize;
+    if n == 0 || n > MAX_AUTH_FRAME || frame.len() != n + 4 {
+        return Err(invalid());
+    }
+    decode_request(&frame[4..])
+}
 
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "malformed auth message")

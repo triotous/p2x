@@ -35,6 +35,7 @@ impl AdmissionLedger {
     }
     pub fn admit_peer_connection(&mut self, peer: &str) -> Admission {
         if self.peer_connections.get(peer).copied().unwrap_or(0) >= 2 {
+            self.connections = self.connections.saturating_sub(1);
             return Admission::Rejected(PublicErrorCode::LimitAuthConnections);
         }
         *self.peer_connections.entry(peer.to_owned()).or_default() += 1;
@@ -92,6 +93,9 @@ impl AdmissionLedger {
     pub fn connections(&self) -> usize {
         self.connections
     }
+    pub fn peer_connections(&self, peer: &str) -> usize {
+        self.peer_connections.get(peer).copied().unwrap_or(0)
+    }
     pub fn inflight(&self) -> usize {
         self.inflight
     }
@@ -110,6 +114,18 @@ mod tests {
             Admission::Rejected(PublicErrorCode::LimitAuthConnections)
         );
         a.close_connection("p");
+        assert_eq!(a.connections(), MAX_CONNECTIONS - 1);
+        let mut peers = AdmissionLedger::default();
+        for _ in 0..2 {
+            assert_eq!(peers.admit_connection(), Admission::Accepted);
+            assert_eq!(peers.admit_peer_connection("p"), Admission::Accepted);
+        }
+        assert_eq!(peers.admit_connection(), Admission::Accepted);
+        assert_eq!(
+            peers.admit_peer_connection("p"),
+            Admission::Rejected(PublicErrorCode::LimitAuthConnections)
+        );
+        assert_eq!(peers.connections(), 2);
         assert_eq!(a.begin_auth("p", 0), Admission::Accepted);
         assert_eq!(
             a.begin_auth("p", 0),
