@@ -4,6 +4,7 @@ use std::collections::HashMap;
 pub const MAX_CONNECTIONS: usize = 256;
 pub const MAX_INFLIGHT: usize = 128;
 pub const MAX_FAILURE_BUCKETS: usize = 1024;
+pub const MAX_CONNECTIONS_PER_IP: usize = 8;
 pub const FAILURE_LIMIT: u32 = 10;
 pub const FAILURE_WINDOW: i64 = 60;
 
@@ -21,16 +22,23 @@ struct FailureBucket {
 pub struct AdmissionLedger {
     connections: usize,
     peer_connections: HashMap<String, usize>,
+    ip_connections: HashMap<String, usize>,
     inflight: usize,
     peer_inflight: HashMap<String, usize>,
     failures: HashMap<String, FailureBucket>,
 }
 impl AdmissionLedger {
     pub fn admit_connection(&mut self) -> Admission {
-        if self.connections >= MAX_CONNECTIONS {
+        self.admit_connection_from("<unknown>")
+    }
+    pub fn admit_connection_from(&mut self, ip: &str) -> Admission {
+        if self.connections >= MAX_CONNECTIONS
+            || self.ip_connections.get(ip).copied().unwrap_or(0) >= MAX_CONNECTIONS_PER_IP
+        {
             return Admission::Rejected(PublicErrorCode::LimitAuthConnections);
         }
         self.connections += 1;
+        *self.ip_connections.entry(ip.to_owned()).or_default() += 1;
         Admission::Accepted
     }
     pub fn admit_peer_connection(&mut self, peer: &str) -> Admission {
@@ -42,7 +50,16 @@ impl AdmissionLedger {
         Admission::Accepted
     }
     pub fn close_connection(&mut self, peer: &str) {
+        self.close_connection_from(peer, "<unknown>");
+    }
+    pub fn close_connection_from(&mut self, peer: &str, ip: &str) {
         self.connections = self.connections.saturating_sub(1);
+        if let Some(n) = self.ip_connections.get_mut(ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.ip_connections.remove(ip);
+            }
+        }
         if let Some(n) = self.peer_connections.get_mut(peer) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -78,6 +95,9 @@ impl AdmissionLedger {
             }
         }
         if failed {
+            if !self.failures.contains_key(peer) && self.failures.len() >= MAX_FAILURE_BUCKETS {
+                return;
+            }
             let bucket = self.failures.entry(peer.to_owned()).or_default();
             if bucket.window != now / FAILURE_WINDOW {
                 bucket.window = now / FAILURE_WINDOW;
@@ -93,6 +113,9 @@ impl AdmissionLedger {
     pub fn connections(&self) -> usize {
         self.connections
     }
+    pub fn ip_connections(&self, ip: &str) -> usize {
+        self.ip_connections.get(ip).copied().unwrap_or(0)
+    }
     pub fn peer_connections(&self, peer: &str) -> usize {
         self.peer_connections.get(peer).copied().unwrap_or(0)
     }
@@ -106,8 +129,9 @@ mod tests {
     #[test]
     fn bounds_and_failure_windows_are_deterministic() {
         let mut a = AdmissionLedger::default();
-        for _ in 0..MAX_CONNECTIONS {
-            assert_eq!(a.admit_connection(), Admission::Accepted);
+        for n in 0..MAX_CONNECTIONS {
+            let ip = format!("ip{n}");
+            assert_eq!(a.admit_connection_from(&ip), Admission::Accepted);
         }
         assert_eq!(
             a.admit_connection(),
@@ -116,11 +140,14 @@ mod tests {
         a.close_connection("p");
         assert_eq!(a.connections(), MAX_CONNECTIONS - 1);
         let mut peers = AdmissionLedger::default();
-        for _ in 0..2 {
-            assert_eq!(peers.admit_connection(), Admission::Accepted);
+        for n in 0..2 {
+            assert_eq!(
+                peers.admit_connection_from(if n == 0 { "ip" } else { "ip2" }),
+                Admission::Accepted
+            );
             assert_eq!(peers.admit_peer_connection("p"), Admission::Accepted);
         }
-        assert_eq!(peers.admit_connection(), Admission::Accepted);
+        assert_eq!(peers.admit_connection_from("ip3"), Admission::Accepted);
         assert_eq!(
             peers.admit_peer_connection("p"),
             Admission::Rejected(PublicErrorCode::LimitAuthConnections)
