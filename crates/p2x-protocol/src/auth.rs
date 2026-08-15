@@ -23,12 +23,11 @@ impl Scope {
         }
     }
 }
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 pub enum AuthRequest {
     Authenticate {
         request_id: [u8; 16],
         credential_id: CredentialId,
-        #[serde(skip)]
         token_secret: [u8; 32],
         requested_role: Role,
         supported_features: u64,
@@ -38,6 +37,36 @@ pub enum AuthRequest {
         session_id: [u8; 16],
         nonce: u64,
     },
+}
+impl std::fmt::Debug for AuthRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Authenticate {
+                request_id,
+                credential_id,
+                requested_role,
+                supported_features,
+                ..
+            } => f
+                .debug_struct("Authenticate")
+                .field("request_id", request_id)
+                .field("credential_id", credential_id)
+                .field("token_secret", &"REDACTED")
+                .field("requested_role", requested_role)
+                .field("supported_features", supported_features)
+                .finish(),
+            Self::Ping {
+                request_id,
+                session_id,
+                nonce,
+            } => f
+                .debug_struct("Ping")
+                .field("request_id", request_id)
+                .field("session_id", session_id)
+                .field("nonce", nonce)
+                .finish(),
+        }
+    }
 }
 #[derive(Debug, Deserialize, Serialize)]
 pub enum AuthResponse {
