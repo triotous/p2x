@@ -44,13 +44,16 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), SecretFileErro
         return Err(SecretFileError::InvalidSize);
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce)
+        .map_err(|_| SecretFileError::Io(io::Error::other("OS randomness unavailable")))?;
     let mut tmp = PathBuf::from(parent);
     tmp.push(format!(
         ".{}.{}.tmp",
         path.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("secret"),
-        std::process::id()
+        u64::from_ne_bytes(nonce)
     ));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
@@ -83,5 +86,26 @@ mod tests {
             read_secret_file(Path::new("/definitely/missing")),
             Err(SecretFileError::Io(_))
         ));
+    }
+    #[test]
+    fn concurrent_creators_do_not_share_temp_names() {
+        let dir = std::env::temp_dir().join(format!("p2x-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret");
+        let mut threads = Vec::new();
+        for byte in 0..8u8 {
+            let path = path.clone();
+            threads.push(std::thread::spawn(move || {
+                write_secret_file(&path, &[byte; 32])
+            }));
+        }
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(read_secret_file(&path).is_ok());
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir(dir);
     }
 }
