@@ -1,6 +1,8 @@
 use base64::Engine;
+use libp2p_identity::PeerId;
 use p2x_protocol::{CredentialId, QuotaProfile, Tenant, TokenDigest, TokenSecret};
 use serde::Deserialize;
+use std::str::FromStr;
 use std::{env, fs, path::Path};
 use thiserror::Error;
 
@@ -67,8 +69,9 @@ impl FixedTokenFile {
             {
                 return Err(CredentialConfigError::Invalid("duplicate credential id"));
             }
-            if record.expires_at <= record.not_before
-                || record.expires_at - record.not_before > 400 * 86400
+            if PeerId::from_str(&record.peer_id).is_err()
+                || record.expires_at <= record.not_before
+                || record.expires_at.saturating_sub(record.not_before) > 400 * 86400
                 || record.peer_id.is_empty()
                 || record.tenant.is_empty()
                 || record.quota_profile.is_empty()
@@ -79,7 +82,10 @@ impl FixedTokenFile {
             let digest = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(&record.token_sha256)
                 .map_err(|_| CredentialConfigError::Invalid("token digest"))?;
-            if digest.len() != 32 {
+            if digest.len() != 32
+                || base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest)
+                    != record.token_sha256
+            {
                 return Err(CredentialConfigError::Invalid("token digest"));
             }
         }
