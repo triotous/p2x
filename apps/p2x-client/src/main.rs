@@ -10,7 +10,11 @@ use p2x_net::{
     probe_stream::behaviour::ProbeOutput,
     probe_worker::execute_probe_client_futures_with_timeout,
 };
-use std::{collections::VecDeque, io, path::PathBuf};
+use std::{
+    collections::{HashSet, VecDeque},
+    io,
+    path::PathBuf,
+};
 use tokio::sync::mpsc;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -19,6 +23,15 @@ enum Path {
     Both,
     Direct,
     Relay,
+}
+
+fn forced_path_matches(path: Path, observed_path: ProbePath) -> bool {
+    matches!(
+        (path, observed_path),
+        (Path::Direct, ProbePath::Direct)
+            | (Path::Relay, ProbePath::Relay)
+            | (Path::Both, ProbePath::Direct | ProbePath::Relay)
+    )
 }
 #[derive(Parser, Debug)]
 struct Args {
@@ -187,6 +200,7 @@ async fn main() -> io::Result<()> {
     let mut saw_relay = false;
     let mut recovery_attempted = false;
     let mut churn_redial_pending = false;
+    let mut forced_opened_connections = HashSet::new();
     let mut attempt: Option<PathAttempt> = None;
     let mut maintenance = tokio::time::interval(std::time::Duration::from_millis(100));
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerResult>(128);
@@ -274,10 +288,14 @@ async fn main() -> io::Result<()> {
                                 emitter.emit(&LifecycleRecord::OperationalError { code: "connection.rejected", message: &message })?;
                                 continue;
                             }
-                            if ((!started && matches!(args.path, Path::Relay)) || matches!(args.path, Path::Both)) && observed_path == ProbePath::Relay {
+                            if forced_path_matches(args.path, observed_path)
+                                && (!started || matches!(args.path, Path::Both))
+                                && launched < args.count
+                                && forced_opened_connections.insert(connection_id)
+                            {
                                 let request_id = swarm.behaviour_mut().probe_stream.open_on(peer_id, connection_id).map_err(io::Error::other)?;
                                 launched += 1;
-                                emitter.emit(&LifecycleRecord::PathSelected { request_id: request_id.0, connection_id_hash: stable_hash(connection_id), selected_path: ProbePath::Relay })?;
+                                emitter.emit(&LifecycleRecord::PathSelected { request_id: request_id.0, connection_id_hash: stable_hash(connection_id), selected_path: observed_path })?;
                                 started = true;
                             } else if !started && matches!(args.path, Path::Auto) && observed_path == ProbePath::Relay {
                                 let current = attempt.get_or_insert_with(|| PathAttempt::with_id(AttemptId(1), std::time::Instant::now()));
@@ -358,7 +376,12 @@ async fn main() -> io::Result<()> {
                         match event.result {
                             Ok(connection_id) => {
                                 connections.on_dcutr_succeeded(event.remote_peer_id, connection_id, std::time::Instant::now()).map_err(io::Error::other)?;
-                                if target_peer == Some(event.remote_peer_id) && (matches!(args.path, Path::Direct) && !started || matches!(args.path, Path::Both)) {
+                                if target_peer == Some(event.remote_peer_id)
+                                    && forced_path_matches(args.path, ProbePath::Direct)
+                                    && (!started || matches!(args.path, Path::Both))
+                                    && launched < args.count
+                                    && forced_opened_connections.insert(connection_id)
+                                {
                                     let request_id = swarm.behaviour_mut().probe_stream.open_on(event.remote_peer_id, connection_id).map_err(io::Error::other)?;
                                     launched += 1;
                                     emitter.emit(&LifecycleRecord::PathSelected { request_id: request_id.0, connection_id_hash: stable_hash(connection_id), selected_path: ProbePath::Direct })?;
@@ -386,4 +409,20 @@ async fn main() -> io::Result<()> {
     terminal.setup_duration_ms = started_at.elapsed().as_millis();
     emitter.terminal(&terminal)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forced_paths_match_established_connection_kind() {
+        assert!(forced_path_matches(Path::Direct, ProbePath::Direct));
+        assert!(!forced_path_matches(Path::Direct, ProbePath::Relay));
+        assert!(forced_path_matches(Path::Relay, ProbePath::Relay));
+        assert!(!forced_path_matches(Path::Relay, ProbePath::Direct));
+        assert!(forced_path_matches(Path::Both, ProbePath::Direct));
+        assert!(forced_path_matches(Path::Both, ProbePath::Relay));
+        assert!(!forced_path_matches(Path::Auto, ProbePath::Direct));
+    }
 }
