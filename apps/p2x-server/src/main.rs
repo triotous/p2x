@@ -91,6 +91,12 @@ async fn main() -> io::Result<()> {
             "product mode requires --identity-file",
         ));
     };
+    if args.credential_env.is_none() && !args.unsafe_connectivity_lab {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "product mode requires --credential-env",
+        ));
+    }
     let credential = args
         .credential_env
         .as_deref()

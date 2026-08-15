@@ -87,6 +87,12 @@ async fn main() -> io::Result<()> {
         .map(p2x_config::ticket_key::TicketKey::load)
         .transpose()
         .map_err(io::Error::other)?;
+    if args.credential_file.is_none() && !args.unsafe_connectivity_lab {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "product mode requires --credential-file",
+        ));
+    }
     let provider = args
         .credential_file
         .as_deref()
