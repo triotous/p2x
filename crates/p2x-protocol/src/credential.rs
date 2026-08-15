@@ -48,6 +48,9 @@ impl fmt::Debug for TokenSecret {
 
 pub struct TokenDigest([u8; 32]);
 impl TokenDigest {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

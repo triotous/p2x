@@ -1,0 +1,130 @@
+use p2x_protocol::{CredentialId, QuotaProfile, Role, Tenant, TokenDigest, TokenSecret};
+use std::collections::HashMap;
+use thiserror::Error;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthPrincipal {
+    pub peer_id: String,
+    pub credential_id: CredentialId,
+    pub tenant: Tenant,
+    pub role: Role,
+    pub scopes: u32,
+    pub quota_profile: QuotaProfile,
+    pub authorization_revision: u64,
+    pub credential_expires_at: i64,
+}
+pub struct CredentialBinding {
+    pub credential_id: CredentialId,
+    pub digest: TokenDigest,
+    pub peer_id: String,
+    pub tenant: Tenant,
+    pub role: Role,
+    pub scopes: u32,
+    pub quota_profile: QuotaProfile,
+    pub not_before: i64,
+    pub expires_at: i64,
+    pub revoked: bool,
+}
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum AuthFailure {
+    #[error("invalid credential")]
+    InvalidCredential,
+    #[error("forbidden role")]
+    ForbiddenRole,
+}
+pub struct FixedTokenProvider {
+    revision: u64,
+    credentials: HashMap<CredentialId, CredentialBinding>,
+}
+impl FixedTokenProvider {
+    pub fn new(revision: u64, bindings: impl IntoIterator<Item = CredentialBinding>) -> Self {
+        Self {
+            revision,
+            credentials: bindings
+                .into_iter()
+                .map(|binding| (binding.credential_id.clone(), binding))
+                .collect(),
+        }
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn authenticate(
+        &self,
+        peer_id: &str,
+        id: &CredentialId,
+        secret: &TokenSecret,
+        requested_role: Role,
+        now: i64,
+    ) -> Result<AuthPrincipal, AuthFailure> {
+        let dummy = TokenDigest::from_bytes([0; 32]);
+        let binding = self.credentials.get(id);
+        let matches = binding
+            .map(|value| value.digest.matches(secret))
+            .unwrap_or_else(|| dummy.matches(secret));
+        let Some(binding) = binding else {
+            return Err(AuthFailure::InvalidCredential);
+        };
+        if !matches
+            || binding.revoked
+            || binding.peer_id != peer_id
+            || now < binding.not_before
+            || now >= binding.expires_at
+        {
+            return Err(AuthFailure::InvalidCredential);
+        }
+        if binding.role != requested_role {
+            return Err(AuthFailure::ForbiddenRole);
+        }
+        Ok(AuthPrincipal {
+            peer_id: peer_id.to_owned(),
+            credential_id: binding.credential_id.clone(),
+            tenant: binding.tenant.clone(),
+            role: binding.role,
+            scopes: binding.scopes,
+            quota_profile: binding.quota_profile.clone(),
+            authorization_revision: self.revision,
+            credential_expires_at: binding.expires_at,
+        })
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn provider() -> (FixedTokenProvider, TokenSecret, CredentialId) {
+        let (_, token) =
+            TokenSecret::parse("p2x1.id.AwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc").unwrap();
+        let id = CredentialId::new("id").unwrap();
+        let binding = CredentialBinding {
+            credential_id: id.clone(),
+            digest: token.digest(),
+            peer_id: "peer".into(),
+            tenant: Tenant::new("tenant").unwrap(),
+            role: Role::Client,
+            scopes: 1,
+            quota_profile: QuotaProfile::new("standard").unwrap(),
+            not_before: 0,
+            expires_at: 100,
+            revoked: false,
+        };
+        (FixedTokenProvider::new(2, [binding]), token, id)
+    }
+    #[test]
+    fn validates_binding_and_rejects_wrong_peer() {
+        let (provider, token, id) = provider();
+        assert_eq!(provider.revision(), 2);
+        assert!(
+            provider
+                .authenticate("peer", &id, &token, Role::Client, 1)
+                .is_ok()
+        );
+        assert_eq!(
+            provider.authenticate("other", &id, &token, Role::Client, 1),
+            Err(AuthFailure::InvalidCredential)
+        );
+        assert_eq!(
+            provider.authenticate("peer", &id, &token, Role::Server, 1),
+            Err(AuthFailure::ForbiddenRole)
+        );
+    }
+}

@@ -2101,6 +2101,8 @@ dependencies = [
  "futures",
  "libp2p",
  "p2x-net",
+ "p2x-protocol",
+ "thiserror 2.0.20",
  "tokio",
  "tracing-subscriber",
 ]
