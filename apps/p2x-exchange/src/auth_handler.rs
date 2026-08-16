@@ -56,18 +56,22 @@ pub fn handle_request(
                                             session.expires_at.saturating_sub(now).max(0) as u64,
                                         ),
                                 };
-                                if admission.install_checked(
+                                let install = admission.install_checked(
                                     peer_id.parse().expect("validated peer id"),
                                     relay,
-                                ) != RelayInstall::Installed
-                                {
+                                );
+                                if install != RelayInstall::Installed {
                                     sessions.remove_for_auth_failure(peer_id);
+                                    let code = match install {
+                                        RelayInstall::Draining => PublicErrorCode::ExchangeDraining,
+                                        RelayInstall::Capacity | RelayInstall::Poisoned => {
+                                            PublicErrorCode::ExchangeOverloaded
+                                        }
+                                        RelayInstall::Installed => unreachable!(),
+                                    };
                                     return AuthResponse::Rejected {
                                         request_id: Some(request_id),
-                                        error: PublicError::new(
-                                            PublicErrorCode::ExchangeOverloaded,
-                                            true,
-                                        ),
+                                        error: PublicError::new(code, true),
                                     };
                                 }
                             }
@@ -219,5 +223,56 @@ mod tests {
             None,
         );
         assert!(matches!(pong, AuthResponse::Pong { nonce: 9, .. }));
+    }
+
+    #[test]
+    fn draining_relay_install_rolls_back_the_new_session() {
+        let peer = libp2p::PeerId::random().to_string();
+        let (_, token) =
+            TokenSecret::parse("p2x1.id.AwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc").unwrap();
+        let id = CredentialId::new("id").unwrap();
+        let provider = FixedTokenProvider::new(
+            1,
+            [CredentialBinding {
+                credential_id: id.clone(),
+                digest: token.digest(),
+                peer_id: peer.clone(),
+                tenant: Tenant::new("t").unwrap(),
+                role: Role::Server,
+                scopes: Scope::ReserveRelay.bit() | Scope::RegisterServices.bit(),
+                quota_profile: QuotaProfile::new("standard").unwrap(),
+                not_before: 0,
+                expires_at: 100,
+                revoked: false,
+            }],
+        );
+        let admission = RelayAdmissionHandle::default();
+        admission.set_draining(true);
+        let mut ledger = AuthSessionLedger::default();
+        let response = handle_request(
+            &provider,
+            &mut ledger,
+            &peer,
+            AuthRequest::Authenticate {
+                request_id: [1; 16],
+                credential_id: id,
+                token_secret: p2x_protocol::TokenSecret::from_bytes(*token.as_bytes()),
+                requested_role: Role::Server,
+                supported_features: 0,
+            },
+            1,
+            Some(&admission),
+        );
+        assert!(matches!(
+            response,
+            AuthResponse::Rejected {
+                error: PublicError {
+                    code: PublicErrorCode::ExchangeDraining,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(ledger.current(&peer, 1).is_none());
     }
 }

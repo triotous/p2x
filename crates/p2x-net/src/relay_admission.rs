@@ -56,6 +56,14 @@ impl RelayAdmissionHandle {
             snapshot.draining = draining;
         }
     }
+    pub fn clear(&self) {
+        if let Ok(mut snapshot) = self.0.write() {
+            snapshot.entries.clear();
+        }
+    }
+    pub fn is_poisoned(&self) -> bool {
+        self.0.read().is_err()
+    }
     pub fn sweep(&self, now: Instant) {
         if let Ok(mut snapshot) = self.0.write() {
             snapshot
@@ -197,6 +205,21 @@ mod tests {
             RelayInstall::Draining
         );
         assert!(admission.is_empty());
+    }
+    #[test]
+    fn poisoned_snapshot_fails_closed_and_is_reported() {
+        let admission = RelayAdmissionHandle::default();
+        let poisoned = admission.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned.0.write().unwrap();
+            panic!("poison relay admission snapshot");
+        });
+        assert!(admission.is_poisoned());
+        assert_eq!(
+            admission.install_checked(peer(), session(Role::Server, Scope::ReserveRelay.bit())),
+            RelayInstall::Poisoned
+        );
+        assert!(!admission.is_reservation_authorized(&peer(), Instant::now()));
     }
     #[test]
     fn per_peer_limit_translation_is_n_minus_one() {

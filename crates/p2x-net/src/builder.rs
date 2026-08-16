@@ -40,10 +40,22 @@ impl RelayProfile {
         let product = matches!(self, Self::Product);
         let limit = matches!(self, Self::LimitTest);
         relay::Config {
-            max_reservations: if limit { 2 } else { 8 },
+            max_reservations: if limit {
+                2
+            } else if product {
+                64
+            } else {
+                8
+            },
             max_reservations_per_peer: if product || limit { 0 } else { 1 },
             reservation_duration: Duration::from_secs(60),
-            max_circuits: if limit { 2 } else { 64 },
+            max_circuits: if limit {
+                2
+            } else if product {
+                128
+            } else {
+                64
+            },
             max_circuits_per_peer: if product {
                 31
             } else if limit {
@@ -650,8 +662,8 @@ mod tests {
     #[test]
     fn relay_profiles_apply_all_effective_limits() {
         let default = RelayProfile::Product.config();
-        assert_eq!(default.max_reservations, 8);
-        assert_eq!(default.max_circuits, 64);
+        assert_eq!(default.max_reservations, 64);
+        assert_eq!(default.max_circuits, 128);
         assert_eq!(default.max_reservations_per_peer, 0);
         assert_eq!(default.max_circuits_per_peer, 31);
         let lab = RelayProfile::DefaultLab.config();

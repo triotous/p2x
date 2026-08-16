@@ -58,6 +58,18 @@ impl RegistryError {
             Self::Malformed => PublicErrorCode::ProtocolMalformed,
         }
     }
+
+    pub const fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::ReservationRequired
+                | Self::StaleRevision
+                | Self::NotFound
+                | Self::Offline
+                | Self::Overloaded
+                | Self::Draining
+        )
+    }
 }
 #[derive(Clone, Debug)]
 struct CachedResponse {
@@ -176,6 +188,7 @@ impl Registry {
             }
             return Err(RegistryError::Malformed);
         }
+        self.sweep(now);
         if self.registrations.len() >= MAX_SERVERS && !self.registrations.contains_key(&peer_id) {
             return Err(RegistryError::Overloaded);
         }
@@ -772,5 +785,42 @@ mod tests {
             Err(RegistryError::ReservationRequired)
         );
         assert!(!registry.remove_peer(&peer));
+    }
+
+    #[test]
+    fn register_can_take_over_a_selector_at_the_previous_lease_boundary() {
+        let (tenant, quota, services) = data();
+        let first_peer = PeerId::random();
+        let second_peer = PeerId::random();
+        let mut registry = Registry::default();
+        registry
+            .register(
+                first_peer,
+                &tenant,
+                Role::Server,
+                3,
+                &quota,
+                1,
+                true,
+                request(services.clone(), [1; 16]),
+                10,
+            )
+            .unwrap();
+        registry
+            .register(
+                second_peer,
+                &tenant,
+                Role::Server,
+                3,
+                &quota,
+                1,
+                true,
+                request(services, [2; 16]),
+                40,
+            )
+            .unwrap();
+        assert!(registry.get(&first_peer).is_none());
+        assert!(registry.get(&second_peer).is_some());
+        assert_eq!(registry.owner_count(), 1);
     }
 }
