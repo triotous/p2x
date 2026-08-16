@@ -77,6 +77,19 @@ case "$case_name" in
   expired) client_not_before=$((now-7200)); client_expires=$((now-3600)) ;;
 esac
 credentials_file="$secret_dir/credentials.yaml"
+services_file="$secret_dir/services.yaml"
+cat > "$services_file" <<'EOF'
+schema_version: 1
+registration:
+  requested_lease_seconds: 30
+  refresh_seconds: 10
+services:
+  - upstream_id: orders
+    selector:
+      protocol: http
+      metadata: {service: orders}
+    enabled: true
+EOF
 cat > "$credentials_file" <<EOF
 schema_version: 1
 authorization_revision: 1
@@ -113,12 +126,24 @@ credentials:
     revoked: false
 EOF
 exchange_log="$out/exchange.ndjson"
+read -r exchange_tcp_port exchange_quic_port < <(python3 - <<'PY'
+import socket
+ports=[]
+for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+    sock=socket.socket(socket.AF_INET, kind)
+    sock.bind(('127.0.0.1', 0))
+    ports.append(sock.getsockname()[1])
+    sock.close()
+print(*ports)
+PY
+)
 P2X_RUN_ID="$run_id" "$root/target/debug/p2x-exchange" \
   --identity-file "$exchange_key" --credential-file "$credentials_file" --ticket-key-file "$ticket_key" \
+  --tcp-listen "/ip4/127.0.0.1/tcp/$exchange_tcp_port" --quic-listen "/ip4/127.0.0.1/udp/$exchange_quic_port/quic-v1" \
+  --advertise "/ip4/127.0.0.1/tcp/$exchange_tcp_port/p2p/$exchange_peer" \
   --auth-limit-connections "$([[ "$case_name" == connection-limit ]] && echo 0 || echo 256)" \
   --auth-limit-requests "$([[ "$case_name" == request-limit ]] && echo 0 || echo 128)" \
   --auth-limit-sessions "$([[ "$case_name" == session-limit ]] && echo 0 || echo 256)" \
-  --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
   >"$exchange_log" 2>&1 &
 exchange_pid=$!
 pids+=("$exchange_pid")
@@ -202,7 +227,7 @@ if [[ "$case_name" == valid-client || "$case_name" == valid-server ]]; then
   if [[ "$component" == client ]]; then companion=server; companion_token="$server_token"; companion_key="$server_key"; else companion=client; companion_token="$client_token"; companion_key="$client_key"; fi
   P2X_TOKEN="$companion_token" "$root/target/debug/p2x-$companion" \
     --identity-file "$companion_key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" \
-    --credential-env P2X_TOKEN --finite-auth-check --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
+    --credential-env P2X_TOKEN --finite-auth-check --services-file "$services_file" --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
     --case-id "$case_name" >"$out/$companion.ndjson" 2>&1 &
   pids+=("$!")
 fi
@@ -211,7 +236,7 @@ if [[ "$case_name" == exchange-restart ]]; then
   companion_pid=""
   P2X_TOKEN="$server_token" "$root/target/debug/p2x-server" \
     --identity-file "$server_key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" \
-    --credential-env P2X_TOKEN --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
+    --credential-env P2X_TOKEN --services-file "$services_file" --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
     --case-id "$case_name" >"$out/server.ndjson" 2>&1 &
   companion_pid=$!
   pids+=("$companion_pid")
