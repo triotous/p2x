@@ -324,7 +324,12 @@ async fn main() -> io::Result<()> {
     let mut instance_bytes = [0; 16];
     getrandom::fill(&mut instance_bytes).map_err(io::Error::other)?;
     let instance_id = InstanceId::new(instance_bytes);
-    let mut availability = availability::Availability::new(instance_bytes);
+    let mut availability = availability::Availability::with_refresh_seconds(
+        instance_bytes,
+        service_config
+            .as_ref()
+            .map_or(10, |config| config.refresh_seconds),
+    );
     let mut registration_requested = false;
     let mut pending_registry: PendingRequest<libp2p::request_response::OutboundRequestId> =
         PendingRequest::new();

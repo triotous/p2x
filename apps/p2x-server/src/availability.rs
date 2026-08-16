@@ -47,7 +47,7 @@ pub struct Availability {
 }
 
 impl Availability {
-    pub fn new(instance_id: [u8; 16]) -> Self {
+    pub fn with_refresh_seconds(instance_id: [u8; 16], refresh_seconds: u16) -> Self {
         Self {
             state: AvailabilityState::Starting,
             generation: 0,
@@ -57,9 +57,13 @@ impl Availability {
             reservation: false,
             registration_expires_at: 0,
             refresh_at: i64::MAX,
-            refresh_seconds: 10,
+            refresh_seconds: refresh_seconds.max(1),
             instance_id,
         }
+    }
+
+    pub fn new(instance_id: [u8; 16]) -> Self {
+        Self::with_refresh_seconds(instance_id, 10)
     }
 
     pub const fn state(&self) -> AvailabilityState {

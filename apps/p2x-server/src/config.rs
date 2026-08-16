@@ -43,6 +43,7 @@ pub struct ServiceConfig {
     pub requested_lease_seconds: u16,
     pub refresh_seconds: u16,
     pub services: ServiceSet,
+    pub service_set_hash: [u8; 32],
 }
 impl ServiceConfig {
     pub fn load(path: &Path) -> Result<Self, ServiceConfigError> {
@@ -58,6 +59,11 @@ impl ServiceConfig {
         if !(10..=60).contains(&lease) || refresh == 0 || refresh > lease / 2 {
             return Err(ServiceConfigError::Invalid(
                 "invalid registration lease or refresh".into(),
+            ));
+        }
+        if file.services.is_empty() || file.services.len() > 128 {
+            return Err(ServiceConfigError::Invalid(
+                "service entry count is out of bounds".into(),
             ));
         }
         let mut all_ids = std::collections::HashSet::new();
@@ -95,10 +101,12 @@ impl ServiceConfig {
         }
         let services =
             ServiceSet::new(services).map_err(|e| ServiceConfigError::Invalid(e.to_string()))?;
+        let service_set_hash = services.hash();
         Ok(Self {
             requested_lease_seconds: lease,
             refresh_seconds: refresh,
             services,
+            service_set_hash,
         })
     }
 }
