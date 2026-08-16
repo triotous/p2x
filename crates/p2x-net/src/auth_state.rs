@@ -352,7 +352,7 @@ impl AuthState {
             return AuthAction::Ignore;
         };
         if expires_at <= now {
-            self.phase = AuthPhase::Disconnected;
+            self.enter_backoff(now, 0);
             return AuthAction::Retry;
         }
         self.phase = AuthPhase::Reauthenticating {

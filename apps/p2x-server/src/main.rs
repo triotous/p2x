@@ -646,6 +646,7 @@ async fn main() -> io::Result<()> {
                             (Some(RegistryOperation::Register { request_id }), RegistryResponseV1::Registered { request_id: response_id, instance_id: response_instance, registration_revision: revision, expires_at, .. }) if request_id == response_id && response_instance == instance_id => {
                                 registration_revision = Some(revision);
                                 registration_expires_at = expires_at;
+                                let _ = availability.reservation_ready(reservation.generation);
                                 let _ = availability.registered(availability.generation(), expires_at, unix_now());
                             }
                             (Some(RegistryOperation::Refresh { request_id, revision, .. }), RegistryResponseV1::Refreshed { request_id: response_id, instance_id: response_instance, registration_revision: response_revision, expires_at }) if request_id == response_id && response_instance == instance_id && response_revision == revision => {
