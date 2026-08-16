@@ -118,6 +118,7 @@ pub struct PeerSwarmConfig {
     pub tcp_listen: Multiaddr,
     pub quic_listen: Multiaddr,
     pub mode: RuntimeMode,
+    pub auth_fault: Option<crate::auth_codec::AuthFault>,
 }
 
 impl Default for PeerSwarmConfig {
@@ -128,6 +129,7 @@ impl Default for PeerSwarmConfig {
                 .parse()
                 .expect("valid QUIC default"),
             mode: RuntimeMode::Product,
+            auth_fault: None,
         }
     }
 }
@@ -345,7 +347,7 @@ pub fn build_exchange_swarm(
                     .with_timeout(Duration::from_secs(PING_TIMEOUT_SECONDS)),
             ),
             auth: libp2p::request_response::Behaviour::with_codec(
-                AuthCodec,
+                AuthCodec::default(),
                 [(
                     libp2p::StreamProtocol::new(AUTH_PROTOCOL),
                     libp2p::request_response::ProtocolSupport::Inbound,
@@ -416,7 +418,7 @@ pub fn build_peer_swarm(
                 (config.mode == RuntimeMode::ConnectivityLab).then(ProbeStreamBehaviour::default),
             ),
             auth: libp2p::request_response::Behaviour::with_codec(
-                AuthCodec,
+                AuthCodec::with_fault(config.auth_fault),
                 [(
                     libp2p::StreamProtocol::new(AUTH_PROTOCOL),
                     libp2p::request_response::ProtocolSupport::Outbound,

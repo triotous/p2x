@@ -22,8 +22,21 @@ pub enum AuthProtocolError {
     #[error("auth capabilities are unsupported")]
     CapabilityMismatch,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthFault {
+    UnsupportedVersion,
+    OversizedFrame,
+    Malformed,
+}
 #[derive(Clone, Default)]
-pub struct AuthCodec;
+pub struct AuthCodec {
+    pub fault: Option<AuthFault>,
+}
+impl AuthCodec {
+    pub fn with_fault(fault: Option<AuthFault>) -> Self {
+        Self { fault }
+    }
+}
 pub fn decode_auth_request(bytes: &[u8]) -> Result<AuthRequest, AuthProtocolError> {
     decode_request(bytes)
 }
@@ -58,6 +71,16 @@ fn version(value: u8) -> Result<(), AuthProtocolError> {
 }
 fn protocol_io(error: AuthProtocolError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
+}
+impl AuthProtocolError {
+    pub fn public_code(&self) -> PublicErrorCode {
+        match self {
+            Self::FrameTooLarge => PublicErrorCode::ProtocolFrameTooLarge,
+            Self::Malformed => PublicErrorCode::ProtocolMalformed,
+            Self::UnsupportedVersion => PublicErrorCode::ProtocolUnsupportedVersion,
+            Self::CapabilityMismatch => PublicErrorCode::ProtocolCapabilityMismatch,
+        }
+    }
 }
 fn take<'a>(b: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], AuthProtocolError> {
     let end = pos.checked_add(n).ok_or_else(invalid)?;
@@ -345,9 +368,25 @@ impl Codec for AuthCodec {
         io: &mut T,
         r: Self::Request,
     ) -> io::Result<()> {
-        write_frame(io, &encode_request(r).map_err(protocol_io)?)
-            .await
-            .map_err(protocol_io)
+        let mut frame = encode_request(r).map_err(protocol_io)?.to_vec();
+        match self.fault {
+            Some(AuthFault::UnsupportedVersion) => frame[0] = VERSION.saturating_add(1),
+            Some(AuthFault::Malformed) => frame.push(0),
+            Some(AuthFault::OversizedFrame) => {
+                io.write_all(&((MAX_AUTH_FRAME as u32) + 1).to_be_bytes())
+                    .await
+                    .map_err(|_| protocol_io(AuthProtocolError::Malformed))?;
+                io.flush()
+                    .await
+                    .map_err(|_| protocol_io(AuthProtocolError::Malformed))?;
+                return io
+                    .close()
+                    .await
+                    .map_err(|_| protocol_io(AuthProtocolError::Malformed));
+            }
+            None => {}
+        }
+        write_frame(io, &frame).await.map_err(protocol_io)
     }
     async fn write_response<T: AsyncWrite + Unpin + Send>(
         &mut self,
@@ -374,14 +413,14 @@ mod tests {
         };
         let mut w = Vec::new();
         block_on(AuthCodec::write_request(
-            &mut AuthCodec,
+            &mut AuthCodec::default(),
             &libp2p::StreamProtocol::new(AUTH_PROTOCOL),
             &mut w,
             r,
         ))
         .unwrap();
         let d = block_on(AuthCodec::read_request(
-            &mut AuthCodec,
+            &mut AuthCodec::default(),
             &libp2p::StreamProtocol::new(AUTH_PROTOCOL),
             &mut Cursor::new(w),
         ))
@@ -395,7 +434,7 @@ mod tests {
             w.extend(b);
             assert!(
                 block_on(AuthCodec::read_request(
-                    &mut AuthCodec,
+                    &mut AuthCodec::default(),
                     &libp2p::StreamProtocol::new(AUTH_PROTOCOL),
                     &mut Cursor::new(w)
                 ))
@@ -428,7 +467,7 @@ mod tests {
         ] {
             assert!(
                 block_on(AuthCodec::read_request(
-                    &mut AuthCodec,
+                    &mut AuthCodec::default(),
                     &libp2p::StreamProtocol::new(AUTH_PROTOCOL),
                     &mut Cursor::new(frame),
                 ))
@@ -439,7 +478,7 @@ mod tests {
         truncated.extend_from_slice(&[VERSION, 0]);
         assert!(
             block_on(AuthCodec::read_request(
-                &mut AuthCodec,
+                &mut AuthCodec::default(),
                 &libp2p::StreamProtocol::new(AUTH_PROTOCOL),
                 &mut Cursor::new(truncated),
             ))

@@ -119,6 +119,22 @@ P2X_RUN_ID="$run_id" "$root/target/debug/p2x-exchange" \
   >"$exchange_log" 2>&1 &
 exchange_pid=$!
 pids+=("$exchange_pid")
+if [[ "$case_name" == wrong-scope ]]; then
+  sleep .2
+  if wait "$exchange_pid"; then
+    echo "wrong-scope configuration unexpectedly accepted" >&2
+    exit 1
+  fi
+  ! grep -E "$client_token|$client_digest|token_secret|raw_ticket|$exchange_key|$client_key|$server_key" "$out"/* >/dev/null 2>&1 || { echo "secret leaked" >&2; exit 1; }
+  python3 - "$out" "$case_name" <<'PY'
+import json, pathlib, sys
+out, case = pathlib.Path(sys.argv[1]), sys.argv[2]
+summary = {'case': case, 'passed': True, 'observed': 'configuration_rejected'}
+(out / 'summary.json').write_text(json.dumps(summary) + '\n')
+print(json.dumps(summary))
+PY
+  exit 0
+fi
 exchange_addr=""
 for _ in $(seq 1 200); do
   exchange_addr=$(jq -r 'select(.event == "listener_ready" and (.address | contains("/tcp/"))) | .address' "$exchange_log" 2>/dev/null | head -1 || true)
@@ -145,9 +161,17 @@ else
   token="$server_token"; key="$server_key"; peer="$server_peer"
 fi
 log="$out/$component.ndjson"
+auth_mode_args=(--finite-auth-check)
+auth_fault_args=""
+case "$case_name" in
+  unsupported-version) auth_fault_args="--auth-fault unsupported-version" ;;
+  oversized-frame) auth_fault_args="--auth-fault oversized-frame" ;;
+  malformed-frame) auth_fault_args="--auth-fault malformed-frame" ;;
+esac
+if [[ "$case_name" == exchange-restart ]]; then auth_mode_args=(); fi
 P2X_TOKEN="$token" "$root/target/debug/p2x-$component" \
   --identity-file "$key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" \
-  --credential-env P2X_TOKEN --finite-auth-check --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
+  --credential-env P2X_TOKEN "${auth_mode_args[@]}" ${auth_fault_args:-} --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
   --case-id "$case_name" >"$log" 2>&1 &
 pids+=("$!")
 companion=""
@@ -177,20 +201,18 @@ if [[ "$case_name" == wrong-token ]]; then
   P2X_TOKEN="${token%?}A" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --finite-auth-check --case-id "$case_name" >"$log" 2>&1 &
   pids+=("$!")
 fi
-for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$log" && break; sleep .05; done
-grep -q '"event":"terminal"' "$log" || { echo "$component did not emit terminal" >&2; exit 1; }
-terminal_count=$(grep -c '"event":"terminal"' "$log")
-[[ "$terminal_count" -eq 1 ]] || { echo "$component emitted $terminal_count terminal records" >&2; exit 1; }
-if [[ "$case_name" == exchange-restart ]]; then
-  grep -q '"event":"auth_readiness","ready":false' "$log" || { echo "restart lacked readiness loss" >&2; exit 1; }
-  grep -q '"event":"auth_readiness","ready":true' "$log" || { echo "restart lacked readiness recovery" >&2; exit 1; }
+if [[ "$case_name" != exchange-restart ]]; then
+  for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$log" && break; sleep .05; done
+  grep -q '"event":"terminal"' "$log" || { echo "$component did not emit terminal" >&2; exit 1; }
+  terminal_count=$(grep -c '"event":"terminal"' "$log")
+  [[ "$terminal_count" -eq 1 ]] || { echo "$component emitted $terminal_count terminal records" >&2; exit 1; }
 fi
 if [[ "$case_name" == connection-limit || "$case_name" == request-limit || "$case_name" == session-limit ]]; then
   cargo test -q -p p2x-exchange --lib admission::tests::rejected_close_cannot_undercount_admitted_connections
   grep -q '"state":"established"' "$out/exchange.ndjson" || { echo "limit case lacked connection admission" >&2; exit 1; }
 elif [[ "$case_name" == malformed-frame || "$case_name" == unsupported-version || "$case_name" == oversized-frame ]]; then
   cargo test -q -p p2x-net --lib auth_codec::tests::rejects_version_capability_and_trailing
-else
+elif [[ "$case_name" != exchange-restart ]]; then
   grep -q "\"code\":\"$expected\"" "$log" || { echo "expected $expected" >&2; cat "$log" >&2; exit 1; }
 fi
 if [[ -n "$companion" ]]; then
@@ -204,18 +226,34 @@ if [[ "$case_name" == rotation-overlap || "$case_name" == rotation-revoke-old ]]
   grep -q '"code":"auth.pong"' "$out/rotation-second.ndjson" || { echo "rotated credential did not authenticate" >&2; exit 1; }
 fi
 if [[ "$case_name" == exchange-restart ]]; then
+  for _ in $(seq 1 200); do grep -q '"event":"auth_readiness","ready":true' "$log" && break; sleep .05; done
+  grep -q '"event":"auth_readiness","ready":true' "$log" || { echo "initial readiness missing" >&2; exit 1; }
+  initial_peer=$(python3 - "$log" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    row = json.loads(line)
+    if row.get('event') == 'started': print(row['peer_id']); break
+PY
+)
+  initial_pid="${pids[1]}"
+  listen_base="${exchange_addr%/p2p/*}"
   kill -INT "$exchange_pid" 2>/dev/null || true; wait "$exchange_pid" 2>/dev/null || true
-  P2X_RUN_ID="$run_id-restart" "$root/target/debug/p2x-exchange" --identity-file "$exchange_key" --credential-file "$credentials_file" --ticket-key-file "$ticket_key" --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/exchange-restart.ndjson" 2>&1 &
+  P2X_RUN_ID="$run_id-restart" "$root/target/debug/p2x-exchange" --identity-file "$exchange_key" --credential-file "$credentials_file" --ticket-key-file "$ticket_key" --tcp-listen "$listen_base" --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/exchange-restart.ndjson" 2>&1 &
   exchange_pid=$!; pids+=("$exchange_pid")
-  restart_addr=""
-  for _ in $(seq 1 200); do restart_addr=$(sed -n 's/.*"event":"listener_ready".*"address":"\([^" ]*\/tcp\/[^" ]*\)".*/\1/p' "$out/exchange-restart.ndjson" | head -1 || true); [[ -n "$restart_addr" ]] && break; sleep .05; done
-  [[ -n "$restart_addr" ]] || { echo "restarted exchange did not become ready" >&2; exit 1; }
-  P2X_TOKEN="$client_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$restart_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --case-id restart-second --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/restart-second.ndjson" 2>&1 &
-  pids+=("$!")
-  for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$out/restart-second.ndjson" && break; sleep .05; done
-  grep -q '"code":"auth.pong"' "$out/restart-second.ndjson" || { echo "restarted exchange did not re-authenticate" >&2; exit 1; }
+  for _ in $(seq 1 200); do grep -q '"event":"listener_ready"' "$out/exchange-restart.ndjson" && break; sleep .05; done
+  grep -q '"event":"listener_ready"' "$out/exchange-restart.ndjson" || { echo "restarted exchange did not become ready" >&2; exit 1; }
+  for _ in $(seq 1 300); do grep -q '"event":"auth_readiness","ready":true,"generation":2' "$log" && break; sleep .05; done
+  grep -q '"event":"auth_readiness","ready":false' "$log" || { echo "restart lacked readiness loss" >&2; exit 1; }
+  grep -q '"event":"auth_readiness","ready":true,"generation":2' "$log" || { echo "restart lacked readiness recovery" >&2; exit 1; }
+  kill -INT "$initial_pid" 2>/dev/null || true
+  for _ in $(seq 1 100); do grep -q '"event":"terminal"' "$log" && break; sleep .05; done
+  [[ "$(grep -c '"event":"terminal"' "$log")" -eq 1 ]] || { echo "restart client terminal cardinality mismatch" >&2; exit 1; }
+  grep -q "\"peer_id\":\"$initial_peer\"" "$log" || { echo "restart changed peer identity" >&2; exit 1; }
 fi
 ! grep -E "$client_token|$server_token|$rotation_token|$client_digest|$server_digest|$rotation_digest|token_secret|raw_ticket|$exchange_key|$client_key|$server_key" "$out"/* >/dev/null 2>&1 || { echo "secret leaked" >&2; exit 1; }
+if [[ "$case_name" == exchange-restart ]]; then
+  exit 0
+fi
 python3 - "$out" "$case_name" <<'PY'
 import json, pathlib, sys
 out, case = pathlib.Path(sys.argv[1]), sys.argv[2]

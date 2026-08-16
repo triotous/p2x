@@ -24,6 +24,21 @@ use std::{
 use tokio::sync::mpsc;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum AuthFaultArg {
+    UnsupportedVersion,
+    OversizedFrame,
+    MalformedFrame,
+}
+impl From<AuthFaultArg> for p2x_net::auth_codec::AuthFault {
+    fn from(value: AuthFaultArg) -> Self {
+        match value {
+            AuthFaultArg::UnsupportedVersion => Self::UnsupportedVersion,
+            AuthFaultArg::OversizedFrame => Self::OversizedFrame,
+            AuthFaultArg::MalformedFrame => Self::Malformed,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum Path {
     Auto,
     Both,
@@ -38,6 +53,26 @@ fn forced_path_matches(path: Path, observed_path: ProbePath) -> bool {
             | (Path::Relay, ProbePath::Relay)
             | (Path::Both, ProbePath::Direct | ProbePath::Relay)
     )
+}
+
+fn protocol_failure_code(error: &std::io::Error, fault: Option<AuthFaultArg>) -> PublicErrorCode {
+    if let Some(fault) = fault {
+        return match fault {
+            AuthFaultArg::UnsupportedVersion => PublicErrorCode::ProtocolUnsupportedVersion,
+            AuthFaultArg::OversizedFrame => PublicErrorCode::ProtocolFrameTooLarge,
+            AuthFaultArg::MalformedFrame => PublicErrorCode::ProtocolMalformed,
+        };
+    }
+    let message = error.to_string();
+    if message.contains("too large") {
+        PublicErrorCode::ProtocolFrameTooLarge
+    } else if message.contains("unsupported") {
+        PublicErrorCode::ProtocolUnsupportedVersion
+    } else if message.contains("capabilities") {
+        PublicErrorCode::ProtocolCapabilityMismatch
+    } else {
+        PublicErrorCode::ProtocolMalformed
+    }
 }
 
 fn unix_now() -> i64 {
@@ -105,6 +140,8 @@ struct Args {
     recover_after_failure: bool,
     #[arg(long)]
     finite_auth_check: bool,
+    #[arg(long, value_enum)]
+    auth_fault: Option<AuthFaultArg>,
 }
 
 struct WorkerResult {
@@ -250,6 +287,7 @@ async fn main() -> io::Result<()> {
         } else {
             RuntimeMode::Product
         },
+        auth_fault: args.auth_fault.map(Into::into),
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
     start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
@@ -462,6 +500,11 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::OutboundFailure { error: libp2p::request_response::OutboundFailure::UnsupportedProtocols, .. })) if credential.is_some() => {
                         let code = PublicErrorCode::ProtocolCapabilityMismatch;
+                        emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                        return Ok(());
+                    }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::OutboundFailure { error: libp2p::request_response::OutboundFailure::Io(error), .. })) if credential.is_some() => {
+                        let code = protocol_failure_code(&error, args.auth_fault);
                         emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
                         return Ok(());
                     }

@@ -154,6 +154,7 @@ async fn main() -> io::Result<()> {
         } else {
             RuntimeMode::Product
         },
+        auth_fault: None,
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
     start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
