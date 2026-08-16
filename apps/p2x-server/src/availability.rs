@@ -68,7 +68,13 @@ impl Availability {
 
     pub fn auth_ready(&mut self) -> AvailabilityAction {
         self.auth = true;
-        self.state = AvailabilityState::Reserving;
+        self.state = if self.reservation && self.registration_expires_at > 0 {
+            AvailabilityState::Ready
+        } else if self.reservation {
+            AvailabilityState::RelayReady
+        } else {
+            AvailabilityState::Reserving
+        };
         AvailabilityAction::Reserve(self.generation)
     }
 
