@@ -217,6 +217,33 @@ mod tests {
         assert!(ring.get(key.key_id(), 20).is_none());
     }
     #[test]
+    fn ring_verifies_exact_active_key() {
+        let key = TicketKey::from_seed([9; 32]);
+        let mut ring = VerificationKeyRing::default();
+        ring.add(VerificationKey {
+            key_id: key.key_id(),
+            public: key.public(),
+            activates_at: 0,
+            retires_at: None,
+        })
+        .unwrap();
+        let expected = p2x_protocol::ticket::TicketValidation {
+            issuer_exchange_peer_id: &[],
+            client_peer_id: &[],
+            server_peer_id: &[],
+            tenant: "",
+            upstream_id: "",
+            selector_fingerprint: [0; 32],
+            registration_revision: 0,
+            authorization_revision: 0,
+            permissions: 0,
+            max_streams: 0,
+            now: 0,
+            clock_skew: 0,
+        };
+        assert!(ring.verify(&[0; 4], &expected).is_err());
+    }
+    #[test]
     fn key_separation_is_enforced() {
         let key = TicketKey::from_seed([9; 32]);
         assert!(key.ensure_separate_from(key.public().as_bytes()).is_err());

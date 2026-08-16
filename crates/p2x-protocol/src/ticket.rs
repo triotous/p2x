@@ -495,6 +495,36 @@ mod tests {
         assert_eq!(c.encode(), Err(TicketError::Invalid));
     }
     #[test]
+    fn raw_ticket_and_verified_ticket_redact_bytes() {
+        let signer = TicketSigner::from_seed([9; 32]);
+        let raw = signer.sign(&claims()).unwrap();
+        assert!(format!("{raw:?}").contains("REDACTED"));
+        let verified = verify_and_validate(
+            raw.as_bytes(),
+            signer.key_id(),
+            &signer.public_key(),
+            &validation(),
+        )
+        .unwrap();
+        assert_eq!(verified.ticket_id(), [5; 16]);
+        assert_eq!(verified.claims().tenant(), "t");
+    }
+    #[test]
+    fn expiry_boundary_is_exclusive() {
+        let signer = TicketSigner::from_seed([9; 32]);
+        let mut expected = validation();
+        expected.now = 20;
+        assert_eq!(
+            verify_and_validate(
+                signer.sign(&claims()).unwrap().as_bytes(),
+                signer.key_id(),
+                &signer.public_key(),
+                &expected
+            ),
+            Err(TicketError::Expired)
+        );
+    }
+    #[test]
     fn vector_and_mutation() {
         let s = TicketSigner::from_seed([9; 32]);
         let t = s.sign(&claims()).unwrap();

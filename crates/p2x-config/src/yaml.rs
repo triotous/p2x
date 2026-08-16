@@ -116,13 +116,13 @@ fn validate_events(text: &str) -> Result<(), YamlError> {
     let mut parser = Parser::new_from_str(text);
     let mut depth = 0usize;
     let mut nodes = 0usize;
-    while let Ok((event, _)) = parser.next_token() {
+    loop {
+        let (event, _) = parser
+            .next_token()
+            .map_err(|_| YamlError::Parse(invalid_yaml()))?;
         match event {
-            Event::Nothing
-            | Event::StreamStart
-            | Event::StreamEnd
-            | Event::DocumentStart
-            | Event::DocumentEnd => {}
+            Event::Nothing | Event::StreamStart | Event::DocumentStart | Event::DocumentEnd => {}
+            Event::StreamEnd => break,
             Event::Alias(_) => return Err(YamlError::Bounds),
             Event::Scalar(value, _, anchor, tag) => {
                 if anchor != 0 || tag.is_some() || value.len() > MAX_YAML_SCALAR {
