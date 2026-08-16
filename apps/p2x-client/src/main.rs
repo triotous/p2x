@@ -527,8 +527,8 @@ async fn main() -> io::Result<()> {
                             }
                         }
                     }
-                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Authenticated { session_id, request_id, .. } }, .. })) if pending_auth.complete(&outbound_id) => {
-                        if let AuthAction::Ping { request_id: ping_id, session_id, nonce } = auth_state.authenticated(request_id, session_id, { ping_request_id = request_ids.allocate().map_err(io::Error::other)?; ping_request_id }, 1, unix_now()) {
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Authenticated { session_id, request_id, expires_at, .. } }, .. })) if pending_auth.complete(&outbound_id) => {
+                        if let AuthAction::Ping { request_id: ping_id, session_id, nonce } = auth_state.authenticated(request_id, session_id, expires_at, { ping_request_id = request_ids.allocate().map_err(io::Error::other)?; ping_request_id }, 1, unix_now()) {
                             ping_request_id = ping_id;
                             let outbound = swarm.behaviour_mut().auth.send_request(&peer, AuthRequest::Ping { request_id: ping_id, session_id, nonce });
                             if !pending_auth.begin(outbound) { return Err(io::Error::other("auth outbound request limit exceeded")); }

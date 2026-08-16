@@ -198,6 +198,7 @@ pub struct AuthState {
     session_expires_at: i64,
     pending_session_expires_at: i64,
     session_started_at: i64,
+    pending_session_started_at: i64,
 }
 impl Default for AuthState {
     fn default() -> Self {
@@ -212,6 +213,7 @@ impl AuthState {
             session_expires_at: 0,
             pending_session_expires_at: 0,
             session_started_at: 0,
+            pending_session_started_at: 0,
         }
     }
     pub const fn phase(&self) -> AuthPhase {
@@ -243,6 +245,7 @@ impl AuthState {
         &mut self,
         request_id: [u8; 16],
         session_id: [u8; 16],
+        expires_at: i64,
         ping_request_id: [u8; 16],
         nonce: u64,
         now: i64,
@@ -252,7 +255,8 @@ impl AuthState {
                 request_id: expected,
                 ..
             } if expected == request_id => {
-                self.session_started_at = now;
+                self.pending_session_expires_at = expires_at;
+                self.pending_session_started_at = now;
                 self.phase = AuthPhase::AwaitingPong {
                     request_id: ping_request_id,
                     session_id,
@@ -273,6 +277,8 @@ impl AuthState {
                 expires_at: prior_expires_at,
                 ..
             } if expected == request_id => {
+                self.pending_session_expires_at = expires_at;
+                self.pending_session_started_at = now;
                 self.phase = AuthPhase::AwaitingPong {
                     request_id: ping_request_id,
                     session_id,
@@ -288,12 +294,6 @@ impl AuthState {
                 }
             }
             _ => AuthAction::Ignore,
-        }
-    }
-    pub fn set_session_expiry(&mut self, expires_at: i64) {
-        self.pending_session_expires_at = expires_at;
-        if matches!(self.phase, AuthPhase::Authenticated { .. }) {
-            self.session_expires_at = expires_at;
         }
     }
     pub fn current_session(&self, now: i64) -> Option<[u8; 16]> {
@@ -364,7 +364,7 @@ impl AuthState {
             } if expected == request_id && expected_nonce == nonce => {
                 let expires_at = self.pending_session_expires_at;
                 self.session_expires_at = expires_at;
-                self.session_started_at = self.session_started_at.max(0);
+                self.session_started_at = self.pending_session_started_at;
                 self.phase = AuthPhase::Authenticated {
                     session_id,
                     expires_at,
@@ -452,13 +452,6 @@ impl AuthState {
     }
     pub fn timeout_with_jitter(&mut self, now: i64, jitter_per_mille: i16) -> AuthAction {
         match self.phase {
-            AuthPhase::Authenticating { deadline, .. }
-            | AuthPhase::AwaitingPong { deadline, .. }
-                if now >= deadline =>
-            {
-                self.enter_backoff(now, jitter_per_mille);
-                AuthAction::Retry
-            }
             AuthPhase::Reauthenticating { deadline, .. } if now >= deadline => {
                 self.enter_reauth_backoff(now, jitter_per_mille);
                 AuthAction::Retry
@@ -469,6 +462,15 @@ impl AuthState {
                 ..
             } if now >= deadline => {
                 self.enter_reauth_backoff(now, jitter_per_mille);
+                AuthAction::Retry
+            }
+            AuthPhase::Authenticating { deadline, .. }
+            | AuthPhase::AwaitingPong {
+                deadline,
+                prior_session_id: None,
+                ..
+            } if now >= deadline => {
+                self.enter_backoff(now, jitter_per_mille);
                 AuthAction::Retry
             }
             _ => AuthAction::Ignore,
@@ -581,12 +583,12 @@ mod tests {
             AuthAction::Authenticate { request_id: AUTH }
         );
         assert_eq!(
-            state.authenticated([9; 16], SESSION, PING, 7, 10),
+            state.authenticated([9; 16], SESSION, 100, PING, 7, 10),
             AuthAction::Ignore
         );
         assert!(matches!(state.phase(), AuthPhase::Authenticating { .. }));
         assert_eq!(
-            state.authenticated(AUTH, SESSION, PING, 7, 10),
+            state.authenticated(AUTH, SESSION, 100, PING, 7, 10),
             AuthAction::Ping {
                 request_id: PING,
                 session_id: SESSION,
@@ -666,8 +668,7 @@ mod tests {
     fn short_session_renews_at_midpoint_without_overwriting_prior_expiry() {
         let mut state = AuthState::new();
         state.connected(AUTH, 0);
-        state.authenticated(AUTH, SESSION, PING, 7, 0);
-        state.set_session_expiry(100);
+        state.authenticated(AUTH, SESSION, 100, PING, 7, 0);
         assert_eq!(state.pong(PING, 7), AuthAction::Ready);
         assert!(!state.renewal_due(49));
         assert!(state.renewal_due(50));
@@ -677,7 +678,7 @@ mod tests {
                 request_id: [4; 16]
             }
         );
-        state.set_session_expiry(200);
+        state.authenticated([4; 16], [5; 16], 200, [6; 16], 8, 50);
         assert_eq!(state.current_session(99), Some(SESSION));
     }
 
@@ -685,8 +686,7 @@ mod tests {
     fn renewal_keeps_valid_session_until_replacement_ping() {
         let mut state = AuthState::new();
         state.connected(AUTH, 0);
-        state.authenticated(AUTH, SESSION, PING, 7, 0);
-        state.set_session_expiry(100);
+        state.authenticated(AUTH, SESSION, 100, PING, 7, 0);
         assert_eq!(state.pong(PING, 7), AuthAction::Ready);
         assert_eq!(state.current_session(99), Some(SESSION));
         assert!(!state.renewal_due(40));
@@ -698,6 +698,25 @@ mod tests {
             }
         );
         assert_eq!(state.current_session(50), Some(SESSION));
+    }
+
+    #[test]
+    fn replacement_ping_timeout_keeps_prior_session_until_real_expiry() {
+        let mut state = AuthState::new();
+        state.connected(AUTH, 0);
+        state.authenticated(AUTH, SESSION, 100, PING, 7, 0);
+        assert_eq!(state.pong(PING, 7), AuthAction::Ready);
+        let renewal = [4; 16];
+        assert_eq!(
+            state.begin_renewal(renewal, 50),
+            AuthAction::Authenticate {
+                request_id: renewal
+            }
+        );
+        state.authenticated(renewal, [5; 16], 200, [6; 16], 8, 50);
+        assert_eq!(state.timeout(55), AuthAction::Retry);
+        assert_eq!(state.current_session(99), Some(SESSION));
+        assert_eq!(state.current_session(100), None);
     }
 
     #[test]
