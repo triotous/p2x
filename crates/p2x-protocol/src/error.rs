@@ -32,6 +32,35 @@ pub enum PublicErrorCode {
     ExchangeDraining,
 }
 impl PublicErrorCode {
+    const ALL: &'static [Self] = &[
+        Self::AuthInvalidCredential,
+        Self::AuthExchangeIdentityMismatch,
+        Self::AuthSessionRequired,
+        Self::AuthSessionExpired,
+        Self::AuthRoleForbidden,
+        Self::AuthTicketInvalid,
+        Self::AuthTicketExpired,
+        Self::ExchangeOverloaded,
+        Self::ExchangeTimeout,
+        Self::LimitAuthConnections,
+        Self::LimitAuthRequests,
+        Self::LimitAuthSessions,
+        Self::ProtocolFrameTooLarge,
+        Self::ProtocolMalformed,
+        Self::ProtocolUnsupportedVersion,
+        Self::ProtocolCapabilityMismatch,
+        Self::RegistryInvalidAdvertisement,
+        Self::RegistryConflict,
+        Self::RegistryReservationRequired,
+        Self::RegistryStaleRevision,
+        Self::RegistryNotFound,
+        Self::RegistryOffline,
+        Self::RelayUnauthorized,
+        Self::RelayQuota,
+        Self::LimitServices,
+        Self::LimitRegistryRequests,
+        Self::ExchangeDraining,
+    ];
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AuthInvalidCredential => "auth.invalid_credential",
@@ -63,6 +92,14 @@ impl PublicErrorCode {
             Self::ExchangeDraining => "exchange.draining",
         }
     }
+    pub fn try_from_wire(value: &str) -> Result<Self, ()> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|code| code.as_str() == value)
+            .ok_or(())
+    }
+
     pub fn parse(value: &str) -> Self {
         match value {
             "auth.invalid_credential" => Self::AuthInvalidCredential,
@@ -121,5 +158,6 @@ mod tests {
             PublicErrorCode::parse("secret"),
             PublicErrorCode::ProtocolMalformed
         );
+        assert!(PublicErrorCode::try_from_wire("secret").is_err());
     }
 }

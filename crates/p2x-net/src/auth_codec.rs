@@ -289,7 +289,7 @@ fn decode_response(b: &[u8]) -> Result<AuthResponse, AuthProtocolError> {
             } else {
                 None
             };
-            let code = PublicErrorCode::parse(&text(b, &mut p)?);
+            let code = PublicErrorCode::try_from_wire(&text(b, &mut p)?).map_err(|_| invalid())?;
             let retryable = take(b, &mut p, 1)?[0];
             if retryable > 1 {
                 return Err(invalid());

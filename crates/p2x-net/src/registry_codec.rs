@@ -376,7 +376,8 @@ fn decode_response(bytes: &[u8]) -> Result<RegistryResponseV1, RegistryProtocolE
                 1 => Some(request_id(bytes, &mut position)?),
                 _ => return Err(malformed()),
             };
-            let code = PublicErrorCode::parse(&text(bytes, &mut position)?);
+            let code = PublicErrorCode::try_from_wire(&text(bytes, &mut position)?)
+                .map_err(|_| malformed())?;
             let retryable = take(bytes, &mut position, 1)?[0];
             if retryable > 1 {
                 return Err(malformed());

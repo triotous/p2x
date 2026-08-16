@@ -3,7 +3,8 @@ use crate::{
     ids::{InstanceId, RegistrationRevision, UpstreamId},
     selector::{ScopedSelector, SelectorError, UnscopedSelector},
 };
-use std::num::NonZeroU64;
+use sha2::{Digest, Sha256};
+use std::{collections::HashSet, num::NonZeroU64};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Capabilities(u32);
@@ -73,16 +74,39 @@ impl ServiceSet {
         if services.is_empty() || services.len() > 128 {
             return Err(SelectorError::ServiceCount);
         }
-        services.sort_by(|a, b| a.upstream_id.as_str().cmp(b.upstream_id.as_str()));
-        for pair in services.windows(2) {
-            if pair[0].upstream_id == pair[1].upstream_id || pair[0].selector == pair[1].selector {
+        let mut upstream_ids = HashSet::with_capacity(services.len());
+        let mut selectors = HashSet::with_capacity(services.len());
+        for service in &services {
+            if !upstream_ids.insert(service.upstream_id.clone())
+                || !selectors.insert(service.selector.clone())
+            {
                 return Err(SelectorError::DuplicateService);
             }
         }
+        services.sort_by(|a, b| a.upstream_id.as_str().cmp(b.upstream_id.as_str()));
         Ok(Self(services))
     }
     pub fn as_slice(&self) -> &[ServiceAdvertisementV1] {
         &self.0
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"p2x-service-set-v1\0");
+        out.extend_from_slice(&(self.0.len() as u16).to_be_bytes());
+        for service in &self.0 {
+            put_bytes(&mut out, service.upstream_id.as_str().as_bytes());
+            put_bytes(&mut out, &service.selector.canonical_bytes(None));
+            out.push(match service.health {
+                Health::Ready => 0,
+                Health::Unavailable => 1,
+            });
+        }
+        out
+    }
+
+    pub fn hash(&self) -> [u8; 32] {
+        Sha256::digest(self.canonical_bytes()).into()
     }
 }
 
@@ -110,6 +134,68 @@ pub enum RegistryRequestV1 {
         expected_registration_revision: NonZeroU64,
     },
 }
+
+impl RegistryRequestV1 {
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"p2x-registry-request-v1\0");
+        match self {
+            Self::Register {
+                request_id,
+                session_id,
+                instance_id,
+                requested_lease_seconds,
+                capabilities,
+                services,
+            } => {
+                out.push(0);
+                out.extend_from_slice(request_id);
+                out.extend_from_slice(session_id);
+                out.extend_from_slice(instance_id.as_bytes());
+                out.extend_from_slice(&requested_lease_seconds.to_be_bytes());
+                out.extend_from_slice(&capabilities.bits().to_be_bytes());
+                put_bytes(&mut out, &services.canonical_bytes());
+            }
+            Self::Refresh {
+                request_id,
+                session_id,
+                instance_id,
+                expected_registration_revision,
+                requested_lease_seconds,
+            } => {
+                out.push(1);
+                out.extend_from_slice(request_id);
+                out.extend_from_slice(session_id);
+                out.extend_from_slice(instance_id.as_bytes());
+                out.extend_from_slice(&expected_registration_revision.get().to_be_bytes());
+                out.extend_from_slice(&requested_lease_seconds.to_be_bytes());
+            }
+            Self::Withdraw {
+                request_id,
+                session_id,
+                instance_id,
+                expected_registration_revision,
+            } => {
+                out.push(2);
+                out.extend_from_slice(request_id);
+                out.extend_from_slice(session_id);
+                out.extend_from_slice(instance_id.as_bytes());
+                out.extend_from_slice(&expected_registration_revision.get().to_be_bytes());
+            }
+        }
+        out
+    }
+
+    pub fn hash(&self) -> [u8; 32] {
+        Sha256::digest(self.canonical_bytes()).into()
+    }
+}
+
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RegistryResponseV1 {
     Registered {
@@ -168,6 +254,14 @@ mod tests {
         assert_eq!(set.as_slice()[0].upstream_id().as_str(), "a");
         assert!(matches!(
             ServiceSet::new(vec![service("a", "a"), service("a", "b")]),
+            Err(SelectorError::DuplicateService)
+        ));
+        assert!(matches!(
+            ServiceSet::new(vec![
+                service("a", "same"),
+                service("b", "other"),
+                service("c", "same")
+            ]),
             Err(SelectorError::DuplicateService)
         ));
         let _ = Tenant::new("t");
