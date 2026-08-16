@@ -61,6 +61,8 @@ struct Args {
     auth_limit_connections: Option<usize>,
     #[arg(long)]
     auth_limit_requests: Option<usize>,
+    #[arg(long)]
+    auth_limit_sessions: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -141,7 +143,10 @@ async fn main() -> io::Result<()> {
             .ensure_separate_from(&transport_public)
             .map_err(io::Error::other)?;
     }
-    let mut sessions = AuthSessionLedger::default();
+    let mut sessions = args.auth_limit_sessions.map_or_else(
+        AuthSessionLedger::default,
+        AuthSessionLedger::with_max_sessions,
+    );
     let mut admission = match (args.auth_limit_connections, args.auth_limit_requests) {
         (Some(connections), Some(requests)) => AdmissionLedger::with_limits(connections, requests),
         _ => AdmissionLedger::default(),

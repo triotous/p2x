@@ -116,7 +116,8 @@ exchange_log="$out/exchange.ndjson"
 P2X_RUN_ID="$run_id" "$root/target/debug/p2x-exchange" \
   --identity-file "$exchange_key" --credential-file "$credentials_file" --ticket-key-file "$ticket_key" \
   --auth-limit-connections "$([[ "$case_name" == connection-limit ]] && echo 0 || echo 256)" \
-  --auth-limit-requests "$([[ "$case_name" == connection-limit || "$case_name" == request-limit || "$case_name" == session-limit ]] && echo 0 || echo 128)" \
+  --auth-limit-requests "$([[ "$case_name" == request-limit ]] && echo 0 || echo 128)" \
+  --auth-limit-sessions "$([[ "$case_name" == session-limit ]] && echo 0 || echo 256)" \
   --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
   >"$exchange_log" 2>&1 &
 exchange_pid=$!
@@ -139,7 +140,17 @@ PY
 fi
 exchange_addr=""
 for _ in $(seq 1 200); do
-  exchange_addr=$(jq -r 'select(.event == "listener_ready" and (.address | contains("/tcp/"))) | .address' "$exchange_log" 2>/dev/null | head -1 || true)
+  exchange_addr=$(python3 - "$exchange_log" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if row.get('event') == 'listener_ready' and '/tcp/' in row.get('address', ''):
+        print(row['address']); break
+PY
+)
   [[ -n "$exchange_addr" ]] && break
   sleep .05
 done
@@ -218,7 +229,7 @@ if [[ "$case_name" != exchange-restart ]]; then
   [[ "$terminal_count" -eq 1 ]] || { echo "$component emitted $terminal_count terminal records" >&2; exit 1; }
 fi
 if [[ "$case_name" == connection-limit || "$case_name" == request-limit || "$case_name" == session-limit ]]; then
-  grep -q '"code":"limit.auth_requests\|"code":"limit.auth_connections"' "$log" || { echo "limit case lacked live request rejection" >&2; exit 1; }
+  grep -q '"code":"limit.auth_requests\|"code":"limit.auth_connections\|"code":"limit.auth_sessions"' "$log" || { echo "limit case lacked live limit rejection" >&2; exit 1; }
   cargo test -q -p p2x-exchange --lib admission::tests::rejected_close_cannot_undercount_admitted_connections
 elif [[ "$case_name" == malformed-frame || "$case_name" == unsupported-version || "$case_name" == oversized-frame ]]; then
   cargo test -q -p p2x-net --lib auth_codec::tests::rejects_version_capability_and_trailing
@@ -247,7 +258,17 @@ PY
   P2X_RUN_ID="$run_id-rotation" "$root/target/debug/p2x-exchange" --identity-file "$exchange_key" --credential-file "$credentials_file" --ticket-key-file "$ticket_key" --tcp-listen "$listen_base" --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/exchange-rotation.ndjson" 2>&1 &
   exchange_pid=$!; pids+=("$exchange_pid")
   rotation_addr=""
-  for _ in $(seq 1 200); do rotation_addr=$(jq -r 'select(.event == "listener_ready" and (.address | contains("/tcp/"))) | .address' "$out/exchange-rotation.ndjson" 2>/dev/null | head -1 || true); [[ -n "$rotation_addr" ]] && break; sleep .05; done
+  for _ in $(seq 1 200); do rotation_addr=$(python3 - "$out/exchange-rotation.ndjson" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if row.get('event') == 'listener_ready' and '/tcp/' in row.get('address', ''):
+        print(row['address']); break
+PY
+); [[ -n "$rotation_addr" ]] && break; sleep .05; done
   [[ -n "$rotation_addr" ]] || { echo "rotation exchange did not become ready" >&2; exit 1; }
   P2X_TOKEN="$rotation_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$rotation_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --finite-auth-check --case-id rotation-second --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/rotation-second.ndjson" 2>&1 &
   pids+=("$!")

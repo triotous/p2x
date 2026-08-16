@@ -53,6 +53,9 @@ impl AuthSessionLedger {
         }
         actions
     }
+    pub fn with_max_sessions(max_sessions: usize) -> Self {
+        Self::new(max_sessions)
+    }
     pub fn new(max_sessions: usize) -> Self {
         Self {
             sessions: HashMap::new(),

@@ -4,7 +4,7 @@ use p2x_protocol::{CredentialId, QuotaProfile, Tenant, TokenDigest, TokenSecret}
 use serde::{Deserialize, Deserializer, de::Visitor};
 use std::fmt;
 use std::str::FromStr;
-use std::{env, fs, path::Path};
+use std::{env, path::Path};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -65,9 +65,6 @@ pub enum CredentialConfigError {
 }
 impl FixedTokenFile {
     pub fn load(path: &Path) -> Result<Self, CredentialConfigError> {
-        if fs::metadata(path)?.len() > 512 * 1024 {
-            return Err(CredentialConfigError::Invalid("file too large"));
-        }
         let file: Self = crate::yaml::load(path).map_err(|error| match error {
             crate::yaml::YamlError::Io(error) => CredentialConfigError::Io(error),
             crate::yaml::YamlError::Parse(error) => CredentialConfigError::Yaml(error),
