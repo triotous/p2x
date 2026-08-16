@@ -13,6 +13,8 @@ cargo-fuzz = true
 libfuzzer-sys = { version = "0.4", package = "libfuzzer-sys" }
 p2x-protocol = { path = "../crates/p2x-protocol" }
 p2x-net = { path = "../crates/p2x-net" }
+futures = "0.3"
+libp2p = { version = "=0.56.0", default-features = false, features = ["request-response"] }
 
 [[bin]]
 name = "auth_frame_decode"
@@ -31,6 +33,13 @@ bench = false
 [[bin]]
 name = "ticket_claims_decode"
 path = "fuzz_targets/ticket_claims_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "registry_frame_decode"
+path = "fuzz_targets/registry_frame_decode.rs"
 test = false
 doc = false
 bench = false
