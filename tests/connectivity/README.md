@@ -4,6 +4,25 @@ Plan 02 proves the accepted libp2p connectivity architecture across native proce
 
 Canonical runners write typed per-process NDJSON, summaries, topology, and resource samples below `target/p2x-spike/<run-id>/`. Missing prerequisites and unavailable environments exit non-zero; no unsupported case is reported as passed.
 
+### Case reference
+
+| Case | Condition | Required observation |
+|---|---|---|
+| C01 | Same host with TCP and QUIC enabled | Relay becomes ready, DCUtR selects direct, and the probe succeeds |
+| C02 | Peer-to-peer TCP blocked | Direct QUIC is selected, not relay |
+| C03 | Peer-to-peer UDP blocked | Direct TCP is selected, not relay |
+| C04 | All peer-to-peer traffic blocked; exchange reachable | Relay succeeds within the setup deadline |
+| C05 | Direct and relay coexist | Exact opens on each connection are observed as direct and relay by both endpoints |
+| C06 | Terminal DCUtR outcome suppressed | Relay commits after the bounded direct deadline without hanging |
+| C07 | Exchange stopped during active direct half-close transfer | Direct transfer completes and relay readiness becomes degraded |
+| C08 | Selected connection dropped during payload | Active stream fails, then a later request reconnects and succeeds in the same process |
+| C09 | Low relay reservation/circuit limits | Excess work is denied without starving admitted control/events |
+| C10 | 64 concurrent probes, then 128 headroom probes | Correct independent results, bounded queues/resources, and no wrong-connection opens |
+| C11 | 256 MiB direct and relay slow-reader transfers | Hash/half-close correctness, bounded RSS, and a concurrent nonce remains responsive |
+| C12 | Reservation lifetime crosses two renewal points | At least two renewals and a continuously dialable circuit address |
+| C13 | 100 connect-close churn iterations | No leaked tasks, listeners, records, permits, RSS, or file descriptors |
+| C14 | Two real hosts on separate networks | Relay succeeds; direct outcome and environment are recorded honestly |
+
 ## 1. Common prerequisites
 
 From a clean checkout of the commit being verified:
@@ -59,7 +78,7 @@ If Cargo is not under the original sudo user's `~/.cargo/bin`:
 sudo P2X_CARGO="$(command -v cargo)" ./tests/connectivity/manual-gates.sh --linux
 ```
 
-Linux mode compiles as the original `SUDO_USER` before creating namespaces, so Cargo does not run as root. It expects Cargo at that user's `~/.cargo/bin/cargo`. For another installation layout, provide the absolute path explicitly:
+Linux mode compiles as the original `SUDO_USER` before creating namespaces, so Cargo does not run as root. By default it expects Cargo at that user's `~/.cargo/bin/cargo`; use `P2X_CARGO` for another installation layout.
 
 The runner creates three run-scoped namespaces and scoped firewall/traffic-control rules, executes C02-C13, including 64/128 concurrency and direct/relay 256 MiB variants, and removes only resources derived from its validated run ID. After completion, confirm no test namespace remains with `ip netns list`. Detailed single-case setup is in [`../linux/C02-netns/README.md`](../linux/C02-netns/README.md).
 
