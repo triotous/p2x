@@ -40,10 +40,10 @@ impl RelayProfile {
         let product = matches!(self, Self::Product);
         let limit = matches!(self, Self::LimitTest);
         relay::Config {
-            max_reservations: if limit { 2 } else { 64 },
+            max_reservations: if limit { 2 } else { 8 },
             max_reservations_per_peer: if product || limit { 0 } else { 1 },
             reservation_duration: Duration::from_secs(60),
-            max_circuits: if limit { 2 } else { 128 },
+            max_circuits: if limit { 2 } else { 64 },
             max_circuits_per_peer: if product {
                 31
             } else if limit {
@@ -65,19 +65,19 @@ impl RelayProfile {
             circuit_src_rate_limiters: vec![],
         }
         .reservation_rate_per_peer(
-            NonZeroU32::new(if limit { 8 } else { 256 }).expect("positive relay rate"),
+            NonZeroU32::new(8).expect("positive relay rate"),
             Duration::from_secs(60),
         )
         .reservation_rate_per_ip(
-            NonZeroU32::new(if limit { 16 } else { 512 }).expect("positive relay rate"),
+            NonZeroU32::new(if limit { 16 } else { 32 }).expect("positive relay rate"),
             Duration::from_secs(60),
         )
         .circuit_src_per_peer(
-            NonZeroU32::new(if limit { 8 } else { 1024 }).expect("positive relay rate"),
+            NonZeroU32::new(if limit { 8 } else { 64 }).expect("positive relay rate"),
             Duration::from_secs(60),
         )
         .circuit_src_per_ip(
-            NonZeroU32::new(if limit { 16 } else { 2048 }).expect("positive relay rate"),
+            NonZeroU32::new(if limit { 16 } else { 256 }).expect("positive relay rate"),
             Duration::from_secs(60),
         )
     }
@@ -650,8 +650,8 @@ mod tests {
     #[test]
     fn relay_profiles_apply_all_effective_limits() {
         let default = RelayProfile::Product.config();
-        assert_eq!(default.max_reservations, 64);
-        assert_eq!(default.max_circuits, 128);
+        assert_eq!(default.max_reservations, 8);
+        assert_eq!(default.max_circuits, 64);
         assert_eq!(default.max_reservations_per_peer, 0);
         assert_eq!(default.max_circuits_per_peer, 31);
         let lab = RelayProfile::DefaultLab.config();

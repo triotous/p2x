@@ -284,11 +284,9 @@ async fn main() -> io::Result<()> {
                         continue;
                     }
                     let failed = matches!(&request, p2x_protocol::AuthRequest::Authenticate { .. });
-                    let response = if let Some(provider) = provider.as_ref() { handle_request(provider, &mut sessions, &peer.to_string(), request, chrono_like_now()) } else { AuthResponse::Rejected { request_id: wire_request_id, error: PublicError::new(PublicErrorCode::AuthSessionRequired, false) } };
-                    if let AuthResponse::Authenticated { ref session_id, ref tenant, role, scopes, ref quota_profile, authorization_revision, expires_at, .. } = response {
-                        let _ = tenant;
-                        let _ = relay_admission.install(peer, p2x_net::RelaySession { role, scopes, quota_profile: quota_profile.as_str().to_owned(), authorization_revision, expires_at: std::time::Instant::now() + std::time::Duration::from_secs(expires_at.saturating_sub(chrono_like_now()).max(0) as u64) });
-                        let _ = session_id;
+                    let response = if let Some(provider) = provider.as_ref() { handle_request(provider, &mut sessions, &peer.to_string(), request, chrono_like_now(), Some(&relay_admission)) } else { AuthResponse::Rejected { request_id: wire_request_id, error: PublicError::new(PublicErrorCode::AuthSessionRequired, false) } };
+                    if let AuthResponse::Authenticated { .. } = response {
+                        // Relay admission is installed transactionally by handle_request.
                     }
                     let rejected = matches!(response, AuthResponse::Rejected { .. });
                     admission.mark_response(admission_request_id, rejected && failed);

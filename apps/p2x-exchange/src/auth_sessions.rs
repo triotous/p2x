@@ -202,6 +202,9 @@ impl AuthSessionLedger {
         }
         actions
     }
+    pub fn remove_for_auth_failure(&mut self, peer_id: &str) {
+        self.sessions.remove(peer_id);
+    }
     pub fn current(&self, peer_id: &str, now: i64) -> Option<AuthSession> {
         self.sessions
             .get(peer_id)

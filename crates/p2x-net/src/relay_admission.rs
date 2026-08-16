@@ -7,6 +7,13 @@ use std::{
 };
 
 const MAX_ENTRIES: usize = 256;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RelayInstall {
+    Installed,
+    Capacity,
+    Draining,
+    Poisoned,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelaySession {
     pub role: Role,
@@ -23,15 +30,21 @@ struct Snapshot {
 #[derive(Clone, Debug, Default)]
 pub struct RelayAdmissionHandle(Arc<RwLock<Snapshot>>);
 impl RelayAdmissionHandle {
-    pub fn install(&self, peer: PeerId, session: RelaySession) -> bool {
+    pub fn install_checked(&self, peer: PeerId, session: RelaySession) -> RelayInstall {
         let Ok(mut snapshot) = self.0.write() else {
-            return false;
+            return RelayInstall::Poisoned;
         };
+        if snapshot.draining {
+            return RelayInstall::Draining;
+        }
         if snapshot.entries.len() >= MAX_ENTRIES && !snapshot.entries.contains_key(&peer) {
-            return false;
+            return RelayInstall::Capacity;
         }
         snapshot.entries.insert(peer, session);
-        true
+        RelayInstall::Installed
+    }
+    pub fn install(&self, peer: PeerId, session: RelaySession) -> bool {
+        self.install_checked(peer, session) == RelayInstall::Installed
     }
     pub fn remove(&self, peer: &PeerId) {
         if let Ok(mut snapshot) = self.0.write() {
@@ -158,16 +171,32 @@ mod tests {
         let admission = RelayAdmissionHandle::default();
         let server = peer();
         let client = peer();
-        assert!(admission.install(server, session(Role::Server, Scope::ReserveRelay.bit())));
+        assert_eq!(
+            admission.install_checked(server, session(Role::Server, Scope::ReserveRelay.bit())),
+            RelayInstall::Installed
+        );
         assert!(admission.is_reservation_authorized(&server, Instant::now()));
         assert!(!admission.is_circuit_source_authorized(&server, Instant::now()));
-        assert!(admission.install(client, session(Role::Client, Scope::OpenProxyStream.bit())));
+        assert_eq!(
+            admission.install_checked(client, session(Role::Client, Scope::OpenProxyStream.bit())),
+            RelayInstall::Installed
+        );
         assert!(admission.is_circuit_source_authorized(&client, Instant::now()));
         admission.set_draining(true);
         assert!(!admission.is_circuit_source_authorized(&client, Instant::now()));
         admission.set_draining(false);
         admission.sweep(Instant::now() + Duration::from_secs(31));
         assert_eq!(admission.len(), 0);
+    }
+    #[test]
+    fn install_rejects_drain_before_mutation() {
+        let admission = RelayAdmissionHandle::default();
+        admission.set_draining(true);
+        assert_eq!(
+            admission.install_checked(peer(), session(Role::Server, Scope::ReserveRelay.bit())),
+            RelayInstall::Draining
+        );
+        assert!(admission.is_empty());
     }
     #[test]
     fn per_peer_limit_translation_is_n_minus_one() {

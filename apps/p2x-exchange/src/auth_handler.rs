@@ -2,6 +2,7 @@ use crate::{
     auth_sessions::{AuthSessionLedger, SessionAction},
     authn::FixedTokenProvider,
 };
+use p2x_net::relay_admission::{RelayAdmissionHandle, RelayInstall, RelaySession};
 use p2x_protocol::{AuthRequest, AuthResponse, PublicError, PublicErrorCode};
 
 fn random_session_id() -> Result<[u8; 16], PublicErrorCode> {
@@ -16,6 +17,7 @@ pub fn handle_request(
     peer_id: &str,
     request: AuthRequest,
     now: i64,
+    relay_admission: Option<&RelayAdmissionHandle>,
 ) -> AuthResponse {
     match request {
         AuthRequest::Authenticate {
@@ -36,17 +38,51 @@ pub fn handle_request(
             match result {
                 Ok(principal) => match random_session_id() {
                     Ok(session_id) => match sessions.authenticate(principal, session_id, now) {
-                        SessionAction::Authenticated(session) => AuthResponse::Authenticated {
-                            request_id,
-                            session_id: session.session_id,
-                            tenant: session.principal.tenant,
-                            role: session.principal.role,
-                            scopes: session.principal.scopes,
-                            quota_profile: session.principal.quota_profile,
-                            authorization_revision: session.principal.authorization_revision,
-                            expires_at: session.expires_at,
-                            exchange_features: 0,
-                        },
+                        SessionAction::Authenticated(session) => {
+                            if let Some(admission) = relay_admission {
+                                let relay = RelaySession {
+                                    role: session.principal.role,
+                                    scopes: session.principal.scopes,
+                                    quota_profile: session
+                                        .principal
+                                        .quota_profile
+                                        .as_str()
+                                        .to_owned(),
+                                    authorization_revision: session
+                                        .principal
+                                        .authorization_revision,
+                                    expires_at: std::time::Instant::now()
+                                        + std::time::Duration::from_secs(
+                                            session.expires_at.saturating_sub(now).max(0) as u64,
+                                        ),
+                                };
+                                if admission.install_checked(
+                                    peer_id.parse().expect("validated peer id"),
+                                    relay,
+                                ) != RelayInstall::Installed
+                                {
+                                    sessions.remove_for_auth_failure(peer_id);
+                                    return AuthResponse::Rejected {
+                                        request_id: Some(request_id),
+                                        error: PublicError::new(
+                                            PublicErrorCode::ExchangeOverloaded,
+                                            true,
+                                        ),
+                                    };
+                                }
+                            }
+                            AuthResponse::Authenticated {
+                                request_id,
+                                session_id: session.session_id,
+                                tenant: session.principal.tenant,
+                                role: session.principal.role,
+                                scopes: session.principal.scopes,
+                                quota_profile: session.principal.quota_profile,
+                                authorization_revision: session.principal.authorization_revision,
+                                expires_at: session.expires_at,
+                                exchange_features: 0,
+                            }
+                        }
                         SessionAction::Rejected(code) => AuthResponse::Rejected {
                             request_id: Some(request_id),
                             error: PublicError::new(code, true),
@@ -119,7 +155,8 @@ mod tests {
                     requested_role: Role::Client,
                     supported_features: 1
                 },
-                1
+                1,
+                None
             ),
             AuthResponse::Rejected {
                 error: PublicError {
@@ -163,6 +200,7 @@ mod tests {
                 supported_features: 0,
             },
             1,
+            None,
         );
         let session_id = match response {
             AuthResponse::Authenticated { session_id, .. } => session_id,
@@ -178,6 +216,7 @@ mod tests {
                 nonce: 9,
             },
             2,
+            None,
         );
         assert!(matches!(pong, AuthResponse::Pong { nonce: 9, .. }));
     }
