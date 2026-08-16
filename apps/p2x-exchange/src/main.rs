@@ -20,6 +20,7 @@ use p2x_net::{
 };
 use p2x_protocol::{AuthResponse, PublicError, PublicErrorCode};
 use std::{
+    collections::HashSet,
     io,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
@@ -203,6 +204,8 @@ async fn main() -> io::Result<()> {
     };
     let relay_admission = p2x_net::RelayAdmissionHandle::default();
     let mut registry = p2x_exchange::registry::Registry::default();
+    let mut reserved_servers = HashSet::new();
+    registry.set_advertise_addresses(args.advertise.iter().map(ToString::to_string).collect());
     let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
     let config = ExchangeSwarmConfig {
         tcp_listen: args.tcp_listen,
@@ -232,9 +235,20 @@ async fn main() -> io::Result<()> {
                 let now = chrono_like_now();
                 let actions = sessions.sweep(now);
                 for action in actions {
-                    if let p2x_exchange::auth_sessions::SessionAction::Removed(peer) | p2x_exchange::auth_sessions::SessionAction::PrincipalRevoked(peer) = action
-                        && let Ok(peer_id) = peer.parse()
-                    { relay_admission.remove(&peer_id); registry.remove_peer(&peer_id); }
+                    match action {
+                        p2x_exchange::auth_sessions::SessionAction::Removed(peer)
+                        | p2x_exchange::auth_sessions::SessionAction::PrincipalRevoked(peer) => {
+                            if let Ok(peer_id) = peer.parse() {
+                                relay_admission.remove(&peer_id);
+                                reserved_servers.remove(&peer_id);
+                                registry.remove_peer(&peer_id);
+                            }
+                        }
+                        p2x_exchange::auth_sessions::SessionAction::ClosePeerConnections { connection_ids, .. } => {
+                            for connection_id in connection_ids { swarm.close_connection(connection_id); }
+                        }
+                        _ => {}
+                    }
                 }
                 registry.sweep(now);
                 relay_admission.sweep(std::time::Instant::now());
@@ -280,12 +294,20 @@ async fn main() -> io::Result<()> {
                 SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Registry(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, .. }, .. })) => {
                     let session = sessions.current(&peer.to_string(), chrono_like_now());
                     let response = match (session, request.clone()) {
-                        (Some(session), p2x_protocol::RegistryRequestV1::Register { .. }) if session.principal.role == p2x_protocol::Role::Server => registry.register(peer, &session.principal.tenant, session.principal.role, session.principal.scopes, &session.principal.quota_profile, session.principal.authorization_revision, relay_admission.is_reservation_authorized(&peer, std::time::Instant::now()), request, chrono_like_now()).unwrap_or_else(|error| p2x_protocol::RegistryResponseV1::Rejected { request_id: None, error: p2x_protocol::PublicError::new(error.code(), matches!(error, p2x_exchange::registry::RegistryError::ReservationRequired | p2x_exchange::registry::RegistryError::Overloaded)) }),
-                        (Some(session), p2x_protocol::RegistryRequestV1::Refresh { request_id, instance_id, expected_registration_revision, requested_lease_seconds, .. }) if session.principal.role == p2x_protocol::Role::Server => registry.refresh(peer, request_id, instance_id, p2x_protocol::RegistrationRevision::new(expected_registration_revision.get()).expect("nonzero revision"), relay_admission.is_reservation_authorized(&peer, std::time::Instant::now()), requested_lease_seconds, chrono_like_now()).unwrap_or_else(|error| p2x_protocol::RegistryResponseV1::Rejected { request_id: Some(request_id), error: p2x_protocol::PublicError::new(error.code(), true) }),
-                        (Some(session), p2x_protocol::RegistryRequestV1::Withdraw { request_id, instance_id, expected_registration_revision, .. }) if session.principal.role == p2x_protocol::Role::Server => registry.withdraw(peer, request_id, instance_id, p2x_protocol::RegistrationRevision::new(expected_registration_revision.get()).expect("nonzero revision")).unwrap_or_else(|error| p2x_protocol::RegistryResponseV1::Rejected { request_id: Some(request_id), error: p2x_protocol::PublicError::new(error.code(), true) }),
+                        (Some(session), p2x_protocol::RegistryRequestV1::Register { session_id, .. }) if session.principal.role == p2x_protocol::Role::Server && session_id == session.session_id => registry.register(peer, &session.principal.tenant, session.principal.role, session.principal.scopes, &session.principal.quota_profile, session.principal.authorization_revision, reserved_servers.contains(&peer), request, chrono_like_now()).unwrap_or_else(|error| p2x_protocol::RegistryResponseV1::Rejected { request_id: None, error: p2x_protocol::PublicError::new(error.code(), matches!(error, p2x_exchange::registry::RegistryError::ReservationRequired | p2x_exchange::registry::RegistryError::Overloaded)) }),
+                        (Some(session), p2x_protocol::RegistryRequestV1::Refresh { request_id, session_id, instance_id, expected_registration_revision, requested_lease_seconds }) if session.principal.role == p2x_protocol::Role::Server && session_id == session.session_id => registry.refresh(peer, request_id, instance_id, p2x_protocol::RegistrationRevision::new(expected_registration_revision.get()).expect("nonzero revision"), reserved_servers.contains(&peer), &session.principal.tenant, session.principal.role, session.principal.scopes, &session.principal.quota_profile, session.principal.authorization_revision, requested_lease_seconds, chrono_like_now()).unwrap_or_else(|error| p2x_protocol::RegistryResponseV1::Rejected { request_id: Some(request_id), error: p2x_protocol::PublicError::new(error.code(), matches!(error, p2x_exchange::registry::RegistryError::ReservationRequired | p2x_exchange::registry::RegistryError::Overloaded)) }),
+                        (Some(session), p2x_protocol::RegistryRequestV1::Withdraw { request_id, session_id, instance_id, expected_registration_revision }) if session.principal.role == p2x_protocol::Role::Server && session_id == session.session_id => registry.withdraw(peer, request_id, instance_id, p2x_protocol::RegistrationRevision::new(expected_registration_revision.get()).expect("nonzero revision"), &session.principal.tenant, session.principal.role, session.principal.scopes, &session.principal.quota_profile, session.principal.authorization_revision, chrono_like_now()).unwrap_or_else(|error| p2x_protocol::RegistryResponseV1::Rejected { request_id: Some(request_id), error: p2x_protocol::PublicError::new(error.code(), false) }),
                         _ => p2x_protocol::RegistryResponseV1::Rejected { request_id: None, error: p2x_protocol::PublicError::new(p2x_protocol::PublicErrorCode::AuthSessionRequired, false) },
                     };
                     swarm.behaviour_mut().registry.send_response(channel, response).map_err(|_| io::Error::other("registry response channel closed"))?;
+                }
+                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Relay(libp2p::relay::Event::ReservationReqAccepted { src_peer_id, .. })) => {
+                    reserved_servers.insert(src_peer_id);
+                }
+                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Relay(libp2p::relay::Event::ReservationClosed { src_peer_id }))
+                | SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Relay(libp2p::relay::Event::ReservationTimedOut { src_peer_id })) => {
+                    reserved_servers.remove(&src_peer_id);
+                    registry.remove_peer(&src_peer_id);
                 }
                 SwarmEvent::Behaviour(event) => { let message = format!("{event:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "relay.event", message: &message })?; }
                 SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => { let peer = peer_id.to_string(); let ip = endpoint.get_remote_address().iter().find_map(|p| match p { libp2p::multiaddr::Protocol::Ip4(v) => Some(v.to_string()), libp2p::multiaddr::Protocol::Ip6(v) => Some(v.to_string()), _ => None }).unwrap_or_else(|| "<unknown>".into()); if admission.admit_connection(connection_id, &peer, &ip) != Admission::Accepted { swarm.close_connection(connection_id); continue; } sessions.connection_established(&peer, connection_id); emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Established, path: Some(if endpoint.is_relayed() { p2x_net::probe::ProbePath::Relay } else { p2x_net::probe::ProbePath::Direct }), reason: None })?; }
@@ -296,6 +318,9 @@ async fn main() -> io::Result<()> {
             }
         }
     }
+    relay_admission.set_draining(true);
+    registry.set_draining(true);
+    registry.remove_peer(&local_peer_id);
     admission.shutdown(chrono_like_now());
     emitter.terminal(&TerminalResult::simple(
         &args.case_id,

@@ -99,6 +99,19 @@ impl ServiceConfig {
 mod tests {
     use super::*;
     #[test]
+    fn strict_service_config_rejects_unknown_and_non_strict_fields() {
+        let path = std::env::temp_dir().join(format!("p2x-services-strict-{}", std::process::id()));
+        std::fs::write(
+            &path,
+            "schema_version: 1\nregistration: {}\nunknown: true\nservices: []\n",
+        )
+        .unwrap();
+        assert!(ServiceConfig::load(&path).is_err());
+        std::fs::write(&path, "schema_version: 1\nregistration: {}\nservices:\n- upstream_id: orders\n  selector:\n    protocol: http\n    metadata: {service: orders}\n  enabled: yes\n").unwrap();
+        assert!(ServiceConfig::load(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+    #[test]
     fn strict_service_config_requires_enabled_service() {
         let path = std::env::temp_dir().join(format!("p2x-services-{}", std::process::id()));
         std::fs::write(&path, "schema_version: 1\nregistration: {}\nservices:\n- upstream_id: orders\n  selector:\n    protocol: http\n    metadata: {service: orders}\n  enabled: true\n").unwrap();

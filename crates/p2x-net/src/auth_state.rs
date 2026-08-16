@@ -149,6 +149,8 @@ pub enum AuthPhase {
     AwaitingPong {
         request_id: [u8; 16],
         session_id: [u8; 16],
+        prior_session_id: Option<[u8; 16]>,
+        prior_expires_at: i64,
         nonce: u64,
         deadline: i64,
     },
@@ -163,6 +165,11 @@ pub enum AuthPhase {
         deadline: i64,
     },
     Backoff {
+        until: i64,
+    },
+    ReauthBackoff {
+        session_id: [u8; 16],
+        expires_at: i64,
         until: i64,
     },
     Terminal(PublicErrorCode),
@@ -229,14 +236,32 @@ impl AuthState {
             AuthPhase::Authenticating {
                 request_id: expected,
                 ..
+            } if expected == request_id => {
+                self.phase = AuthPhase::AwaitingPong {
+                    request_id: ping_request_id,
+                    session_id,
+                    prior_session_id: None,
+                    prior_expires_at: 0,
+                    nonce,
+                    deadline: now + AUTH_TIMEOUT_SECONDS,
+                };
+                AuthAction::Ping {
+                    request_id: ping_request_id,
+                    session_id,
+                    nonce,
+                }
             }
-            | AuthPhase::Reauthenticating {
+            AuthPhase::Reauthenticating {
                 request_id: expected,
+                session_id: prior_session_id,
+                expires_at: prior_expires_at,
                 ..
             } if expected == request_id => {
                 self.phase = AuthPhase::AwaitingPong {
                     request_id: ping_request_id,
                     session_id,
+                    prior_session_id: Some(prior_session_id),
+                    prior_expires_at,
                     nonce,
                     deadline: now + AUTH_TIMEOUT_SECONDS,
                 };
@@ -251,12 +276,31 @@ impl AuthState {
     }
     pub fn set_session_expiry(&mut self, expires_at: i64) {
         self.session_expires_at = expires_at;
-        if let AuthPhase::Authenticated { session_id, .. } = self.phase {
-            self.phase = AuthPhase::Authenticated {
+        self.phase = match self.phase {
+            AuthPhase::Authenticated { session_id, .. } => AuthPhase::Authenticated {
                 session_id,
                 expires_at,
-            };
-        }
+            },
+            AuthPhase::Reauthenticating {
+                session_id,
+                request_id,
+                deadline,
+                ..
+            } => AuthPhase::Reauthenticating {
+                session_id,
+                expires_at,
+                request_id,
+                deadline,
+            },
+            AuthPhase::ReauthBackoff {
+                session_id, until, ..
+            } => AuthPhase::ReauthBackoff {
+                session_id,
+                expires_at,
+                until,
+            },
+            phase => phase,
+        };
     }
     pub fn current_session(&self, now: i64) -> Option<[u8; 16]> {
         match self.phase {
@@ -267,6 +311,16 @@ impl AuthState {
             | AuthPhase::Reauthenticating {
                 session_id,
                 expires_at,
+                ..
+            }
+            | AuthPhase::ReauthBackoff {
+                session_id,
+                expires_at,
+                ..
+            }
+            | AuthPhase::AwaitingPong {
+                prior_session_id: Some(session_id),
+                prior_expires_at: expires_at,
                 ..
             } if expires_at > now => Some(session_id),
             _ => None,
@@ -333,7 +387,11 @@ impl AuthState {
             self.phase = AuthPhase::Terminal(code);
             return AuthAction::Terminal(code);
         }
-        self.enter_backoff(now, jitter_per_mille);
+        if self.is_reauth_in_progress() {
+            self.enter_reauth_backoff(now, jitter_per_mille);
+        } else {
+            self.enter_backoff(now, jitter_per_mille);
+        }
         AuthAction::Retry
     }
     pub fn rejected(
@@ -342,9 +400,14 @@ impl AuthState {
         code: PublicErrorCode,
         now: i64,
     ) -> AuthAction {
+        let reauth = self.is_reauth_in_progress();
         let matches = match (self.phase, request_id) {
             (
                 AuthPhase::Authenticating {
+                    request_id: expected,
+                    ..
+                }
+                | AuthPhase::Reauthenticating {
                     request_id: expected,
                     ..
                 },
@@ -368,7 +431,11 @@ impl AuthState {
                 | PublicErrorCode::ExchangeOverloaded
                 | PublicErrorCode::LimitAuthRequests
         ) {
-            self.enter_backoff(now, 0);
+            if reauth {
+                self.enter_reauth_backoff(now, 0);
+            } else {
+                self.enter_backoff(now, 0);
+            }
             AuthAction::Retry
         } else {
             self.phase = AuthPhase::Terminal(code);
@@ -382,10 +449,21 @@ impl AuthState {
         match self.phase {
             AuthPhase::Authenticating { deadline, .. }
             | AuthPhase::AwaitingPong { deadline, .. }
-            | AuthPhase::Reauthenticating { deadline, .. }
                 if now >= deadline =>
             {
                 self.enter_backoff(now, jitter_per_mille);
+                AuthAction::Retry
+            }
+            AuthPhase::Reauthenticating { deadline, .. } if now >= deadline => {
+                self.enter_reauth_backoff(now, jitter_per_mille);
+                AuthAction::Retry
+            }
+            AuthPhase::AwaitingPong {
+                deadline,
+                prior_session_id: Some(_),
+                ..
+            } if now >= deadline => {
+                self.enter_reauth_backoff(now, jitter_per_mille);
                 AuthAction::Retry
             }
             _ => AuthAction::Ignore,
@@ -403,6 +481,14 @@ impl AuthState {
             self.phase = AuthPhase::Disconnected;
             return self.connected(request_id, now);
         }
+        if let AuthPhase::ReauthBackoff { until, .. } = self.phase
+            && now >= until
+        {
+            return self.begin_renewal(request_id, now);
+        }
+        if self.renewal_due(now) {
+            return self.begin_renewal(request_id, now);
+        }
         self.timeout_with_jitter(now, jitter_per_mille)
     }
     pub fn tick(&mut self, request_id: [u8; 16], now: i64) -> AuthAction {
@@ -413,6 +499,7 @@ impl AuthState {
             self.phase,
             AuthPhase::Authenticated { .. }
                 | AuthPhase::Reauthenticating { .. }
+                | AuthPhase::ReauthBackoff { .. }
                 | AuthPhase::Authenticating { .. }
                 | AuthPhase::AwaitingPong { .. }
         ) {
@@ -424,6 +511,43 @@ impl AuthState {
     }
     pub fn ready(&self) -> bool {
         matches!(self.phase, AuthPhase::Authenticated { expires_at, .. } if expires_at > i64::MIN)
+    }
+    fn is_reauth_in_progress(&self) -> bool {
+        matches!(
+            self.phase,
+            AuthPhase::Reauthenticating { .. }
+                | AuthPhase::ReauthBackoff { .. }
+                | AuthPhase::AwaitingPong {
+                    prior_session_id: Some(_),
+                    ..
+                }
+        )
+    }
+    fn enter_reauth_backoff(&mut self, now: i64, jitter_per_mille: i16) {
+        let (session_id, expires_at) = match self.phase {
+            AuthPhase::Reauthenticating {
+                session_id,
+                expires_at,
+                ..
+            } => (session_id, expires_at),
+            AuthPhase::AwaitingPong {
+                prior_session_id: Some(session_id),
+                prior_expires_at: expires_at,
+                ..
+            } => (session_id, expires_at),
+            _ => return,
+        };
+        self.attempts = self.attempts.saturating_add(1);
+        let shift = self.attempts.saturating_sub(1).min(5);
+        let delay = (BACKOFF_BASE_SECONDS << shift).min(BACKOFF_MAX_SECONDS);
+        let jitter =
+            (delay * BACKOFF_JITTER_PER_MILLE * i64::from(jitter_per_mille.clamp(-1000, 1000)))
+                / 1000;
+        self.phase = AuthPhase::ReauthBackoff {
+            session_id,
+            expires_at,
+            until: now.saturating_add(delay + jitter),
+        };
     }
     fn enter_backoff(&mut self, now: i64, jitter_per_mille: i16) {
         self.attempts = self.attempts.saturating_add(1);

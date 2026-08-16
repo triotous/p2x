@@ -58,6 +58,7 @@ impl RegistryError {
 struct CachedResponse {
     digest: [u8; 32],
     response: RegistryResponseV1,
+    created_at: i64,
 }
 #[derive(Default)]
 pub struct Registry {
@@ -66,20 +67,28 @@ pub struct Registry {
     idempotency: HashMap<(PeerId, [u8; 16]), CachedResponse>,
     revision_allocator: RevisionAllocator,
     draining: bool,
+    advertise_addresses: Vec<String>,
 }
 #[derive(Default)]
 struct RevisionAllocator;
 impl RevisionAllocator {
-    fn next(&mut self) -> Option<RegistrationRevision> {
+    fn next_unique<'a>(
+        &mut self,
+        mut records: impl Iterator<Item = &'a RegistrationRecord>,
+    ) -> Option<RegistrationRevision> {
         let mut bytes = [0; 8];
         getrandom::fill(&mut bytes).ok()?;
-        RegistrationRevision::new(u64::from_be_bytes(bytes))
+        let revision = RegistrationRevision::new(u64::from_be_bytes(bytes))?;
+        (!records.any(|record| record.registration_revision == revision)).then_some(revision)
     }
 }
 
 impl Registry {
     pub fn set_draining(&mut self, value: bool) {
         self.draining = value;
+    }
+    pub fn set_advertise_addresses(&mut self, addresses: Vec<String>) {
+        self.advertise_addresses = addresses;
     }
     #[allow(clippy::too_many_arguments)]
     pub fn register(
@@ -133,8 +142,7 @@ impl Registry {
         }
         if services.as_slice().is_empty()
             || services.as_slice().len() > MAX_SERVICES
-            || lease == 0
-            || lease > 60
+            || !(10..=60).contains(&lease)
             || !capabilities.contains(Capabilities::RELAY_V2)
             || !capabilities.direct_transport()
         {
@@ -158,7 +166,7 @@ impl Registry {
         }
         let revision = self
             .revision_allocator
-            .next()
+            .next_unique(self.registrations.values())
             .ok_or(RegistryError::Overloaded)?;
         let hash = service_set_hash(services);
         let expires_at = now.saturating_add(lease as i64);
@@ -181,7 +189,11 @@ impl Registry {
             service_set_hash: hash,
             services: services.clone(),
             expires_at,
-            relay_addresses: Vec::new(),
+            relay_addresses: self
+                .advertise_addresses
+                .iter()
+                .map(|address| format!("{address}/p2p-circuit/p2p/{peer_id}"))
+                .collect(),
         };
         if let Some(old) = self.registrations.remove(&peer_id) {
             for service in old.services.as_slice() {
@@ -195,7 +207,7 @@ impl Registry {
             self.selector_owners.insert(key, peer_id);
         }
         self.registrations.insert(peer_id, record);
-        self.cache(peer_id, request_id, digest, response.clone());
+        self.cache(peer_id, request_id, digest, response.clone(), now);
         let _ = session_id;
         Ok(response)
     }
@@ -207,14 +219,40 @@ impl Registry {
         instance_id: InstanceId,
         revision: RegistrationRevision,
         reserved: bool,
+        tenant: &Tenant,
+        role: Role,
+        scopes: u32,
+        quota: &QuotaProfile,
+        authorization_revision: u64,
         requested_lease: u16,
         now: i64,
     ) -> Result<RegistryResponseV1, RegistryError> {
         if self.draining {
             return Err(RegistryError::Draining);
         }
+        if role != Role::Server
+            || scopes & Scope::RegisterServices.bit() == 0
+            || quota.as_str() != "standard"
+        {
+            return Err(RegistryError::Unauthorized);
+        }
         if !reserved {
             return Err(RegistryError::ReservationRequired);
+        }
+        if !(10..=60).contains(&requested_lease) {
+            return Err(RegistryError::InvalidAdvertisement);
+        }
+        let digest = request_digest_fields(&[
+            &request_id,
+            instance_id.as_bytes(),
+            &revision.get().to_be_bytes(),
+            &requested_lease.to_be_bytes(),
+        ]);
+        if let Some(cached) = self.idempotency.get(&(peer_id, request_id)) {
+            if cached.digest == digest {
+                return Ok(cached.response.clone());
+            }
+            return Err(RegistryError::InvalidAdvertisement);
         }
         let record = self
             .registrations
@@ -223,22 +261,54 @@ impl Registry {
         if record.instance_id != instance_id || record.registration_revision != revision {
             return Err(RegistryError::StaleRevision);
         }
-        let lease = requested_lease.clamp(1, 60);
+        if record.authorization_revision != authorization_revision
+            || record.tenant != *tenant
+            || record.quota_profile != *quota
+        {
+            return Err(RegistryError::Unauthorized);
+        }
+        let lease = requested_lease;
         record.expires_at = now.saturating_add(lease as i64);
-        Ok(RegistryResponseV1::Refreshed {
+        let response = RegistryResponseV1::Refreshed {
             request_id,
             instance_id,
             registration_revision: revision,
             expires_at: record.expires_at,
-        })
+        };
+        self.cache(peer_id, request_id, digest, response.clone(), now);
+        Ok(response)
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn withdraw(
         &mut self,
         peer_id: PeerId,
         request_id: [u8; 16],
         instance_id: InstanceId,
         revision: RegistrationRevision,
+        tenant: &Tenant,
+        role: Role,
+        scopes: u32,
+        quota: &QuotaProfile,
+        authorization_revision: u64,
+        now: i64,
     ) -> Result<RegistryResponseV1, RegistryError> {
+        let digest = request_digest_fields(&[
+            &request_id,
+            instance_id.as_bytes(),
+            &revision.get().to_be_bytes(),
+        ]);
+        if let Some(cached) = self.idempotency.get(&(peer_id, request_id)) {
+            if cached.digest == digest {
+                return Ok(cached.response.clone());
+            }
+            return Err(RegistryError::InvalidAdvertisement);
+        }
+        if role != Role::Server
+            || scopes & Scope::RegisterServices.bit() == 0
+            || quota.as_str() != "standard"
+        {
+            return Err(RegistryError::Unauthorized);
+        }
         let record = self
             .registrations
             .get(&peer_id)
@@ -246,16 +316,24 @@ impl Registry {
         if record.instance_id != instance_id || record.registration_revision != revision {
             return Err(RegistryError::StaleRevision);
         }
+        if record.authorization_revision != authorization_revision
+            || record.quota_profile != *quota
+            || record.tenant != *tenant
+        {
+            return Err(RegistryError::Unauthorized);
+        }
         let record = self
             .registrations
             .remove(&peer_id)
             .expect("record was checked");
         self.remove_indexes(&record);
-        Ok(RegistryResponseV1::Withdrawn {
+        let response = RegistryResponseV1::Withdrawn {
             request_id,
             instance_id,
             registration_revision: revision,
-        })
+        };
+        self.cache(peer_id, request_id, digest, response.clone(), now);
+        Ok(response)
     }
     pub fn remove_peer(&mut self, peer_id: &PeerId) -> bool {
         let Some(record) = self.registrations.remove(peer_id) else {
@@ -265,6 +343,9 @@ impl Registry {
         true
     }
     pub fn sweep(&mut self, now: i64) {
+        self.idempotency.retain(|_, cached| {
+            cached.created_at == i64::MAX || now.saturating_sub(cached.created_at) <= 60
+        });
         let peers = self
             .registrations
             .iter()
@@ -301,6 +382,7 @@ impl Registry {
         request_id: [u8; 16],
         digest: [u8; 32],
         response: RegistryResponseV1,
+        created_at: i64,
     ) {
         if self.idempotency.len() >= MAX_IDEMPOTENCY_GLOBAL {
             self.idempotency.clear();
@@ -316,13 +398,27 @@ impl Registry {
         {
             self.idempotency.remove(oldest);
         }
-        self.idempotency
-            .insert((peer, request_id), CachedResponse { digest, response });
+        self.idempotency.insert(
+            (peer, request_id),
+            CachedResponse {
+                digest,
+                response,
+                created_at,
+            },
+        );
     }
 }
 fn request_digest(request: &RegistryRequestV1) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(format!("{request:?}").as_bytes());
+    hasher.finalize().into()
+}
+fn request_digest_fields(fields: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for field in fields {
+        hasher.update((*field).len().to_be_bytes());
+        hasher.update(field);
+    }
     hasher.finalize().into()
 }
 fn service_set_hash(services: &ServiceSet) -> [u8; 32] {
@@ -420,6 +516,90 @@ mod tests {
         registry.sweep(40);
         assert_eq!(registry.len(), 0);
         assert_eq!(registry.owner_count(), 0);
+    }
+    #[test]
+    fn refresh_and_withdraw_are_session_scoped_and_idempotent() {
+        let (tenant, quota, services) = data();
+        let peer = PeerId::random();
+        let mut registry = Registry::default();
+        let registered = registry
+            .register(
+                peer,
+                &tenant,
+                Role::Server,
+                3,
+                &quota,
+                7,
+                true,
+                request(services, [1; 16]),
+                10,
+            )
+            .unwrap();
+        let (instance, revision) = match registered {
+            RegistryResponseV1::Registered {
+                instance_id,
+                registration_revision,
+                ..
+            } => (instance_id, registration_revision),
+            _ => unreachable!(),
+        };
+        let refreshed = registry
+            .refresh(
+                peer,
+                [2; 16],
+                instance,
+                revision,
+                true,
+                &tenant,
+                Role::Server,
+                3,
+                &quota,
+                7,
+                30,
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            refreshed,
+            registry
+                .refresh(
+                    peer,
+                    [2; 16],
+                    instance,
+                    revision,
+                    true,
+                    &tenant,
+                    Role::Server,
+                    3,
+                    &quota,
+                    7,
+                    30,
+                    99
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            registry
+                .withdraw(
+                    peer,
+                    [3; 16],
+                    instance,
+                    revision,
+                    &tenant,
+                    Role::Server,
+                    3,
+                    &quota,
+                    7,
+                    21
+                )
+                .unwrap(),
+            RegistryResponseV1::Withdrawn {
+                request_id: [3; 16],
+                instance_id: instance,
+                registration_revision: revision
+            }
+        );
+        assert!(registry.is_empty());
     }
     #[test]
     fn removal_is_idempotent_and_requires_reservation() {
