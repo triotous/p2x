@@ -1,4 +1,4 @@
-use libp2p::swarm::ConnectionId;
+use libp2p::{request_response::InboundRequestId, swarm::ConnectionId};
 use p2x_protocol::PublicErrorCode;
 use std::collections::HashMap;
 
@@ -26,6 +26,19 @@ struct ConnectionRecord {
     peer: String,
     ip: String,
 }
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct AdmissionRequestId(String);
+impl From<InboundRequestId> for AdmissionRequestId {
+    fn from(value: InboundRequestId) -> Self {
+        Self(value.to_string())
+    }
+}
+#[cfg(test)]
+impl From<u64> for AdmissionRequestId {
+    fn from(value: u64) -> Self {
+        Self(value.to_string())
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RequestRecord {
     connection_id: ConnectionId,
@@ -41,7 +54,7 @@ pub struct AdmissionLedger {
     inflight: usize,
     peer_inflight: HashMap<String, usize>,
     failures: HashMap<String, FailureBucket>,
-    requests: HashMap<String, RequestRecord>,
+    requests: HashMap<AdmissionRequestId, RequestRecord>,
 }
 impl AdmissionLedger {
     pub fn admit_connection(
@@ -72,12 +85,12 @@ impl AdmissionLedger {
     }
     pub fn begin_auth(
         &mut self,
-        request_id: impl ToString,
+        request_id: impl Into<AdmissionRequestId>,
         connection_id: ConnectionId,
         now: i64,
     ) -> Admission {
         self.sweep(now);
-        let request_id = request_id.to_string();
+        let request_id = request_id.into();
         if self.requests.contains_key(&request_id) {
             return Admission::Rejected(PublicErrorCode::LimitAuthRequests);
         }
@@ -117,14 +130,14 @@ impl AdmissionLedger {
         );
         Admission::Accepted
     }
-    pub fn mark_response(&mut self, request_id: impl ToString, failed: bool) {
-        let request_id = request_id.to_string();
+    pub fn mark_response(&mut self, request_id: impl Into<AdmissionRequestId>, failed: bool) {
+        let request_id = request_id.into();
         if let Some(record) = self.requests.get_mut(&request_id) {
             record.failed = failed;
         }
     }
-    pub fn response_delivered(&mut self, request_id: impl ToString, now: i64) {
-        let request_id = request_id.to_string();
+    pub fn response_delivered(&mut self, request_id: impl Into<AdmissionRequestId>, now: i64) {
+        let request_id = request_id.into();
         let Some(record) = self.requests.remove(&request_id) else {
             return;
         };
@@ -239,13 +252,14 @@ mod tests {
         let mut ledger = AdmissionLedger::default();
         let id = ConnectionId::new_unchecked(7);
         assert_eq!(
-            ledger.begin_auth("1", id, 0),
+            ledger.begin_auth(1u64, id, 0),
             Admission::Rejected(PublicErrorCode::LimitAuthConnections)
         );
         ledger.admit_connection(id, "peer", "ip");
-        assert_eq!(ledger.begin_auth("2", id, 0), Admission::Accepted);
-        ledger.mark_response("2", true);
-        ledger.response_delivered("2", 0);
+        let request = 2u64;
+        assert_eq!(ledger.begin_auth(request, id, 0), Admission::Accepted);
+        ledger.mark_response(request, true);
+        ledger.response_delivered(request, 0);
         assert_eq!(ledger.inflight(), 0);
     }
     #[test]
@@ -253,7 +267,7 @@ mod tests {
         let mut ledger = AdmissionLedger::default();
         let connection = ConnectionId::new_unchecked(8);
         ledger.admit_connection(connection, "peer", "ip");
-        let request = 3;
+        let request = 3u64;
         assert_eq!(
             ledger.begin_auth(request, connection, 0),
             Admission::Accepted
