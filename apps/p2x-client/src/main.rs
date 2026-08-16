@@ -65,8 +65,8 @@ struct Args {
     identity_file: Option<PathBuf>,
     #[arg(long)]
     generate_identity: bool,
-    #[arg(long)]
-    exchange: Option<Multiaddr>,
+    #[arg(long, action = clap::ArgAction::Append)]
+    exchange: Vec<Multiaddr>,
     #[arg(long)]
     exchange_peer_id: Option<String>,
     #[arg(long)]
@@ -207,7 +207,7 @@ async fn main() -> io::Result<()> {
     let exchange_trust = if args.unsafe_connectivity_lab {
         None
     } else {
-        let exchange = args.exchange.as_ref().ok_or_else(|| {
+        let _exchange = args.exchange.first().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "product mode requires --exchange",
@@ -220,13 +220,14 @@ async fn main() -> io::Result<()> {
             )
         })?;
         Some(
-            p2x_config::trust::validate_exchange_trust(configured, std::slice::from_ref(exchange))
-                .map_err(|_| {
+            p2x_config::trust::validate_exchange_trust(configured, &args.exchange).map_err(
+                |_| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "auth.exchange_identity_mismatch",
                     )
-                })?,
+                },
+            )?,
         )
     };
     if args.credential_env.is_none() && !args.unsafe_connectivity_lab {
@@ -267,7 +268,7 @@ async fn main() -> io::Result<()> {
         .as_ref()
         .map(|trust| trust.peer_id)
         .or_else(|| {
-            args.exchange.as_ref().and_then(|address| {
+            args.exchange.first().and_then(|address| {
                 address.iter().find_map(|part| match part {
                     libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
                     _ => None,
@@ -294,8 +295,8 @@ async fn main() -> io::Result<()> {
         })?;
     let mut credential: Option<(p2x_protocol::CredentialId, p2x_protocol::TokenSecret)> = None;
     let mut connections = ConnectionBook::new(expected_exchange);
-    if let Some(address) = args.exchange.clone() {
-        swarm.dial(address).map_err(io::Error::other)?;
+    for address in &args.exchange {
+        swarm.dial(address.clone()).map_err(io::Error::other)?;
     }
     if let Some(address) = args.server.clone() {
         swarm.dial(address).map_err(io::Error::other)?;
@@ -313,12 +314,19 @@ async fn main() -> io::Result<()> {
     let mut auth_request_id = request_ids.allocate().map_err(io::Error::other)?;
     let mut ping_request_id = request_ids.allocate().map_err(io::Error::other)?;
     let mut auth_state = AuthState::new();
+    let mut exchange_redial_pending = false;
     let mut maintenance = tokio::time::interval(std::time::Duration::from_millis(100));
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerResult>(128);
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = maintenance.tick() => {
+                if exchange_redial_pending {
+                    exchange_redial_pending = false;
+                    for address in &args.exchange {
+                        swarm.dial(address.clone()).map_err(io::Error::other)?;
+                    }
+                }
                 let now = std::time::Instant::now();
                 connections.sweep(now);
                 if let (Some(peer_id), Some(attempt)) = (target_peer, attempt.as_mut()) {
@@ -468,6 +476,9 @@ async fn main() -> io::Result<()> {
                         let peer = peer_id.to_string();
                         let reason = format!("{cause:?}");
                         emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Closed, path: None, reason: Some(&reason) })?;
+                        if expected_exchange == peer_id && credential.is_some() && auth_state.disconnected() == AuthAction::Retry {
+                            exchange_redial_pending = true;
+                        }
                         if args.churn && churn_redial_pending && target_peer == Some(peer_id) && completed < args.count && let Some(address) = server_address.clone() {
                             churn_redial_pending = false;
                             swarm.dial(address).map_err(io::Error::other)?;

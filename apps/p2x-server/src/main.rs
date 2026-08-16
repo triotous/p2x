@@ -41,8 +41,8 @@ struct Args {
     #[arg(long, default_value = "/ip4/127.0.0.1/udp/0/quic-v1")]
     quic_listen: Multiaddr,
     /// Exchange relay address, including its /p2p/<peer-id> component.
-    #[arg(long)]
-    exchange: Option<Multiaddr>,
+    #[arg(long, action = clap::ArgAction::Append)]
+    exchange: Vec<Multiaddr>,
     #[arg(long)]
     exchange_peer_id: Option<String>,
     #[arg(long)]
@@ -111,7 +111,7 @@ async fn main() -> io::Result<()> {
     let exchange_trust = if args.unsafe_connectivity_lab {
         None
     } else {
-        let exchange = args.exchange.as_ref().ok_or_else(|| {
+        let _exchange = args.exchange.first().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "product mode requires --exchange",
@@ -124,13 +124,14 @@ async fn main() -> io::Result<()> {
             )
         })?;
         Some(
-            p2x_config::trust::validate_exchange_trust(configured, std::slice::from_ref(exchange))
-                .map_err(|_| {
+            p2x_config::trust::validate_exchange_trust(configured, &args.exchange).map_err(
+                |_| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "auth.exchange_identity_mismatch",
                     )
-                })?,
+                },
+            )?,
         )
     };
     if args.credential_env.is_none() && !args.unsafe_connectivity_lab {
@@ -172,13 +173,14 @@ async fn main() -> io::Result<()> {
     let mut auth_request_id = request_ids.allocate().map_err(io::Error::other)?;
     let mut ping_request_id = request_ids.allocate().map_err(io::Error::other)?;
     let mut auth_state = AuthState::new();
+    let mut exchange_redial_pending = false;
     if config.mode == RuntimeMode::Product
-        && let Some(exchange) = args.exchange.clone()
+        && let Some(exchange) = args.exchange.first().cloned()
     {
         swarm.dial(exchange).map_err(io::Error::other)?;
     }
     if config.mode == RuntimeMode::ConnectivityLab
-        && let Some(exchange) = args.exchange
+        && let Some(exchange) = args.exchange.first().cloned()
     {
         let relay_peer = exchange
             .iter()
@@ -220,6 +222,12 @@ async fn main() -> io::Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = resource_tick.tick() => {
+                if exchange_redial_pending {
+                    exchange_redial_pending = false;
+                    for address in &args.exchange {
+                        swarm.dial(address.clone()).map_err(io::Error::other)?;
+                    }
+                }
                 if let Some(book) = connection_book.as_mut() { book.sweep(std::time::Instant::now()); }
                 if let Some((id, token)) = credential.as_ref()
                     && let AuthAction::Authenticate { request_id } = auth_state.tick(request_ids.allocate().map_err(io::Error::other)?, unix_now())
@@ -307,6 +315,9 @@ async fn main() -> io::Result<()> {
                             emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Degraded, exchange_peer_id: &peer_id.to_string(), listener_id: circuit_listener_id.as_ref().map(|_| "circuit"), address: None, generation: 1, renewal: false })?;
                         }
                         if let Some(book) = connection_book.as_mut() { book.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?; }
+                        if relay_peer_id == Some(peer_id) && credential.is_some() && auth_state.disconnected() == AuthAction::Retry {
+                            exchange_redial_pending = true;
+                        }
                         connection_paths.remove(&connection_id);
                         let peer = peer_id.to_string();
                         let reason = format!("{cause:?}");
