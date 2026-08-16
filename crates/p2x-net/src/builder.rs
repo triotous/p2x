@@ -661,7 +661,7 @@ mod tests {
 
         let limited = RelayProfile::LimitTest.config();
         assert_eq!(limited.max_reservations, 2);
-        assert_eq!(limited.max_reservations_per_peer, 1);
+        assert_eq!(limited.max_reservations_per_peer, 0);
         assert_eq!(limited.max_circuits, 2);
         assert_eq!(limited.max_circuits_per_peer, 0);
         assert_eq!(limited.max_circuit_bytes, 16 * 1024 * 1024);
