@@ -204,10 +204,10 @@ def injected(case):
             restored = h.wait("exchange", lambda r: r.get("event") == "registry_transition" and r.get("code") == "registry.registered" and r.get("offset_ms", 0) > event["offset_ms"], 15)
             assertions = {"lease_expired": True, "readiness_lost": True, "selector_removed": event["selector_owners"] == 0, "late_refresh_not_resurrected": event["code"] == "registry.not_found", "fresh_revision_required": restored["revision"] != registered["revision"]}
         elif case == "reservation-loss":
-            ready = h.wait("server", lambda r: r.get("event") == "server_readiness" and r.get("ready") is True)
+            h.wait("server", lambda r: r.get("event") == "server_readiness" and r.get("ready") is True)
             registered = h.wait("exchange", lambda r: r.get("event") == "registry_transition" and r.get("code") == "registry.registered")
             event = h.wait("exchange", lambda r: r.get("event") == "exchange_resources" and r.get("offset_ms", 0) > registered["offset_ms"] and r.get("reservations") == 0 and r.get("registrations") == 0, 15)
-            h.wait("server", lambda r: r.get("event") == "server_readiness" and r.get("ready") is False and r.get("offset_ms", 0) > ready["offset_ms"])
+            h.wait("server", lambda r: r.get("event") == "server_readiness" and r.get("ready") is False and len([x for x in read_rows(h.logs["server"]) if x.get("event") == "server_readiness" and x.get("ready") is False]) >= 2)
             assertions = {"readiness_lost": True, "reservation_removed": True, "registration_removed": event["registrations"] == 0}
         else:
             event = h.wait("exchange", lambda r: r.get("event") == "registry_transition" and r.get("operation") == "register" and r.get("revision") is not None and r.get("mutations") == 1 and len([x for x in h.exrows() if x.get("event") == "registry_transition" and x.get("revision") == r.get("revision")]) >= 2)
