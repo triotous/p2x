@@ -1962,7 +1962,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 name = "p2x-fuzz"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "libfuzzer-sys",
+ "libp2p",
  "p2x-net",
  "p2x-protocol",
 ]
@@ -1979,6 +1981,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "web-time",
  "zeroize",
 ]
 
