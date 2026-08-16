@@ -10,6 +10,7 @@ use p2x_exchange::{
     auth_handler::handle_request,
     auth_sessions::AuthSessionLedger,
     authn::FixedTokenProvider,
+    registry_admission::{RegistryAdmission, RegistryAdmissionLedger},
 };
 use p2x_net::{
     builder::{
@@ -207,6 +208,7 @@ async fn main() -> io::Result<()> {
     };
     let relay_admission = p2x_net::RelayAdmissionHandle::default();
     let mut registry = p2x_exchange::registry::Registry::default();
+    let mut registry_admission = RegistryAdmissionLedger::default();
     let mut reserved_servers = HashSet::new();
     registry.set_advertise_addresses(args.advertise.iter().map(ToString::to_string).collect());
     let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -216,6 +218,7 @@ async fn main() -> io::Result<()> {
         allow_public: args.unsafe_lab_public_relay,
         relay_profile: args.relay_profile.into(),
         relay_admission: (!args.unsafe_connectivity_lab).then(|| relay_admission.clone()),
+        registry_enabled: !args.unsafe_connectivity_lab,
         mode: if args.unsafe_connectivity_lab {
             RuntimeMode::ConnectivityLab
         } else {
@@ -254,6 +257,7 @@ async fn main() -> io::Result<()> {
                     }
                 }
                 registry.sweep(now);
+                registry_admission.sweep(now);
                 relay_admission.sweep(std::time::Instant::now());
                 admission.sweep(chrono_like_now());
             }
@@ -296,7 +300,12 @@ async fn main() -> io::Result<()> {
                 SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Auth(RequestResponseEvent::InboundFailure { request_id, .. })) => {
                     admission.response_delivered(request_id, chrono_like_now());
                 }
-                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Registry(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, .. }, .. })) => {
+                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Registry(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, request_id }, connection_id, .. })) => {
+                    if registry_admission.begin(peer, request_id, connection_id, chrono_like_now()) != RegistryAdmission::Accepted {
+                        let response = p2x_protocol::RegistryResponseV1::Rejected { request_id: match &request { p2x_protocol::RegistryRequestV1::Register { request_id, .. } | p2x_protocol::RegistryRequestV1::Refresh { request_id, .. } | p2x_protocol::RegistryRequestV1::Withdraw { request_id, .. } => Some(*request_id) }, error: p2x_protocol::PublicError::new(PublicErrorCode::LimitRegistryRequests, true) };
+                        if swarm.behaviour_mut().registry.send_response(channel, response).is_err() { /* no owner was acquired */ }
+                        continue;
+                    }
                     let registry_request_id = match &request {
                         p2x_protocol::RegistryRequestV1::Register { request_id, .. }
                         | p2x_protocol::RegistryRequestV1::Refresh { request_id, .. }
@@ -309,7 +318,15 @@ async fn main() -> io::Result<()> {
                         (Some(session), p2x_protocol::RegistryRequestV1::Withdraw { request_id, session_id, instance_id, expected_registration_revision }) if session.principal.role == p2x_protocol::Role::Server && session_id == session.session_id => registry.withdraw(peer, request_id, instance_id, p2x_protocol::RegistrationRevision::new(expected_registration_revision.get()).expect("nonzero revision"), session_id, &session.principal.tenant, session.principal.role, session.principal.scopes, &session.principal.quota_profile, session.principal.authorization_revision, chrono_like_now()).unwrap_or_else(|error| p2x_protocol::RegistryResponseV1::Rejected { request_id: Some(request_id), error: p2x_protocol::PublicError::new(error.code(), false) }),
                         _ => p2x_protocol::RegistryResponseV1::Rejected { request_id: registry_request_id, error: p2x_protocol::PublicError::new(p2x_protocol::PublicErrorCode::AuthSessionRequired, false) },
                     };
-                    swarm.behaviour_mut().registry.send_response(channel, response).map_err(|_| io::Error::other("registry response channel closed"))?;
+                    if swarm.behaviour_mut().registry.send_response(channel, response).is_err() {
+                        registry_admission.release(peer, request_id, connection_id);
+                    }
+                }
+                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Registry(RequestResponseEvent::ResponseSent { peer, connection_id, request_id, .. })) => {
+                    registry_admission.release(peer, request_id, connection_id);
+                }
+                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Registry(RequestResponseEvent::InboundFailure { peer, connection_id, request_id, .. })) => {
+                    registry_admission.release(peer, request_id, connection_id);
                 }
                 SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Relay(libp2p::relay::Event::ReservationReqAccepted { src_peer_id, .. })) => {
                     reserved_servers.insert(src_peer_id);
@@ -330,6 +347,7 @@ async fn main() -> io::Result<()> {
                         reserved_servers.remove(&peer_id);
                         registry.remove_peer(&peer_id);
                     }
+                    registry_admission.close_connection(connection_id);
                     admission.close_connection(connection_id);
                     let reason = format!("{cause:?}");
                     emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Closed, path: None, reason: Some(&reason) })?;
@@ -343,6 +361,7 @@ async fn main() -> io::Result<()> {
     relay_admission.set_draining(true);
     registry.set_draining(true);
     registry.clear();
+    registry_admission.shutdown();
     admission.shutdown(chrono_like_now());
     emitter.terminal(&TerminalResult::simple(
         &args.case_id,

@@ -108,6 +108,7 @@ pub struct ExchangeSwarmConfig {
     pub allow_public: bool,
     pub relay_profile: RelayProfile,
     pub relay_admission: Option<RelayAdmissionHandle>,
+    pub registry_enabled: bool,
     pub mode: RuntimeMode,
 }
 
@@ -121,6 +122,7 @@ impl Default for ExchangeSwarmConfig {
             allow_public: false,
             relay_profile: RelayProfile::Product,
             relay_admission: None,
+            registry_enabled: true,
             mode: RuntimeMode::Product,
         }
     }
@@ -434,10 +436,10 @@ pub fn build_exchange_swarm(
             ),
             registry: libp2p::request_response::Behaviour::with_codec(
                 RegistryCodec,
-                [(
+                config.registry_enabled.then_some((
                     libp2p::StreamProtocol::new(REGISTRY_PROTOCOL),
                     libp2p::request_response::ProtocolSupport::Inbound,
-                )],
+                )),
                 libp2p::request_response::Config::default()
                     .with_request_timeout(Duration::from_secs(REGISTRY_REQUEST_TIMEOUT_SECONDS)),
             ),
