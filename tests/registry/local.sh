@@ -190,14 +190,15 @@ PY
   }
 
   local client_log="$out/client.ndjson"
+  local server_circuit="$exchange_addr/p2p-circuit/p2p/$server_peer"
   P2X_TOKEN="$client_token" P2X_RUN_ID="$run_id-$current" "$root/target/debug/p2x-client" \
     --identity-file "$client_key" --exchange "$exchange_addr" \
     --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN \
-    --finite-auth-check --case-id "$current" >"$client_log" 2>&1 &
+    --server "$server_circuit" --finite-relay-ping --case-id "$current" >"$client_log" 2>&1 &
   local client_pid=$!
   pids+=("$client_pid")
-  wait_for_json "$client_log" "row.get('event') == 'terminal' and row.get('code') == 'auth.pong'" 400 || {
-    echo "$current: client authentication failed" >&2; return 1;
+  wait_for_json "$client_log" "row.get('event') == 'terminal' and row.get('code') == 'relay.ping'" 600 || {
+    echo "$current: authenticated client relay Ping failed" >&2; return 1;
   }
   wait "$client_pid"
   untrack_pid "$client_pid"
@@ -267,7 +268,7 @@ summary={
     'observed_assertions': {
         'authenticated_reserve_register_ready': bool(ready),
         'registration_refresh': len(ready) >= 2,
-        'client_authenticated': any(r.get('event') == 'terminal' and r.get('code') == 'auth.pong' for r in rows),
+        'authenticated_client_relay_ping': any(r.get('event') == 'terminal' and r.get('code') == 'relay.ping' for r in rows),
         'graceful_server_shutdown': any(r.get('event') == 'terminal' and r.get('code') == 'shutdown' for r in rows),
         'same_process_exchange_restart_recovery': recovered == 'true',
         'privacy_scan_clean': True,

@@ -157,6 +157,8 @@ struct Args {
     recover_after_failure: bool,
     #[arg(long)]
     finite_auth_check: bool,
+    #[arg(long)]
+    finite_relay_ping: bool,
     #[arg(long, value_enum)]
     auth_fault: Option<AuthFaultArg>,
 }
@@ -304,7 +306,7 @@ async fn main() -> io::Result<()> {
         } else {
             RuntimeMode::Product
         },
-        relay_client_enabled: false,
+        relay_client_enabled: true,
         registry_enabled: false,
         auth_fault: args.auth_fault.map(Into::into),
     };
@@ -369,7 +371,9 @@ async fn main() -> io::Result<()> {
             .dial(args.exchange[index].clone())
             .map_err(io::Error::other)?;
     }
-    if let Some(address) = args.server.clone() {
+    if args.unsafe_connectivity_lab
+        && let Some(address) = args.server.clone()
+    {
         swarm.dial(address).map_err(io::Error::other)?;
     }
     let mut started = false;
@@ -509,7 +513,13 @@ async fn main() -> io::Result<()> {
                                 emitter.emit(&LifecycleRecord::OperationalError { code: "connection.rejected", message: &message })?;
                                 continue;
                             }
-                            if forced_path_matches(args.path, observed_path)
+                            if args.finite_relay_ping {
+                                if observed_path != ProbePath::Relay {
+                                    emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", "relay.path_required"))?;
+                                    return Ok(());
+                                }
+                                started = true;
+                            } else if forced_path_matches(args.path, observed_path)
                                 && (!started || matches!(args.path, Path::Both))
                                 && launched < args.count
                                 && forced_opened_connections.insert(connection_id)
@@ -534,7 +544,17 @@ async fn main() -> io::Result<()> {
                             if !pending_auth.begin(outbound) { return Err(io::Error::other("auth outbound request limit exceeded")); }
                         }
                     }
-                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Pong { request_id, nonce, .. } }, .. })) if credential.is_some() && pending_auth.complete(&outbound_id) && request_id == ping_request_id && auth_state.pong(request_id, nonce) == AuthAction::Ready => { readiness_generation = readiness_generation.saturating_add(1); if args.finite_auth_check { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?; return Ok(()); } emitter.emit(&LifecycleRecord::AuthReadiness { ready: true, generation: readiness_generation })?; }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Pong { request_id, nonce, .. } }, .. })) if credential.is_some() && pending_auth.complete(&outbound_id) && request_id == ping_request_id && auth_state.pong(request_id, nonce) == AuthAction::Ready => {
+                        readiness_generation = readiness_generation.saturating_add(1);
+                        if args.finite_auth_check {
+                            emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?;
+                            return Ok(());
+                        }
+                        emitter.emit(&LifecycleRecord::AuthReadiness { ready: true, generation: readiness_generation })?;
+                        if args.finite_relay_ping && let Some(address) = server_address.clone() {
+                            swarm.dial(address).map_err(io::Error::other)?;
+                        }
+                    }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Rejected { request_id, error } }, .. })) if credential.is_some() && pending_auth.complete(&outbound_id) && auth_state.rejected(request_id, error.code, unix_now()) != AuthAction::Ignore => {
                         if args.finite_auth_check || matches!(auth_state.phase(), p2x_net::auth_state::AuthPhase::Terminal(_)) {
                             emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", error.code.as_str()))?;
@@ -555,6 +575,10 @@ async fn main() -> io::Result<()> {
                         return Ok(());
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::OutboundFailure { request_id, error: libp2p::request_response::OutboundFailure::ConnectionClosed, .. })) if credential.is_some() => { pending_auth.complete(&request_id); }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Ping(event)) if args.finite_relay_ping && target_peer == Some(event.peer) && event.result.is_ok() && started => {
+                        emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "relay.ping"))?;
+                        return Ok(());
+                    }
                     SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => {
                         connections.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?;
                         if let Some(current) = attempt.as_mut() {
