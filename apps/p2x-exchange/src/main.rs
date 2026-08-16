@@ -112,6 +112,10 @@ struct Args {
     auth_limit_sessions: Option<usize>,
     #[arg(long, hide = true)]
     auth_limit_connections_per_ip: Option<usize>,
+    #[arg(long, hide = true)]
+    registry_limit_global: Option<usize>,
+    #[arg(long, hide = true)]
+    registry_limit_per_peer: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -219,7 +223,15 @@ async fn main() -> io::Result<()> {
     };
     let relay_admission = p2x_net::RelayAdmissionHandle::default();
     let mut registry = p2x_exchange::registry::Registry::default();
-    let mut registry_admission = RegistryAdmissionLedger::default();
+    let mut registry_admission = match (args.registry_limit_global, args.registry_limit_per_peer) {
+        (Some(global), Some(per_peer)) => RegistryAdmissionLedger::with_limits(
+            global,
+            per_peer,
+            p2x_exchange::registry_admission::MAX_PER_MINUTE,
+            p2x_exchange::registry_admission::MAX_BUCKETS,
+        ),
+        _ => RegistryAdmissionLedger::default(),
+    };
     let mut reserved_servers = HashSet::new();
     let mut active_circuits = 0usize;
     registry.set_advertise_addresses(args.advertise.iter().map(ToString::to_string).collect());

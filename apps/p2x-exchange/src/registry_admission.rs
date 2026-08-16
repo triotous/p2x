@@ -21,13 +21,37 @@ struct Key {
     connection_id: ConnectionId,
     peer: PeerId,
 }
-#[derive(Default)]
 pub struct RegistryAdmissionLedger {
+    max_global: usize,
+    max_per_peer: usize,
+    max_per_minute: usize,
+    max_buckets: usize,
     owners: HashMap<Key, ()>,
     peer_counts: HashMap<PeerId, usize>,
     buckets: HashMap<PeerId, VecDeque<i64>>,
 }
+impl Default for RegistryAdmissionLedger {
+    fn default() -> Self {
+        Self::with_limits(MAX_GLOBAL, MAX_PER_PEER, MAX_PER_MINUTE, MAX_BUCKETS)
+    }
+}
 impl RegistryAdmissionLedger {
+    pub fn with_limits(
+        max_global: usize,
+        max_per_peer: usize,
+        max_per_minute: usize,
+        max_buckets: usize,
+    ) -> Self {
+        Self {
+            max_global,
+            max_per_peer,
+            max_per_minute,
+            max_buckets,
+            owners: HashMap::new(),
+            peer_counts: HashMap::new(),
+            buckets: HashMap::new(),
+        }
+    }
     pub fn begin(
         &mut self,
         peer: PeerId,
@@ -36,16 +60,16 @@ impl RegistryAdmissionLedger {
         now: i64,
     ) -> RegistryAdmission {
         self.sweep(now);
-        if self.owners.len() >= MAX_GLOBAL
-            || self.peer_counts.get(&peer).copied().unwrap_or(0) >= MAX_PER_PEER
+        if self.owners.len() >= self.max_global
+            || self.peer_counts.get(&peer).copied().unwrap_or(0) >= self.max_per_peer
         {
             return RegistryAdmission::Rejected(PublicErrorCode::LimitRegistryRequests);
         }
-        if !self.buckets.contains_key(&peer) && self.buckets.len() >= MAX_BUCKETS {
+        if !self.buckets.contains_key(&peer) && self.buckets.len() >= self.max_buckets {
             return RegistryAdmission::Rejected(PublicErrorCode::ExchangeOverloaded);
         }
         let bucket = self.buckets.entry(peer).or_default();
-        if bucket.len() >= MAX_PER_MINUTE {
+        if bucket.len() >= self.max_per_minute {
             return RegistryAdmission::Rejected(PublicErrorCode::LimitRegistryRequests);
         }
         let key = Key {
@@ -158,5 +182,20 @@ mod tests {
             ledger.begin(peer, 100u64, connection, 60),
             RegistryAdmission::Accepted
         );
+    }
+    #[test]
+    fn configured_global_limit_rejects_before_higher_peer_limit() {
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(1);
+        let mut ledger = RegistryAdmissionLedger::with_limits(1, 2, 30, 256);
+        assert_eq!(
+            ledger.begin(peer, 1u64, connection, 0),
+            RegistryAdmission::Accepted
+        );
+        assert_eq!(
+            ledger.begin(peer, 2u64, connection, 0),
+            RegistryAdmission::Rejected(PublicErrorCode::LimitRegistryRequests)
+        );
+        assert_eq!(ledger.inflight(), 1);
     }
 }

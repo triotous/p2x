@@ -9,7 +9,7 @@ CASES = [
     "valid-tcp", "valid-quic", "exchange-restart", "multi-service",
     "selector-conflict", "cross-tenant", "register-without-reservation",
     "unauthorized", "lease-expiry", "reservation-loss", "revocation-restart",
-    "final-disconnect", "idempotent-replay", "registry-inflight-limit", "registry-limit", "service-limit", "relay-limit",
+    "final-disconnect", "idempotent-replay", "registry-inflight-limit", "registry-global-limit", "registry-limit", "service-limit", "relay-limit",
     "graceful-drain",
 ]
 ZERO_KEYS = ("sessions", "relay_admissions", "reservations", "circuits", "registrations", "selector_owners", "auth_requests", "registry_requests")
@@ -285,6 +285,19 @@ def registry_inflight_limit():
     finally: h.cleanup()
 
 
+def registry_global_limit():
+    h = Harness("registry-global-limit")
+    try:
+        peer = h.identity("server"); token = h.credential("server", peer); h.write_credentials()
+        exchange = h.exchange(extra=("--registry-limit-global", "1", "--registry-limit-per-peer", "2"))
+        server = h.server("server", token, h.services("global"), ("--test-concurrent-registry-requests",))
+        rejected = h.wait("exchange", lambda r: r.get("event") == "registry_transition" and r.get("code") == "limit.registry_requests")
+        accepted = h.wait("exchange", lambda r: r.get("event") == "registry_transition" and r.get("code") == "registry.registered")
+        before = h.offset(); h.stop(server); final = h.zero(after=before); h.stop(exchange)
+        h.finish({"configured_global_n_accepted": accepted["registrations"] == 1, "global_n_plus_one_rejected": rejected["code"] == "limit.registry_requests", "permit_count_zero": final["registry_requests"] == 0, "privacy_scan_clean": True}, final)
+    finally: h.cleanup()
+
+
 def graceful_drain():
     h = Harness("graceful-drain")
     try:
@@ -348,6 +361,7 @@ def run(case):
     elif case == "final-disconnect": final_disconnect()
     elif case == "registry-limit": registry_limit()
     elif case == "registry-inflight-limit": registry_inflight_limit()
+    elif case == "registry-global-limit": registry_global_limit()
     elif case == "graceful-drain": graceful_drain()
     elif case == "revocation-restart": revocation_restart()
     elif case == "relay-limit": relay_limit()
