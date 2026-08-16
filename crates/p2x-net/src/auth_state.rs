@@ -154,6 +154,13 @@ pub enum AuthPhase {
     },
     Authenticated {
         session_id: [u8; 16],
+        expires_at: i64,
+    },
+    Reauthenticating {
+        session_id: [u8; 16],
+        expires_at: i64,
+        request_id: [u8; 16],
+        deadline: i64,
     },
     Backoff {
         until: i64,
@@ -181,6 +188,7 @@ pub enum AuthAction {
 pub struct AuthState {
     phase: AuthPhase,
     attempts: u32,
+    session_expires_at: i64,
 }
 impl Default for AuthState {
     fn default() -> Self {
@@ -192,6 +200,7 @@ impl AuthState {
         Self {
             phase: AuthPhase::Disconnected,
             attempts: 0,
+            session_expires_at: 0,
         }
     }
     pub const fn phase(&self) -> AuthPhase {
@@ -220,6 +229,10 @@ impl AuthState {
             AuthPhase::Authenticating {
                 request_id: expected,
                 ..
+            }
+            | AuthPhase::Reauthenticating {
+                request_id: expected,
+                ..
             } if expected == request_id => {
                 self.phase = AuthPhase::AwaitingPong {
                     request_id: ping_request_id,
@@ -236,6 +249,55 @@ impl AuthState {
             _ => AuthAction::Ignore,
         }
     }
+    pub fn set_session_expiry(&mut self, expires_at: i64) {
+        self.session_expires_at = expires_at;
+        if let AuthPhase::Authenticated { session_id, .. } = self.phase {
+            self.phase = AuthPhase::Authenticated {
+                session_id,
+                expires_at,
+            };
+        }
+    }
+    pub fn current_session(&self, now: i64) -> Option<[u8; 16]> {
+        match self.phase {
+            AuthPhase::Authenticated {
+                session_id,
+                expires_at,
+            }
+            | AuthPhase::Reauthenticating {
+                session_id,
+                expires_at,
+                ..
+            } if expires_at > now => Some(session_id),
+            _ => None,
+        }
+    }
+    pub fn renewal_due(&self, now: i64) -> bool {
+        match self.phase {
+            AuthPhase::Authenticated { expires_at, .. } => now >= expires_at.saturating_sub(60),
+            _ => false,
+        }
+    }
+    pub fn begin_renewal(&mut self, request_id: [u8; 16], now: i64) -> AuthAction {
+        let AuthPhase::Authenticated {
+            session_id,
+            expires_at,
+        } = self.phase
+        else {
+            return AuthAction::Ignore;
+        };
+        if expires_at <= now {
+            self.phase = AuthPhase::Disconnected;
+            return AuthAction::Retry;
+        }
+        self.phase = AuthPhase::Reauthenticating {
+            session_id,
+            expires_at,
+            request_id,
+            deadline: now + AUTH_TIMEOUT_SECONDS,
+        };
+        AuthAction::Authenticate { request_id }
+    }
     pub fn pong(&mut self, request_id: [u8; 16], nonce: u64) -> AuthAction {
         match self.phase {
             AuthPhase::AwaitingPong {
@@ -244,7 +306,10 @@ impl AuthState {
                 nonce: expected_nonce,
                 ..
             } if expected == request_id && expected_nonce == nonce => {
-                self.phase = AuthPhase::Authenticated { session_id };
+                self.phase = AuthPhase::Authenticated {
+                    session_id,
+                    expires_at: self.session_expires_at,
+                };
                 self.attempts = 0;
                 AuthAction::Ready
             }
@@ -317,6 +382,7 @@ impl AuthState {
         match self.phase {
             AuthPhase::Authenticating { deadline, .. }
             | AuthPhase::AwaitingPong { deadline, .. }
+            | AuthPhase::Reauthenticating { deadline, .. }
                 if now >= deadline =>
             {
                 self.enter_backoff(now, jitter_per_mille);
@@ -346,6 +412,7 @@ impl AuthState {
         if matches!(
             self.phase,
             AuthPhase::Authenticated { .. }
+                | AuthPhase::Reauthenticating { .. }
                 | AuthPhase::Authenticating { .. }
                 | AuthPhase::AwaitingPong { .. }
         ) {
@@ -356,7 +423,7 @@ impl AuthState {
         AuthAction::Ignore
     }
     pub fn ready(&self) -> bool {
-        matches!(self.phase, AuthPhase::Authenticated { .. })
+        matches!(self.phase, AuthPhase::Authenticated { expires_at, .. } if expires_at > i64::MIN)
     }
     fn enter_backoff(&mut self, now: i64, jitter_per_mille: i16) {
         self.attempts = self.attempts.saturating_add(1);
@@ -466,6 +533,24 @@ mod tests {
         assert_eq!(cursor.next(3), Some(2));
         assert_eq!(cursor.next(3), Some(0));
     }
+    #[test]
+    fn renewal_keeps_valid_session_until_replacement_ping() {
+        let mut state = AuthState::new();
+        state.connected(AUTH, 0);
+        state.authenticated(AUTH, SESSION, PING, 7, 0);
+        state.set_session_expiry(100);
+        assert_eq!(state.pong(PING, 7), AuthAction::Ready);
+        assert_eq!(state.current_session(99), Some(SESSION));
+        assert!(state.renewal_due(40));
+        assert_eq!(
+            state.begin_renewal([4; 16], 40),
+            AuthAction::Authenticate {
+                request_id: [4; 16]
+            }
+        );
+        assert_eq!(state.current_session(50), Some(SESSION));
+    }
+
     #[test]
     fn non_retryable_rejection_is_terminal() {
         let mut state = AuthState::new();

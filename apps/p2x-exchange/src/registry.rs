@@ -81,6 +81,7 @@ impl Registry {
     pub fn set_draining(&mut self, value: bool) {
         self.draining = value;
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &mut self,
         peer_id: PeerId,
@@ -146,10 +147,12 @@ impl Registry {
         for service in services.as_slice() {
             let fingerprint = service.selector().fingerprint(principal);
             let key = (principal.clone(), fingerprint);
-            if let Some(owner) = self.selector_owners.get(&key) {
-                if *owner != peer_id {
-                    return Err(RegistryError::Conflict);
-                }
+            if self
+                .selector_owners
+                .get(&key)
+                .is_some_and(|owner| *owner != peer_id)
+            {
+                return Err(RegistryError::Conflict);
             }
             prepared_owners.push(key);
         }
@@ -196,9 +199,11 @@ impl Registry {
         let _ = session_id;
         Ok(response)
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn refresh(
         &mut self,
         peer_id: PeerId,
+        request_id: [u8; 16],
         instance_id: InstanceId,
         revision: RegistrationRevision,
         reserved: bool,
@@ -221,7 +226,7 @@ impl Registry {
         let lease = requested_lease.clamp(1, 60);
         record.expires_at = now.saturating_add(lease as i64);
         Ok(RegistryResponseV1::Refreshed {
-            request_id: [0; 16],
+            request_id,
             instance_id,
             registration_revision: revision,
             expires_at: record.expires_at,
@@ -230,6 +235,7 @@ impl Registry {
     pub fn withdraw(
         &mut self,
         peer_id: PeerId,
+        request_id: [u8; 16],
         instance_id: InstanceId,
         revision: RegistrationRevision,
     ) -> Result<RegistryResponseV1, RegistryError> {
@@ -246,7 +252,7 @@ impl Registry {
             .expect("record was checked");
         self.remove_indexes(&record);
         Ok(RegistryResponseV1::Withdrawn {
-            request_id: [0; 16],
+            request_id,
             instance_id,
             registration_revision: revision,
         })
@@ -275,6 +281,9 @@ impl Registry {
     pub fn len(&self) -> usize {
         self.registrations.len()
     }
+    pub fn is_empty(&self) -> bool {
+        self.registrations.is_empty()
+    }
     pub fn owner_count(&self) -> usize {
         self.selector_owners.len()
     }
@@ -302,10 +311,10 @@ impl Registry {
             .filter(|(owner, _)| *owner == peer)
             .copied()
             .collect::<Vec<_>>();
-        if peer_entries.len() >= MAX_IDEMPOTENCY_PER_PEER {
-            if let Some(oldest) = peer_entries.first() {
-                self.idempotency.remove(oldest);
-            }
+        if peer_entries.len() >= MAX_IDEMPOTENCY_PER_PEER
+            && let Some(oldest) = peer_entries.first()
+        {
+            self.idempotency.remove(oldest);
         }
         self.idempotency
             .insert((peer, request_id), CachedResponse { digest, response });

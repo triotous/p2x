@@ -123,6 +123,7 @@ pub struct PeerSwarmConfig {
     pub tcp_listen: Multiaddr,
     pub quic_listen: Multiaddr,
     pub mode: RuntimeMode,
+    pub relay_client_enabled: bool,
     pub auth_fault: Option<crate::auth_codec::AuthFault>,
 }
 
@@ -134,6 +135,7 @@ impl Default for PeerSwarmConfig {
                 .parse()
                 .expect("valid QUIC default"),
             mode: RuntimeMode::Product,
+            relay_client_enabled: false,
             auth_fault: None,
         }
     }
@@ -473,7 +475,8 @@ pub fn build_peer_swarm(
         .map_err(|e| BuildError::Builder(e.to_string()))?
         .with_behaviour(|_, relay_client| PeerBehaviour {
             relay_client: libp2p::swarm::behaviour::toggle::Toggle::from(
-                (config.mode == RuntimeMode::ConnectivityLab).then_some(relay_client),
+                (config.mode == RuntimeMode::ConnectivityLab || config.relay_client_enabled)
+                    .then_some(relay_client),
             ),
             dcutr: libp2p::swarm::behaviour::toggle::Toggle::from(
                 (config.mode == RuntimeMode::ConnectivityLab)

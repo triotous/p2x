@@ -12,5 +12,7 @@ futures.workspace = true
 getrandom.workspace = true
 libp2p.workspace = true
 p2x-net = { path = "../../crates/p2x-net" }
+serde.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

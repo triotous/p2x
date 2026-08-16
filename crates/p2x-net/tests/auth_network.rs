@@ -20,6 +20,7 @@ async fn run_auth_round_trip(quic: bool) {
         tcp_listen: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
         quic_listen: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
         mode: p2x_net::builder::RuntimeMode::Product,
+        relay_client_enabled: false,
         auth_fault: None,
     };
     let mut exchange = build_exchange_swarm(

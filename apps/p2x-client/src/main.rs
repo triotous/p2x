@@ -304,6 +304,7 @@ async fn main() -> io::Result<()> {
         } else {
             RuntimeMode::Product
         },
+        relay_client_enabled: false,
         auth_fault: args.auth_fault.map(Into::into),
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;

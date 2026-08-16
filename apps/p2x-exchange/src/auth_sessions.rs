@@ -179,8 +179,34 @@ impl AuthSessionLedger {
             .collect::<Vec<_>>();
         self.remove_revoked(revoked)
     }
-    pub fn sweep(&mut self, now: i64) {
-        self.sessions.retain(|_, session| session.expires_at > now);
+    pub fn sweep(&mut self, now: i64) -> Vec<SessionAction> {
+        let expired = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.expires_at <= now)
+            .map(|(peer, _)| peer.clone())
+            .collect::<Vec<_>>();
+        let mut actions = Vec::new();
+        for peer in expired {
+            self.sessions.remove(&peer);
+            let connection_ids = self
+                .connections
+                .get(&peer)
+                .map(|ids| ids.iter().copied().collect())
+                .unwrap_or_default();
+            actions.push(SessionAction::Removed(peer.clone()));
+            actions.push(SessionAction::ClosePeerConnections {
+                peer_id: peer,
+                connection_ids,
+            });
+        }
+        actions
+    }
+    pub fn current(&self, peer_id: &str, now: i64) -> Option<AuthSession> {
+        self.sessions
+            .get(peer_id)
+            .filter(|session| session.expires_at > now)
+            .cloned()
     }
     pub fn len(&self) -> usize {
         self.sessions.len()

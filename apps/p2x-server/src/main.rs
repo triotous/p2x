@@ -1,3 +1,6 @@
+mod availability;
+mod config;
+
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::{
@@ -25,7 +28,10 @@ use p2x_net::{
     probe_stream::behaviour::ProbeOutput,
     probe_worker::{WorkerAdmission, execute_probe_futures_with_timeout},
 };
-use p2x_protocol::{AuthRequest, AuthResponse, PublicErrorCode, Role};
+use p2x_protocol::{
+    AuthRequest, AuthResponse, Capabilities, InstanceId, PublicErrorCode, RegistryRequestV1,
+    RegistryResponseV1, Role,
+};
 use std::{collections::HashMap, io, path::PathBuf};
 use tokio::sync::mpsc;
 
@@ -50,6 +56,8 @@ struct Args {
     exchange_peer_id: Option<String>,
     #[arg(long)]
     credential_env: Option<String>,
+    #[arg(long)]
+    services_file: Option<PathBuf>,
     #[arg(long)]
     artifact: Option<PathBuf>,
     #[arg(long, default_value = "lifecycle")]
@@ -151,6 +159,19 @@ async fn main() -> io::Result<()> {
             )?,
         )
     };
+    let service_config = if args.unsafe_connectivity_lab {
+        None
+    } else {
+        Some(
+            config::ServiceConfig::load(args.services_file.as_deref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "product mode requires --services-file",
+                )
+            })?)
+            .map_err(io::Error::other)?,
+        )
+    };
     if args.credential_env.is_none() && !args.unsafe_connectivity_lab {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -171,6 +192,7 @@ async fn main() -> io::Result<()> {
         } else {
             RuntimeMode::Product
         },
+        relay_client_enabled: !args.unsafe_connectivity_lab,
         auth_fault: None,
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
@@ -196,12 +218,43 @@ async fn main() -> io::Result<()> {
     let mut exchange_redial = RedialBackoff::new();
     let mut exchange_addresses = AddressCursor::new();
     let mut readiness_generation = 0u64;
+    let mut instance_bytes = [0; 16];
+    getrandom::fill(&mut instance_bytes).map_err(io::Error::other)?;
+    let instance_id = InstanceId::new(instance_bytes);
+    let mut availability = availability::Availability::new(instance_bytes);
+    let mut registration_requested = false;
+    let mut pending_registry: PendingRequest<libp2p::request_response::OutboundRequestId> =
+        PendingRequest::new();
+    let mut registration_request_id = [0; 16];
     if config.mode == RuntimeMode::Product
         && let Some(index) = exchange_addresses.next(args.exchange.len())
     {
         swarm
             .dial(args.exchange[index].clone())
             .map_err(io::Error::other)?;
+    }
+    if config.mode == RuntimeMode::Product
+        && let Some(index) = exchange_addresses.next(args.exchange.len())
+    {
+        let exchange = args.exchange[index].clone();
+        let relay_peer = exchange
+            .iter()
+            .find_map(|part| match part {
+                Protocol::P2p(peer) => Some(peer),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "exchange address needs /p2p/<peer>",
+                )
+            })?;
+        relay_peer_id = Some(relay_peer);
+        pending_circuit = Some(
+            exchange
+                .with(Protocol::P2pCircuit)
+                .with(Protocol::P2p(*swarm.local_peer_id())),
+        );
     }
     if config.mode == RuntimeMode::ConnectivityLab
         && let Some(index) = exchange_addresses.next(args.exchange.len())
@@ -292,6 +345,16 @@ async fn main() -> io::Result<()> {
                         emitter.emit(&LifecycleRecord::ListenerReady { listener_id: &listener, address: &address })?;
                         if address.contains("p2p-circuit") && let (Some(peer_id), Some(connection_id)) = (relay_peer_id, relay_connection_id) {
                             reservation.apply(ReservationEvent::RelayAddressConfirmed { generation: 1, peer_id, connection_id, listener_id, address: address.parse().map_err(io::Error::other)? }).map_err(io::Error::other)?;
+                            if config.mode == RuntimeMode::Product && reservation.is_ready() && !registration_requested
+                                && let (Some(services), Some(session_id)) = (service_config.as_ref().map(|value| value.services.clone()), auth_state.current_session(unix_now()))
+                            {
+                                let request_id = request_ids.allocate().map_err(io::Error::other)?;
+                                let request = RegistryRequestV1::Register { request_id, session_id, instance_id, requested_lease_seconds: service_config.as_ref().map_or(30, |value| value.requested_lease_seconds), capabilities: Capabilities::from_bits(7).expect("known capabilities"), services };
+                                let outbound = swarm.behaviour_mut().registry.send_request(&peer_id, request);
+                                if !pending_registry.begin(outbound) { return Err(io::Error::other("registry outbound request limit exceeded")); }
+                                registration_request_id = request_id;
+                                registration_requested = true;
+                            }
                         }
                     }
                     SwarmEvent::ExternalAddrConfirmed { address } => {
@@ -317,6 +380,16 @@ async fn main() -> io::Result<()> {
                         emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Established, path: Some(path), reason: None })?;
                         if relay_peer_id == Some(peer_id) {
                             exchange_connections.established(connection_id);
+                            if config.mode == RuntimeMode::Product {
+                                relay_connection_id = Some(connection_id);
+                                if let Some(address) = pending_circuit.clone() && !reservation_requested {
+                                    reservation.apply(ReservationEvent::GenerationStarted { generation: 1, peer_id, connection_id }).map_err(io::Error::other)?;
+                                    let listener_id = swarm.listen_on(address).map_err(io::Error::other)?;
+                                    circuit_listener_id = Some(listener_id);
+                                    reservation.apply(ReservationEvent::ReservationRequested { generation: 1, peer_id, connection_id }).map_err(io::Error::other)?;
+                                    reservation_requested = true;
+                                }
+                            }
                             exchange_redial.reset();
                             if credential.is_none() {
                                 credential = credential_ref.as_ref().map(|reference| reference.read().map_err(io::Error::other)).transpose()?;
@@ -329,8 +402,8 @@ async fn main() -> io::Result<()> {
                                 if !pending_auth.begin(outbound) { return Err(io::Error::other("auth outbound request limit exceeded")); }
                             }
                         }
-                        if config.mode == RuntimeMode::ConnectivityLab
-                            && relay_peer_id == Some(peer_id)
+                        if relay_peer_id == Some(peer_id)
+                            && config.mode == RuntimeMode::ConnectivityLab
                             && !reservation_requested
                             && let Some(address) = pending_circuit.clone()
                         {
@@ -377,14 +450,27 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::ListenerClosed { reason, .. } => {
                         let message = format!("{reason:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "listener.closed", message: &message })?;
                     }
-                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Authenticated { session_id, request_id, .. } }, .. })) if pending_auth.complete(&outbound_id) => {
-                        if let AuthAction::Ping { request_id: ping_id, session_id, nonce } = auth_state.authenticated(request_id, session_id, { ping_request_id = request_ids.allocate().map_err(io::Error::other)?; ping_request_id }, 1, unix_now()) {
+                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Authenticated { session_id, request_id, expires_at, .. } }, .. })) if pending_auth.complete(&outbound_id) => {
+                        auth_state.set_session_expiry(expires_at);
+                        let next_ping_id = request_ids.allocate().map_err(io::Error::other)?;
+                        if let AuthAction::Ping { request_id: ping_id, session_id, nonce } = auth_state.authenticated(request_id, session_id, next_ping_id, 1, unix_now()) {
                             ping_request_id = ping_id;
                             let outbound = swarm.behaviour_mut().auth.send_request(&peer, AuthRequest::Ping { request_id: ping_id, session_id, nonce });
                             if !pending_auth.begin(outbound) { return Err(io::Error::other("auth outbound request limit exceeded")); }
                         }
                     }
-                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Pong { request_id, nonce, .. } }, .. })) if credential.is_some() && pending_auth.complete(&outbound_id) && request_id == ping_request_id && auth_state.pong(request_id, nonce) == AuthAction::Ready => { readiness_generation = readiness_generation.saturating_add(1); if args.finite_auth_check { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?; return Ok(()); } emitter.emit(&LifecycleRecord::AuthReadiness { ready: true, generation: readiness_generation })?; }
+                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Pong { request_id, nonce, .. } }, .. })) if credential.is_some() && pending_auth.complete(&outbound_id) && request_id == ping_request_id && auth_state.pong(request_id, nonce) == AuthAction::Ready => {
+                        readiness_generation = readiness_generation.saturating_add(1);
+                        if config.mode == RuntimeMode::Product { let _ = availability.auth_ready(); }
+                        if config.mode == RuntimeMode::Product && !reservation_requested && let (Some(address), Some(connection_id)) = (pending_circuit.clone(), relay_connection_id) {
+                            reservation.apply(ReservationEvent::GenerationStarted { generation: 1, peer_id: peer, connection_id }).map_err(io::Error::other)?;
+                            let listener_id = swarm.listen_on(address).map_err(io::Error::other)?;
+                            circuit_listener_id = Some(listener_id);
+                            reservation.apply(ReservationEvent::ReservationRequested { generation: 1, peer_id: peer, connection_id }).map_err(io::Error::other)?;
+                            reservation_requested = true;
+                        }
+                        if args.finite_auth_check { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?; return Ok(()); } emitter.emit(&LifecycleRecord::AuthReadiness { ready: true, generation: readiness_generation })?;
+                    }
                     SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Rejected { request_id, error } }, .. })) if credential.is_some() && pending_auth.complete(&outbound_id) && auth_state.rejected(request_id, error.code, unix_now()) != AuthAction::Ignore => {
                         if matches!(auth_state.phase(), p2x_net::auth_state::AuthPhase::Terminal(_)) {
                             emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", error.code.as_str()))?;
@@ -400,13 +486,19 @@ async fn main() -> io::Result<()> {
                         return Ok(());
                     }
                     SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::OutboundFailure { request_id, error: libp2p::request_response::OutboundFailure::ConnectionClosed, .. })) if credential.is_some() => { pending_auth.complete(&request_id); }
-                    SwarmEvent::Behaviour(PeerEvent::Relay(libp2p::relay::client::Event::ReservationReqAccepted { relay_peer_id: peer_id, renewal, .. })) if config.mode == RuntimeMode::ConnectivityLab => {
+                    SwarmEvent::Behaviour(PeerEvent::Relay(libp2p::relay::client::Event::ReservationReqAccepted { relay_peer_id: peer_id, renewal, .. })) if config.mode == RuntimeMode::ConnectivityLab || config.mode == RuntimeMode::Product => {
                         if let (Some(connection_id), Some(listener_id)) = (relay_connection_id, circuit_listener_id) {
                             reservation.apply(ReservationEvent::ReservationAccepted { generation: 1, peer_id, connection_id, listener_id, renewal }).map_err(io::Error::other)?;
                             let relay = peer_id.to_string();
                             emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Accepted, exchange_peer_id: &relay, listener_id: Some("circuit"), address: None, generation: 1, renewal })?;
                         }
                     }
+                    SwarmEvent::Behaviour(PeerEvent::Registry(RequestResponseEvent::Message { message: RequestResponseMessage::Response { request_id: outbound_id, response }, .. })) if pending_registry.complete(&outbound_id) => {
+                        if let RegistryResponseV1::Registered { request_id, instance_id: response_instance, expires_at, .. } = response
+                            && request_id == registration_request_id && response_instance == instance_id
+                        { let _ = availability.registered(1, expires_at, unix_now()); }
+                    }
+                    SwarmEvent::Behaviour(PeerEvent::Registry(RequestResponseEvent::OutboundFailure { request_id, .. })) if pending_registry.complete(&request_id) => { registration_requested = false; }
                     SwarmEvent::Behaviour(PeerEvent::Relay(_)) => {}
                     SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundOpened { mut stream, peer_id, connection_id })) => {
                         if args.drop_first_probe && !first_probe_dropped {
