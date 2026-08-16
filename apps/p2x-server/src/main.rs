@@ -633,6 +633,9 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::Behaviour(PeerEvent::Relay(libp2p::relay::client::Event::ReservationReqAccepted { relay_peer_id: peer_id, renewal, .. })) if config.mode == RuntimeMode::ConnectivityLab || config.mode == RuntimeMode::Product => {
                         if let (Some(connection_id), Some(listener_id)) = (relay_connection_id, circuit_listener_id) {
                             reservation.apply(ReservationEvent::ReservationAccepted { generation: reservation.generation, peer_id, connection_id, listener_id, renewal }).map_err(io::Error::other)?;
+                            if config.mode == RuntimeMode::Product {
+                                let _ = availability.reservation_ready(reservation.generation);
+                            }
                             if config.mode == RuntimeMode::Product && reservation.is_ready() && !registration_requested && let Some(session_id) = auth_state.current_session(unix_now()) {
                                 let (outbound, operation) = send_register(&mut swarm, peer_id, &mut request_ids, session_id, instance_id, service_config.as_ref().expect("product services"))?;
                                 if !pending_registry.begin(outbound) { return Err(io::Error::other("registry outbound request limit exceeded")); }
@@ -663,7 +666,22 @@ async fn main() -> io::Result<()> {
                             _ => { let _ = availability.registration_lost(); }
                         }
                     }
-                    SwarmEvent::Behaviour(PeerEvent::Registry(RequestResponseEvent::OutboundFailure { request_id, .. })) if pending_registry.complete(&request_id) => { registration_requested = false; registry_operation = None; let _ = availability.registration_lost(); }
+                    SwarmEvent::Behaviour(PeerEvent::Registry(RequestResponseEvent::OutboundFailure { request_id, .. })) if pending_registry.complete(&request_id) => {
+                        registration_requested = false;
+                        registry_operation = None;
+                        let _ = availability.registration_lost();
+                        if config.mode == RuntimeMode::Product
+                            && reservation.is_ready()
+                            && !registration_requested
+                            && let (Some(peer_id), Some(session_id), Some(services)) = (relay_peer_id, auth_state.current_session(unix_now()), service_config.as_ref())
+                        {
+                            let (outbound, operation) = send_register(&mut swarm, peer_id, &mut request_ids, session_id, instance_id, services)?;
+                            if pending_registry.begin(outbound) {
+                                registry_operation = Some(operation);
+                                registration_requested = true;
+                            }
+                        }
+                    }
                     SwarmEvent::Behaviour(PeerEvent::Relay(_)) => {}
                     SwarmEvent::Behaviour(PeerEvent::Probe(ProbeOutput::InboundOpened { mut stream, peer_id, connection_id })) => {
                         if args.drop_first_probe && !first_probe_dropped {

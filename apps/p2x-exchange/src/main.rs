@@ -259,7 +259,9 @@ async fn main() -> io::Result<()> {
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { listener_id, address } => {
-                    swarm.add_external_address(address.clone());
+                    if args.unsafe_connectivity_lab {
+                        swarm.add_external_address(address.clone());
+                    }
                     let advertised = address.with(libp2p::multiaddr::Protocol::P2p(*swarm.local_peer_id()));
                     let listener_id = format!("{listener_id:?}");
                     let advertised = advertised.to_string();

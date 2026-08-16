@@ -98,7 +98,7 @@ impl AuthSessionLedger {
             .get(peer_id)
             .is_some_and(|session| session.expires_at <= now)
         {
-            self.sessions.remove(peer_id);
+            let _ = self.sweep(now);
             return SessionAction::Rejected(PublicErrorCode::AuthSessionExpired);
         }
         self.sweep(now);
