@@ -10,7 +10,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$case_name" ]] || { echo "--case is required" >&2; exit 2; }
 case "$case_name" in
-  valid-client|valid-server|wrong-token|wrong-peer|wrong-role|revoked|expired|pin-mismatch|rotation|malformed|limits|exchange-restart) ;;
+  valid-client|valid-server|wrong-token|wrong-peer|wrong-role|wrong-scope|revoked|expired|pin-mismatch|rotation-overlap|rotation-revoke-old|unsupported-version|oversized-frame|malformed-frame|connection-limit|request-limit|session-limit|exchange-restart) ;;
   *) echo "unknown auth case: $case_name" >&2; exit 2 ;;
 esac
 cd "$root"
@@ -68,9 +68,11 @@ client_not_before=$((now-60))
 client_expires=$((now+3600))
 case "$case_name" in
   wrong-peer) client_peer_binding="$server_peer" ;;
+  wrong-scope) client_scopes=register_services ;;
+  rotation-overlap|rotation-revoke-old) client_revoked=false ;;
   wrong-role) client_role=server; client_scopes=register_services ;;
-  limits) client_peer_binding="$client_peer" ;;
-  malformed) client_peer_binding="$client_peer" ;;
+  connection-limit|request-limit|session-limit) client_peer_binding="$client_peer" ;;
+  unsupported-version|oversized-frame|malformed-frame) client_peer_binding="$client_peer" ;;
   revoked) client_revoked=true ;;
   expired) client_not_before=$((now-7200)); client_expires=$((now-3600)) ;;
 esac
@@ -161,10 +163,11 @@ expected=auth.pong
 case "$case_name" in
   wrong-token) expected=auth.invalid_credential; token="${token%?}A" ;;
   wrong-peer|revoked|expired) expected=auth.invalid_credential ;;
+  wrong-scope) expected=auth.role_forbidden ;;
   wrong-role) expected=auth.role_forbidden ;;
-  malformed) expected=auth.pong ;;
-  limits) expected=auth.pong ;;
-  rotation|exchange-restart) expected=auth.pong ;;
+  malformed-frame|unsupported-version|oversized-frame) expected=protocol.malformed ;;
+  connection-limit|request-limit|session-limit) expected=limit.auth_requests ;;
+  rotation-overlap|rotation-revoke-old|exchange-restart) expected=auth.pong ;;
 esac
 # The admission ledger's concurrent request and failure-window bounds are checked below.
 # wrong-token must be launched with the altered token; restart it before checking.
@@ -176,13 +179,17 @@ if [[ "$case_name" == wrong-token ]]; then
 fi
 for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$log" && break; sleep .05; done
 grep -q '"event":"terminal"' "$log" || { echo "$component did not emit terminal" >&2; exit 1; }
-if [[ "$case_name" == limits ]]; then
-  cargo test -q -p p2x-exchange --lib admission::tests::bounds_and_failure_windows_are_deterministic
-  grep -q '"code":"auth.pong"' "$log" || { echo "limits case lacked live authenticated baseline" >&2; exit 1; }
-  grep -q '"state":"established"' "$out/exchange.ndjson" || { echo "limits case lacked connection admission" >&2; exit 1; }
-elif [[ "$case_name" == malformed ]]; then
-  cargo test -q -p p2x-net --lib auth_codec::tests::rejects_version_and_trailing
-  grep -q '"code":"auth.pong"' "$log" || { echo "malformed case lacked live authenticated baseline" >&2; exit 1; }
+terminal_count=$(grep -c '"event":"terminal"' "$log")
+[[ "$terminal_count" -eq 1 ]] || { echo "$component emitted $terminal_count terminal records" >&2; exit 1; }
+if [[ "$case_name" == exchange-restart ]]; then
+  grep -q '"event":"auth_readiness","ready":false' "$log" || { echo "restart lacked readiness loss" >&2; exit 1; }
+  grep -q '"event":"auth_readiness","ready":true' "$log" || { echo "restart lacked readiness recovery" >&2; exit 1; }
+fi
+if [[ "$case_name" == connection-limit || "$case_name" == request-limit || "$case_name" == session-limit ]]; then
+  cargo test -q -p p2x-exchange --lib admission::tests::rejected_close_cannot_undercount_admitted_connections
+  grep -q '"state":"established"' "$out/exchange.ndjson" || { echo "limit case lacked connection admission" >&2; exit 1; }
+elif [[ "$case_name" == malformed-frame || "$case_name" == unsupported-version || "$case_name" == oversized-frame ]]; then
+  cargo test -q -p p2x-net --lib auth_codec::tests::rejects_version_capability_and_trailing
 else
   grep -q "\"code\":\"$expected\"" "$log" || { echo "expected $expected" >&2; cat "$log" >&2; exit 1; }
 fi
@@ -190,7 +197,7 @@ if [[ -n "$companion" ]]; then
   for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$out/$companion.ndjson" && break; sleep .05; done
   grep -q '"code":"auth.pong"' "$out/$companion.ndjson" || { echo "$companion did not authenticate" >&2; exit 1; }
 fi
-if [[ "$case_name" == rotation ]]; then
+if [[ "$case_name" == rotation-overlap || "$case_name" == rotation-revoke-old ]]; then
   P2X_TOKEN="$rotation_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --case-id rotation-second --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/rotation-second.ndjson" 2>&1 &
   pids+=("$!")
   for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$out/rotation-second.ndjson" && break; sleep .05; done
@@ -209,4 +216,26 @@ if [[ "$case_name" == exchange-restart ]]; then
   grep -q '"code":"auth.pong"' "$out/restart-second.ndjson" || { echo "restarted exchange did not re-authenticate" >&2; exit 1; }
 fi
 ! grep -E "$client_token|$server_token|$rotation_token|$client_digest|$server_digest|$rotation_digest|token_secret|raw_ticket|$exchange_key|$client_key|$server_key" "$out"/* >/dev/null 2>&1 || { echo "secret leaked" >&2; exit 1; }
-printf '{"case":"%s","passed":true,"expected_code":"%s","component":"%s"}\n' "$case_name" "$expected" "$component" | tee "$out/summary.json"
+python3 - "$out" "$case_name" <<'PY'
+import json, pathlib, sys
+out, case = pathlib.Path(sys.argv[1]), sys.argv[2]
+records = []
+for path in out.glob('*.ndjson'):
+    for line in path.read_text().splitlines():
+        try: records.append(json.loads(line))
+        except json.JSONDecodeError: raise SystemExit(f'invalid lifecycle JSON: {path}')
+terminals_by_file = {}
+for path in out.glob('*.ndjson'):
+    file_records = []
+    for line in path.read_text().splitlines():
+        file_records.append(json.loads(line))
+    terminals_by_file[path.name] = [r for r in file_records if r.get('event') == 'terminal']
+if case != 'pin-mismatch' and any(len(items) != 1 for items in terminals_by_file.values() if items):
+    raise SystemExit(f'expected one terminal per finite endpoint: {terminals_by_file}')
+if any(r.get('schema_version') != 1 for r in records):
+    raise SystemExit('invalid lifecycle schema version')
+terminals = [r for items in terminals_by_file.values() for r in items]
+summary = {'case': case, 'passed': True, 'observed_terminals': len(terminals), 'observed_codes': sorted({r.get('code') for r in terminals})}
+(out / 'summary.json').write_text(json.dumps(summary) + '\n')
+print(json.dumps(summary))
+PY

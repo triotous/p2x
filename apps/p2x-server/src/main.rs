@@ -174,6 +174,7 @@ async fn main() -> io::Result<()> {
     let mut ping_request_id = request_ids.allocate().map_err(io::Error::other)?;
     let mut auth_state = AuthState::new();
     let mut exchange_redial_pending = false;
+    let mut readiness_generation = 0u64;
     if config.mode == RuntimeMode::Product
         && let Some(exchange) = args.exchange.first().cloned()
     {
@@ -317,6 +318,7 @@ async fn main() -> io::Result<()> {
                         if let Some(book) = connection_book.as_mut() { book.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?; }
                         if relay_peer_id == Some(peer_id) && credential.is_some() && auth_state.disconnected() == AuthAction::Retry {
                             exchange_redial_pending = true;
+                            emitter.emit(&LifecycleRecord::AuthReadiness { ready: false, generation: readiness_generation })?;
                         }
                         connection_paths.remove(&connection_id);
                         let peer = peer_id.to_string();
@@ -339,7 +341,7 @@ async fn main() -> io::Result<()> {
                             swarm.behaviour_mut().auth.send_request(&peer, AuthRequest::Ping { request_id: ping_id, session_id, nonce });
                         }
                     }
-                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { response: AuthResponse::Pong { request_id, nonce, .. }, .. }, .. })) if credential.is_some() && request_id == ping_request_id && auth_state.pong(request_id, nonce) == AuthAction::Ready => { if args.finite_auth_check { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?; return Ok(()); } emitter.emit(&LifecycleRecord::OperationalError { code: "auth.ready", message: "authenticated readiness established" })?; }
+                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { response: AuthResponse::Pong { request_id, nonce, .. }, .. }, .. })) if credential.is_some() && request_id == ping_request_id && auth_state.pong(request_id, nonce) == AuthAction::Ready => { readiness_generation = readiness_generation.saturating_add(1); if args.finite_auth_check { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?; return Ok(()); } emitter.emit(&LifecycleRecord::AuthReadiness { ready: true, generation: readiness_generation })?; }
                     SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { response: AuthResponse::Rejected { request_id, error }, .. }, .. })) if credential.is_some() && auth_state.rejected(request_id, error.code, unix_now()) != AuthAction::Ignore => {
                         if matches!(auth_state.phase(), p2x_net::auth_state::AuthPhase::Terminal(_)) {
                             emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", error.code.as_str()))?;

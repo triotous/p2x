@@ -68,6 +68,10 @@ pub enum LifecycleRecord<'a> {
         code: &'a str,
         message: &'a str,
     },
+    AuthReadiness {
+        ready: bool,
+        generation: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]

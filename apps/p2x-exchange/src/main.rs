@@ -160,7 +160,10 @@ async fn main() -> io::Result<()> {
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
-            _ = maintenance.tick() => { sessions.sweep(chrono_like_now()); admission.sweep(chrono_like_now()); }
+            _ = maintenance.tick() => {
+                sessions.sweep(chrono_like_now());
+                admission.sweep(chrono_like_now());
+            }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { listener_id, address } => {
                     swarm.add_external_address(address.clone());
@@ -200,6 +203,7 @@ async fn main() -> io::Result<()> {
             }
         }
     }
+    admission.shutdown(chrono_like_now());
     emitter.terminal(&TerminalResult::simple(
         &args.case_id,
         "stopped",

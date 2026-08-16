@@ -36,6 +36,23 @@ impl Default for AuthSessionLedger {
     }
 }
 impl AuthSessionLedger {
+    pub fn apply_actions<F>(
+        &mut self,
+        actions: Vec<SessionAction>,
+        mut close: F,
+    ) -> Vec<SessionAction>
+    where
+        F: FnMut(ConnectionId),
+    {
+        for action in &actions {
+            if let SessionAction::ClosePeerConnections { connection_ids, .. } = action {
+                for connection_id in connection_ids {
+                    close(*connection_id);
+                }
+            }
+        }
+        actions
+    }
     pub fn new(max_sessions: usize) -> Self {
         Self {
             sessions: HashMap::new(),
@@ -220,6 +237,24 @@ mod tests {
                     peer_id: "peer".into(),
                     connection_ids: vec![ConnectionId::new_unchecked(1)]
                 }
+            ]
+        );
+    }
+    #[test]
+    fn owner_consumes_close_action_for_every_connection() {
+        let mut ledger = AuthSessionLedger::new(1);
+        ledger.connection_established("peer", ConnectionId::new_unchecked(1));
+        ledger.connection_established("peer", ConnectionId::new_unchecked(2));
+        ledger.authenticate(principal(1), [1; 16], 1);
+        let actions = ledger.replace_revision(2);
+        let mut closed = Vec::new();
+        ledger.apply_actions(actions, |id| closed.push(id));
+        closed.sort_by_key(|id| format!("{id:?}"));
+        assert_eq!(
+            closed,
+            vec![
+                ConnectionId::new_unchecked(1),
+                ConnectionId::new_unchecked(2)
             ]
         );
     }
