@@ -1,9 +1,143 @@
 use p2x_protocol::PublicErrorCode;
+use std::{collections::HashSet, hash::Hash};
 
 pub const AUTH_TIMEOUT_SECONDS: i64 = 5;
 const BACKOFF_BASE_SECONDS: i64 = 1;
 const BACKOFF_MAX_SECONDS: i64 = 30;
 const BACKOFF_JITTER_PER_MILLE: i64 = 100;
+const REDIAL_BASE_MILLIS: i64 = 250;
+const REDIAL_MAX_MILLIS: i64 = 30_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionLoss {
+    Unknown,
+    Remaining,
+    Final,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ExchangeConnections<T> {
+    ids: HashSet<T>,
+}
+
+impl<T: Eq + Hash> ExchangeConnections<T> {
+    pub fn new() -> Self {
+        Self {
+            ids: HashSet::new(),
+        }
+    }
+
+    pub fn established(&mut self, id: T) -> bool {
+        self.ids.insert(id)
+    }
+
+    pub fn closed(&mut self, id: &T) -> ConnectionLoss {
+        if !self.ids.remove(id) {
+            ConnectionLoss::Unknown
+        } else if self.ids.is_empty() {
+            ConnectionLoss::Final
+        } else {
+            ConnectionLoss::Remaining
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PendingRequest<T> {
+    current: Option<T>,
+}
+
+impl<T: Eq> PendingRequest<T> {
+    pub const fn new() -> Self {
+        Self { current: None }
+    }
+
+    pub fn begin(&mut self, id: T) -> bool {
+        if self.current.is_some() {
+            return false;
+        }
+        self.current = Some(id);
+        true
+    }
+
+    pub fn complete(&mut self, id: &T) -> bool {
+        if self.current.as_ref() != Some(id) {
+            return false;
+        }
+        self.current = None;
+        true
+    }
+
+    pub fn clear(&mut self) {
+        self.current = None;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RedialBackoff {
+    attempts: u32,
+    due_at_millis: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AddressCursor {
+    next: usize,
+}
+
+impl AddressCursor {
+    pub const fn new() -> Self {
+        Self { next: 0 }
+    }
+
+    pub fn next(&mut self, len: usize) -> Option<usize> {
+        if len == 0 {
+            return None;
+        }
+        let selected = self.next % len;
+        self.next = (selected + 1) % len;
+        Some(selected)
+    }
+}
+
+impl RedialBackoff {
+    pub const fn new() -> Self {
+        Self {
+            attempts: 0,
+            due_at_millis: None,
+        }
+    }
+
+    pub fn schedule(&mut self, now_millis: i64, jitter_per_mille: i16) -> i64 {
+        self.attempts = self.attempts.saturating_add(1);
+        let shift = self.attempts.saturating_sub(1).min(7);
+        let delay = (REDIAL_BASE_MILLIS << shift).min(REDIAL_MAX_MILLIS);
+        let jitter = delay * i64::from(jitter_per_mille.clamp(-100, 100)) / 1000;
+        let due = now_millis.saturating_add(delay + jitter);
+        self.due_at_millis = Some(due);
+        due
+    }
+
+    pub fn take_due(&mut self, now_millis: i64) -> bool {
+        if self.due_at_millis.is_none_or(|due| now_millis < due) {
+            return false;
+        }
+        self.due_at_millis = None;
+        true
+    }
+
+    pub fn reset(&mut self) {
+        self.attempts = 0;
+        self.due_at_millis = None;
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthPhase {
@@ -280,6 +414,57 @@ mod tests {
             state.tick(AUTH, AUTH_TIMEOUT_SECONDS + 1),
             AuthAction::Authenticate { request_id: AUTH }
         );
+    }
+
+    #[test]
+    fn only_final_known_exchange_connection_is_a_loss() {
+        let mut connections = ExchangeConnections::new();
+        assert!(connections.established(1));
+        assert!(connections.established(2));
+        assert!(!connections.established(2));
+        assert_eq!(connections.len(), 2);
+        assert_eq!(connections.closed(&9), ConnectionLoss::Unknown);
+        assert_eq!(connections.closed(&1), ConnectionLoss::Remaining);
+        assert_eq!(connections.closed(&1), ConnectionLoss::Unknown);
+        assert_eq!(connections.closed(&2), ConnectionLoss::Final);
+    }
+
+    #[test]
+    fn stale_outbound_completion_cannot_release_current_request() {
+        let mut pending = PendingRequest::new();
+        assert!(pending.begin(7));
+        assert!(!pending.begin(8));
+        assert!(!pending.complete(&6));
+        assert!(pending.complete(&7));
+        assert!(!pending.complete(&7));
+        assert!(pending.begin(8));
+        pending.clear();
+        assert!(pending.begin(9));
+    }
+
+    #[test]
+    fn redial_backoff_is_capped_jittered_and_resettable() {
+        let mut backoff = RedialBackoff::new();
+        assert_eq!(backoff.schedule(1_000, -100), 1_225);
+        assert!(!backoff.take_due(1_224));
+        assert!(backoff.take_due(1_225));
+        assert_eq!(backoff.schedule(2_000, 100), 2_550);
+        for _ in 0..20 {
+            backoff.schedule(0, 100);
+        }
+        assert!(backoff.due_at_millis <= Some(REDIAL_MAX_MILLIS + 3_000));
+        backoff.reset();
+        assert_eq!(backoff.schedule(0, 0), REDIAL_BASE_MILLIS);
+    }
+
+    #[test]
+    fn address_cursor_retries_every_configured_address_in_order() {
+        let mut cursor = AddressCursor::new();
+        assert_eq!(cursor.next(0), None);
+        assert_eq!(cursor.next(3), Some(0));
+        assert_eq!(cursor.next(3), Some(1));
+        assert_eq!(cursor.next(3), Some(2));
+        assert_eq!(cursor.next(3), Some(0));
     }
     #[test]
     fn non_retryable_rejection_is_terminal() {
