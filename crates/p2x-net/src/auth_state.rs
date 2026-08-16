@@ -213,6 +213,17 @@ impl AuthState {
     pub const fn phase(&self) -> AuthPhase {
         self.phase
     }
+    pub const fn reauthenticating(&self) -> bool {
+        matches!(
+            self.phase,
+            AuthPhase::Reauthenticating { .. }
+                | AuthPhase::ReauthBackoff { .. }
+                | AuthPhase::AwaitingPong {
+                    prior_session_id: Some(_),
+                    ..
+                }
+        )
+    }
 
     pub fn connected(&mut self, request_id: [u8; 16], now: i64) -> AuthAction {
         if !matches!(self.phase, AuthPhase::Disconnected) {

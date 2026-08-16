@@ -60,6 +60,8 @@ impl ServiceConfig {
                 "invalid registration lease or refresh".into(),
             ));
         }
+        let mut all_ids = std::collections::HashSet::new();
+        let mut all_selectors = std::collections::HashSet::new();
         let mut services = Vec::new();
         for entry in file.services {
             let id = UpstreamId::new(&entry.upstream_id)
@@ -82,6 +84,11 @@ impl ServiceConfig {
             }
             let selector = UnscopedSelector::new(protocol, metadata)
                 .map_err(|e| ServiceConfigError::Invalid(e.to_string()))?;
+            if !all_ids.insert(id.clone()) || !all_selectors.insert(selector.clone()) {
+                return Err(ServiceConfigError::Invalid(
+                    "duplicate service identifier or selector".into(),
+                ));
+            }
             if entry.enabled {
                 services.push(ServiceAdvertisementV1::new(id, selector, Health::Ready));
             }

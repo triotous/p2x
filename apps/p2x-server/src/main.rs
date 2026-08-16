@@ -149,6 +149,31 @@ fn send_register(
     Ok((outbound, RegistryOperation::Register { request_id }))
 }
 
+fn send_withdraw(
+    swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
+    peer_id: libp2p::PeerId,
+    request_ids: &mut p2x_protocol::CorrelationIdGenerator,
+    session_id: [u8; 16],
+    instance_id: InstanceId,
+    revision: p2x_protocol::RegistrationRevision,
+) -> io::Result<(
+    libp2p::request_response::OutboundRequestId,
+    RegistryOperation,
+)> {
+    let request_id = request_ids.allocate().map_err(io::Error::other)?;
+    let request = RegistryRequestV1::Withdraw {
+        request_id,
+        session_id,
+        instance_id,
+        expected_registration_revision: std::num::NonZeroU64::new(revision.get()).expect("nonzero"),
+    };
+    let outbound = swarm
+        .behaviour_mut()
+        .registry
+        .send_request(&peer_id, request);
+    Ok((outbound, RegistryOperation::Withdraw { request_id }))
+}
+
 fn send_refresh(
     swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
     peer_id: libp2p::PeerId,
@@ -269,6 +294,7 @@ async fn main() -> io::Result<()> {
             RuntimeMode::Product
         },
         relay_client_enabled: !args.unsafe_connectivity_lab,
+        registry_enabled: !args.unsafe_connectivity_lab,
         auth_fault: None,
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
@@ -452,8 +478,16 @@ async fn main() -> io::Result<()> {
                         if address.to_string().contains("p2p-circuit") {
                             let relay = relay_peer_id.map(|peer| peer.to_string()).unwrap_or_default();
                             let address = address.to_string();
-                            emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Ready, exchange_peer_id: &relay, listener_id: None, address: Some(&address), generation: 1, renewal: false })?;
+                            emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Ready, exchange_peer_id: &relay, listener_id: None, address: Some(&address), generation: reservation.generation, renewal: false })?;
                         }
+                    }
+                    SwarmEvent::ExternalAddrExpired { address } if address.to_string().contains("p2p-circuit") => {
+                        let _ = availability.reservation_lost();
+                        registration_revision = None;
+                        registration_expires_at = 0;
+                        registration_requested = false;
+                        registry_operation = None;
+                        emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Degraded, exchange_peer_id: &relay_peer_id.map(|peer| peer.to_string()).unwrap_or_default(), listener_id: Some("circuit"), address: None, generation: reservation.generation, renewal: false })?;
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                         let path = if endpoint.is_relayed() {
@@ -668,6 +702,46 @@ async fn main() -> io::Result<()> {
                 }
             }
         }
+    }
+    if config.mode == RuntimeMode::Product
+        && let (Some(peer_id), Some(session_id), Some(revision)) = (
+            relay_peer_id,
+            auth_state.current_session(unix_now()),
+            registration_revision,
+        )
+        && let Ok((outbound, RegistryOperation::Withdraw { request_id })) = send_withdraw(
+            &mut swarm,
+            peer_id,
+            &mut request_ids,
+            session_id,
+            instance_id,
+            revision,
+        )
+    {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let SwarmEvent::Behaviour(PeerEvent::Registry(RequestResponseEvent::Message {
+                    message:
+                        RequestResponseMessage::Response {
+                            request_id: response_id,
+                            response:
+                                RegistryResponseV1::Withdrawn {
+                                    request_id: wire_id,
+                                    instance_id: response_instance,
+                                    ..
+                                },
+                        },
+                    ..
+                })) = swarm.select_next_some().await
+                    && response_id == outbound
+                    && wire_id == request_id
+                    && response_instance == instance_id
+                {
+                    break;
+                }
+            }
+        })
+        .await;
     }
     worker_admission.close_and_discard();
     emitter.terminal(&TerminalResult::simple(

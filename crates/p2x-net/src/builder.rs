@@ -31,18 +31,26 @@ pub enum RuntimeMode {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RelayProfile {
     #[default]
+    Product,
     DefaultLab,
     LimitTest,
 }
 impl RelayProfile {
     pub fn config(self) -> relay::Config {
+        let product = matches!(self, Self::Product);
         let limit = matches!(self, Self::LimitTest);
         relay::Config {
             max_reservations: if limit { 2 } else { 64 },
-            max_reservations_per_peer: if limit { 1 } else { 2 },
+            max_reservations_per_peer: if product || limit { 0 } else { 1 },
             reservation_duration: Duration::from_secs(60),
             max_circuits: if limit { 2 } else { 128 },
-            max_circuits_per_peer: if limit { 1 } else { 4 },
+            max_circuits_per_peer: if product {
+                31
+            } else if limit {
+                0
+            } else {
+                3
+            },
             max_circuit_duration: if limit {
                 Duration::from_secs(300)
             } else {
@@ -111,7 +119,7 @@ impl Default for ExchangeSwarmConfig {
                 .parse()
                 .expect("valid QUIC default"),
             allow_public: false,
-            relay_profile: RelayProfile::DefaultLab,
+            relay_profile: RelayProfile::Product,
             relay_admission: None,
             mode: RuntimeMode::Product,
         }
@@ -124,6 +132,7 @@ pub struct PeerSwarmConfig {
     pub quic_listen: Multiaddr,
     pub mode: RuntimeMode,
     pub relay_client_enabled: bool,
+    pub registry_enabled: bool,
     pub auth_fault: Option<crate::auth_codec::AuthFault>,
 }
 
@@ -136,6 +145,7 @@ impl Default for PeerSwarmConfig {
                 .expect("valid QUIC default"),
             mode: RuntimeMode::Product,
             relay_client_enabled: false,
+            registry_enabled: false,
             auth_fault: None,
         }
     }
@@ -505,7 +515,7 @@ pub fn build_peer_swarm(
             ),
             registry: libp2p::request_response::Behaviour::with_codec(
                 RegistryCodec,
-                (config.mode == RuntimeMode::Product).then_some((
+                (config.mode == RuntimeMode::Product && config.registry_enabled).then_some((
                     libp2p::StreamProtocol::new(REGISTRY_PROTOCOL),
                     libp2p::request_response::ProtocolSupport::Outbound,
                 )),
@@ -637,9 +647,14 @@ mod tests {
 
     #[test]
     fn relay_profiles_apply_all_effective_limits() {
-        let default = RelayProfile::DefaultLab.config();
+        let default = RelayProfile::Product.config();
         assert_eq!(default.max_reservations, 64);
         assert_eq!(default.max_circuits, 128);
+        assert_eq!(default.max_reservations_per_peer, 0);
+        assert_eq!(default.max_circuits_per_peer, 31);
+        let lab = RelayProfile::DefaultLab.config();
+        assert_eq!(lab.max_reservations_per_peer, 1);
+        assert_eq!(lab.max_circuits_per_peer, 3);
         assert_eq!(default.max_circuit_bytes, 1024 * 1024 * 1024);
         assert_eq!(default.reservation_rate_limiters.len(), 2);
         assert_eq!(default.circuit_src_rate_limiters.len(), 2);
@@ -648,7 +663,7 @@ mod tests {
         assert_eq!(limited.max_reservations, 2);
         assert_eq!(limited.max_reservations_per_peer, 1);
         assert_eq!(limited.max_circuits, 2);
-        assert_eq!(limited.max_circuits_per_peer, 1);
+        assert_eq!(limited.max_circuits_per_peer, 0);
         assert_eq!(limited.max_circuit_bytes, 16 * 1024 * 1024);
     }
 }
