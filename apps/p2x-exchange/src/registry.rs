@@ -149,12 +149,6 @@ impl Registry {
             _ => return Err(RegistryError::InvalidAdvertisement),
         };
         let digest = request.hash();
-        if let Some(cached) = self.idempotency.get(&(peer_id, request_id)) {
-            if cached.digest == digest {
-                return Ok(cached.response.clone());
-            }
-            return Err(RegistryError::Malformed);
-        }
         if self.draining {
             return Err(RegistryError::Draining);
         }
@@ -175,6 +169,12 @@ impl Registry {
             || capabilities.contains(Capabilities::DCUTR)
         {
             return Err(RegistryError::InvalidAdvertisement);
+        }
+        if let Some(cached) = self.idempotency.get(&(peer_id, request_id)) {
+            if cached.digest == digest {
+                return Ok(cached.response.clone());
+            }
+            return Err(RegistryError::Malformed);
         }
         if self.registrations.len() >= MAX_SERVERS && !self.registrations.contains_key(&peer_id) {
             return Err(RegistryError::Overloaded);
