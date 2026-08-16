@@ -10,9 +10,25 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$case_name" ]] || { echo "--case is required" >&2; exit 2; }
 case "$case_name" in
-  valid-client|valid-server|wrong-token|wrong-peer|wrong-role|wrong-scope|revoked|expired|pin-mismatch|rotation-overlap|rotation-revoke-old|unsupported-version|oversized-frame|malformed-frame|connection-limit|request-limit|session-limit|exchange-restart) ;;
+  all|valid-client|valid-server|wrong-token|wrong-peer|wrong-role|wrong-scope|revoked|expired|pin-mismatch|rotation-overlap|rotation-revoke-old|unsupported-version|oversized-frame|malformed-frame|connection-limit|request-limit|session-limit|exchange-restart) ;;
   *) echo "unknown auth case: $case_name" >&2; exit 2 ;;
 esac
+
+if [[ "$case_name" == all ]]; then
+  auth_cases=(
+    valid-client valid-server wrong-token wrong-peer wrong-role wrong-scope
+    revoked expired pin-mismatch rotation-overlap rotation-revoke-old
+    unsupported-version oversized-frame malformed-frame connection-limit
+    request-limit session-limit exchange-restart
+  )
+  base_run_id=${P2X_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}
+  for auth_case in "${auth_cases[@]}"; do
+    P2X_RUN_ID="$base_run_id-$auth_case" \
+      "$root/tests/auth/local.sh" --case "$auth_case"
+  done
+  exit 0
+fi
+
 cd "$root"
 cargo build -q --workspace --bins
 cargo build -q -p p2x-config --example identity-id
@@ -216,18 +232,24 @@ case "$case_name" in
   malformed-frame) auth_fault_args="--auth-fault malformed-frame" ;;
 esac
 if [[ "$case_name" == exchange-restart ]]; then auth_mode_args=(); fi
+component_config_args=()
+[[ "$component" == server ]] && component_config_args+=(--services-file "$services_file")
 P2X_TOKEN="$token" "$root/target/debug/p2x-$component" \
   --identity-file "$key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" \
-  --credential-env P2X_TOKEN "${auth_mode_args[@]}" ${auth_fault_args:-} --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
+  --credential-env P2X_TOKEN "${auth_mode_args[@]}" "${component_config_args[@]}" \
+  ${auth_fault_args:-} --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
   --case-id "$case_name" >"$log" 2>&1 &
 component_pid=$!
 pids+=("$component_pid")
 companion=""
 if [[ "$case_name" == valid-client || "$case_name" == valid-server ]]; then
   if [[ "$component" == client ]]; then companion=server; companion_token="$server_token"; companion_key="$server_key"; else companion=client; companion_token="$client_token"; companion_key="$client_key"; fi
+  companion_config_args=()
+  [[ "$companion" == server ]] && companion_config_args+=(--services-file "$services_file")
   P2X_TOKEN="$companion_token" "$root/target/debug/p2x-$companion" \
     --identity-file "$companion_key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" \
-    --credential-env P2X_TOKEN --finite-auth-check --services-file "$services_file" --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
+    --credential-env P2X_TOKEN --finite-auth-check "${companion_config_args[@]}" \
+    --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
     --case-id "$case_name" >"$out/$companion.ndjson" 2>&1 &
   pids+=("$!")
 fi
@@ -288,7 +310,7 @@ if case == 'rotation-revoke-old':
     text = text[:first] + text[first:].replace('    revoked: false', '    revoked: true', 1)
 path.write_text(text)
 PY
-  P2X_RUN_ID="$run_id-rotation" "$root/target/debug/p2x-exchange" --identity-file "$exchange_key" --credential-file "$credentials_file" --ticket-key-file "$ticket_key" --tcp-listen "$listen_base" --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/exchange-rotation.ndjson" 2>&1 &
+  P2X_RUN_ID="$run_id-rotation" "$root/target/debug/p2x-exchange" --identity-file "$exchange_key" --credential-file "$credentials_file" --ticket-key-file "$ticket_key" --tcp-listen "$listen_base" --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 --advertise "$listen_base/p2p/$exchange_peer" >"$out/exchange-rotation.ndjson" 2>&1 &
   exchange_pid=$!; pids+=("$exchange_pid")
   rotation_addr=""
   for _ in $(seq 1 200); do rotation_addr=$(python3 - "$out/exchange-rotation.ndjson" <<'PY'
@@ -335,7 +357,7 @@ PY
 )
   listen_base="${exchange_addr%/p2p/*}"
   kill -INT "$exchange_pid" 2>/dev/null || true; wait "$exchange_pid" 2>/dev/null || true
-  P2X_RUN_ID="$run_id-restart" "$root/target/debug/p2x-exchange" --identity-file "$exchange_key" --credential-file "$credentials_file" --ticket-key-file "$ticket_key" --tcp-listen "$listen_base" --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/exchange-restart.ndjson" 2>&1 &
+  P2X_RUN_ID="$run_id-restart" "$root/target/debug/p2x-exchange" --identity-file "$exchange_key" --credential-file "$credentials_file" --ticket-key-file "$ticket_key" --tcp-listen "$listen_base" --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 --advertise "$listen_base/p2p/$exchange_peer" >"$out/exchange-restart.ndjson" 2>&1 &
   exchange_pid=$!; pids+=("$exchange_pid")
   for _ in $(seq 1 200); do grep -q '"event":"listener_ready"' "$out/exchange-restart.ndjson" && break; sleep .05; done
   grep -q '"event":"listener_ready"' "$out/exchange-restart.ndjson" || { echo "restarted exchange did not become ready" >&2; exit 1; }
@@ -354,6 +376,24 @@ PY
 fi
 ! grep -E "$client_token|$server_token|$rotation_token|$client_digest|$server_digest|$rotation_digest|token_secret|raw_ticket|$exchange_key|$client_key|$server_key" "$out"/* >/dev/null 2>&1 || { echo "secret leaked" >&2; exit 1; }
 if [[ "$case_name" == exchange-restart ]]; then
+  python3 - "$out" "$initial_peer" "$initial_server_peer" <<'PY'
+import json, pathlib, sys
+out = pathlib.Path(sys.argv[1])
+summary = {
+    'case': 'exchange-restart',
+    'passed': True,
+    'client_peer_id': sys.argv[2],
+    'server_peer_id': sys.argv[3],
+    'observed_assertions': {
+        'readiness_loss': True,
+        'same_process_generation_2_recovery': True,
+        'peer_ids_stable': True,
+        'privacy_scan_clean': True,
+    },
+}
+(out / 'summary.json').write_text(json.dumps(summary, sort_keys=True) + '\n')
+print(json.dumps(summary, sort_keys=True))
+PY
   exit 0
 fi
 python3 - "$out" "$case_name" <<'PY'

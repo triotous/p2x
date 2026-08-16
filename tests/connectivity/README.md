@@ -20,7 +20,7 @@ Canonical runners write typed per-process NDJSON, summaries, topology, and resou
 | C10 | 64 concurrent probes, then 128 headroom probes | Correct independent results, bounded queues/resources, and no wrong-connection opens |
 | C11 | 256 MiB direct and relay slow-reader transfers | Hash/half-close correctness, bounded RSS, and a concurrent nonce remains responsive |
 | C12 | Reservation lifetime crosses two renewal points | At least two renewals and a continuously dialable circuit address |
-| C13 | 100 connect-close churn iterations | No leaked tasks, listeners, records, permits, RSS, or file descriptors |
+| C13 | 100 direct connect-close churn iterations | No leaked tasks, listeners, records, permits, RSS, or file descriptors |
 | C14 | Two real hosts on separate networks | Relay succeeds; direct outcome and environment are recorded honestly |
 
 ## 1. Common prerequisites
@@ -56,6 +56,12 @@ Run on each supported native platform required by the change. The full Plan 02 l
 ./tests/connectivity/local.sh --case C11 --bytes 268435456 --path relay
 ./tests/connectivity/local.sh --case C12
 ./tests/connectivity/local.sh --case C13 --iterations 100
+```
+
+Run that exact matrix sequentially with:
+
+```text
+./tests/connectivity/local.sh --case all
 ```
 
 Add `--exchange-transport quic` to repeat an applicable local case through the exchange QUIC listener; TCP is the default.

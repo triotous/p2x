@@ -30,6 +30,12 @@ connection-limit          request-limit
 session-limit             exchange-restart
 ```
 
+Run every case above sequentially with:
+
+```text
+./tests/auth/local.sh --case all
+```
+
 Each case prepares run-scoped identities and credentials, validates schema and exact stable result codes, scans artifacts for secrets, and cleans up its process group. Results are written under `target/p2x-auth/<run-id>/`; `summary.json` is the case summary and `*.ndjson` files are the raw lifecycle records. The restart case passes only when the original client and server processes and PeerIds lose readiness and return at readiness generation 2.
 
 ## 2. Platform security check

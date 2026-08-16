@@ -14,4 +14,9 @@ Generated test output belongs below `target/` and is ignored by Git. Preserve ra
 
 `tests/registry/local.sh --case <name>` is the single registry harness entry point; it prepares a run-scoped artifact directory and returns 2 when owner-executed prerequisites are unavailable.
 
+`Dockerfile.test` packages the complete non-interactive test toolchain. Its
+default entry point runs all container-safe automated suites; the privileged
+Linux namespace suite is selected with the `linux` argument. Build and run
+commands are documented in [`registry/README.md`](registry/README.md#73-container-runtime).
+
 `tests/local/run.sh` is only a compatibility redirect to the canonical connectivity runner. It does not define weaker case meanings or replace the Linux namespace and C14 gates.

@@ -6,7 +6,7 @@ start_services() {
   RUN_ID=${P2X_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}
   OUT=${P2X_ARTIFACT_DIR:-target/p2x-spike/$RUN_ID}/$case_id
   mkdir -p "$OUT"
-  cd "$(git rev-parse --show-toplevel)"
+  cd "$root"
   if [[ "${P2X_SKIP_BUILD:-0}" != 1 ]]; then
     cargo build --workspace --bins >/dev/null
   fi
@@ -91,7 +91,11 @@ start_services() {
       ;;
     C11|C11-large-transfer) client_args+=(--mode slow_reader --length "${P2X_BYTES:-268435456}" --path "${P2X_PATH:-relay}") ;;
     C12|C12-renewal) client_args+=(--count 1 --path relay) ;;
-    C13|C13-churn) client_args+=(--count "${P2X_ITERATIONS:-100}" --churn --path relay) ;;
+    C13|C13-churn)
+      server_peer=$(sed -n 's/.*"event":"started","peer_id":"\([^"]*\)".*/\1/p' "$OUT/server.ndjson" | head -1)
+      direct_addr=$(sed -n 's/.*"event":"listener_ready".*"address":"\([^" ]*\/quic-v1[^" ]*\)".*/\1/p' "$OUT/server.ndjson" | head -1)
+      client_args=(--unsafe-connectivity-lab --identity-seed 3 --server "$direct_addr/p2p/$server_peer" --count "${P2X_ITERATIONS:-100}" --churn --path direct)
+      ;;
     C05-direct)
       server_peer=$(sed -n 's/.*"event":"started","peer_id":"\([^"]*\)".*/\1/p' "$OUT/server.ndjson" | head -1)
       direct_addr=$(sed -n 's/.*"event":"listener_ready".*"address":"\([^" ]*\/tcp\/[^" ]*\)".*/\1/p' "$OUT/server.ndjson" | head -1)
@@ -150,7 +154,7 @@ run_local_case() {
     C13|C13-churn) expected=${P2X_ITERATIONS:-100} ;;
   esac
   local client_path=Relay
-  [[ "$case_id" == C01 || "$case_id" == C02 || "$case_id" == C03 || "$case_id" == C05-direct || "$case_id" == C07 || "$case_id" == C10 || "$case_id" == C10-concurrency ]] && client_path=Direct
+  [[ "$case_id" == C01 || "$case_id" == C02 || "$case_id" == C03 || "$case_id" == C05-direct || "$case_id" == C07 || "$case_id" == C10 || "$case_id" == C10-concurrency || "$case_id" == C13 || "$case_id" == C13-churn ]] && client_path=Direct
   if [[ "$case_id" == C11 && "${P2X_PATH:-relay}" == direct ]]; then client_path=Direct; fi
   local wait_loops=300
   [[ "$case_id" == C11 || "$case_id" == C11-large-transfer ]] && wait_loops=3600
