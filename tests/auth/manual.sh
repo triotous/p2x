@@ -44,14 +44,22 @@ case "$mode" in
     ;;
   --fuzz-smoke)
     cd "$root"
+    command -v rustup >/dev/null 2>&1 || {
+      echo "rustup is required to select the nightly compiler used by cargo-fuzz" >&2
+      exit 2
+    }
+    rustup run nightly rustc --version >/dev/null 2>&1 || {
+      echo "the nightly Rust toolchain is required; install it with: rustup toolchain install nightly --profile minimal" >&2
+      exit 2
+    }
     cargo fuzz --help >/dev/null 2>&1 || {
       echo "cargo-fuzz is required; install it with: cargo install cargo-fuzz" >&2
       exit 2
     }
-    cargo fuzz run auth_frame_decode fuzz/corpus/auth_frame -- -max_total_time=10
-    cargo fuzz run token_parse fuzz/corpus/token_parse -- -max_total_time=10
-    cargo fuzz run ticket_claims_decode fuzz/corpus/ticket_claims -- -max_total_time=10
-    cargo fuzz run ticket_envelope_decode fuzz/corpus/ticket_envelope -- -max_total_time=10
+    cargo +nightly fuzz run auth_frame_decode fuzz/corpus/auth_frame -- -max_total_time=10
+    cargo +nightly fuzz run token_parse fuzz/corpus/token_parse -- -max_total_time=10
+    cargo +nightly fuzz run ticket_claims_decode fuzz/corpus/ticket_claims -- -max_total_time=10
+    cargo +nightly fuzz run ticket_envelope_decode fuzz/corpus/ticket_envelope -- -max_total_time=10
     ;;
   --packet-inspection)
     echo "Start a packet capture on the loopback interface before continuing; press Enter when ready." >&2
