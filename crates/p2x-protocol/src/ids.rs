@@ -74,6 +74,29 @@ macro_rules! id {
 id!(CredentialId, 64);
 id!(Tenant, 64);
 id!(QuotaProfile, 64);
+id!(UpstreamId, 64);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InstanceId([u8; 16]);
+impl InstanceId {
+    pub const fn new(value: [u8; 16]) -> Self {
+        Self(value)
+    }
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RegistrationRevision(std::num::NonZeroU64);
+impl RegistrationRevision {
+    pub fn new(value: u64) -> Option<Self> {
+        std::num::NonZeroU64::new(value).map(Self)
+    }
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
 
 #[cfg(test)]
 mod tests {

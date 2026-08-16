@@ -19,6 +19,17 @@ pub enum PublicErrorCode {
     ProtocolMalformed,
     ProtocolUnsupportedVersion,
     ProtocolCapabilityMismatch,
+    RegistryInvalidAdvertisement,
+    RegistryConflict,
+    RegistryReservationRequired,
+    RegistryStaleRevision,
+    RegistryNotFound,
+    RegistryOffline,
+    RelayUnauthorized,
+    RelayQuota,
+    LimitServices,
+    LimitRegistryRequests,
+    ExchangeDraining,
 }
 impl PublicErrorCode {
     pub const fn as_str(self) -> &'static str {
@@ -39,6 +50,17 @@ impl PublicErrorCode {
             Self::ProtocolMalformed => "protocol.malformed",
             Self::ProtocolUnsupportedVersion => "protocol.unsupported_version",
             Self::ProtocolCapabilityMismatch => "protocol.capability_mismatch",
+            Self::RegistryInvalidAdvertisement => "registry.invalid_advertisement",
+            Self::RegistryConflict => "registry.conflict",
+            Self::RegistryReservationRequired => "registry.reservation_required",
+            Self::RegistryStaleRevision => "registry.stale_revision",
+            Self::RegistryNotFound => "registry.not_found",
+            Self::RegistryOffline => "registry.offline",
+            Self::RelayUnauthorized => "relay.unauthorized",
+            Self::RelayQuota => "relay.quota",
+            Self::LimitServices => "limit.services",
+            Self::LimitRegistryRequests => "limit.registry_requests",
+            Self::ExchangeDraining => "exchange.draining",
         }
     }
     pub fn parse(value: &str) -> Self {
@@ -58,6 +80,17 @@ impl PublicErrorCode {
             "protocol.frame_too_large" => Self::ProtocolFrameTooLarge,
             "protocol.unsupported_version" => Self::ProtocolUnsupportedVersion,
             "protocol.capability_mismatch" => Self::ProtocolCapabilityMismatch,
+            "registry.invalid_advertisement" => Self::RegistryInvalidAdvertisement,
+            "registry.conflict" => Self::RegistryConflict,
+            "registry.reservation_required" => Self::RegistryReservationRequired,
+            "registry.stale_revision" => Self::RegistryStaleRevision,
+            "registry.not_found" => Self::RegistryNotFound,
+            "registry.offline" => Self::RegistryOffline,
+            "relay.unauthorized" => Self::RelayUnauthorized,
+            "relay.quota" => Self::RelayQuota,
+            "limit.services" => Self::LimitServices,
+            "limit.registry_requests" => Self::LimitRegistryRequests,
+            "exchange.draining" => Self::ExchangeDraining,
             _ => Self::ProtocolMalformed,
         }
     }

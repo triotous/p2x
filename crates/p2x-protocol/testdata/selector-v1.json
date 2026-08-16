@@ -1,0 +1,9 @@
+{
+  "tenant": "tenant-a",
+  "protocol": "http",
+  "metadata": {
+    "environment": "production",
+    "service": "orders"
+  },
+  "fingerprint": "89ffc2c62967ad3ca6450e3de45ac5c86ffd7a7dfc6f4db240ef35aa5b7300db"
+}
