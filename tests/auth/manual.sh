@@ -53,8 +53,14 @@ case "$mode" in
     cargo fuzz run ticket_claims_decode fuzz/corpus/ticket_claims -- -max_total_time=10
     cargo fuzz run ticket_envelope_decode fuzz/corpus/ticket_envelope -- -max_total_time=10
     ;;
+  --packet-inspection)
+    echo "Start a packet capture on the loopback interface before continuing; press Enter when ready." >&2
+    read -r
+    "$root/tests/auth/local.sh" --case valid-client
+    echo "Stop the capture and verify that it contains no plaintext token, digest, private key, raw ticket, selector, or private upstream value." >&2
+    ;;
   *)
-    echo "usage: $0 --platform-security | --linux-connectivity | --fuzz-smoke" >&2
+    echo "usage: $0 --platform-security | --linux-connectivity | --fuzz-smoke | --packet-inspection" >&2
     exit 2
     ;;
 esac
