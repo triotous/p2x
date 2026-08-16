@@ -311,7 +311,19 @@ async fn main() -> io::Result<()> {
                 }
                 SwarmEvent::Behaviour(event) => { let message = format!("{event:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "relay.event", message: &message })?; }
                 SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => { let peer = peer_id.to_string(); let ip = endpoint.get_remote_address().iter().find_map(|p| match p { libp2p::multiaddr::Protocol::Ip4(v) => Some(v.to_string()), libp2p::multiaddr::Protocol::Ip6(v) => Some(v.to_string()), _ => None }).unwrap_or_else(|| "<unknown>".into()); if admission.admit_connection(connection_id, &peer, &ip) != Admission::Accepted { swarm.close_connection(connection_id); continue; } sessions.connection_established(&peer, connection_id); emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Established, path: Some(if endpoint.is_relayed() { p2x_net::probe::ProbePath::Relay } else { p2x_net::probe::ProbePath::Direct }), reason: None })?; }
-                SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => { let peer = peer_id.to_string(); sessions.connection_closed(&peer, connection_id); admission.close_connection(connection_id); let reason = format!("{cause:?}"); emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Closed, path: None, reason: Some(&reason) })?; }
+                SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => {
+                    let peer = peer_id.to_string();
+                    if let Some(action) = sessions.connection_closed(&peer, connection_id)
+                        && matches!(action, p2x_exchange::auth_sessions::SessionAction::Removed(_))
+                    {
+                        relay_admission.remove(&peer_id);
+                        reserved_servers.remove(&peer_id);
+                        registry.remove_peer(&peer_id);
+                    }
+                    admission.close_connection(connection_id);
+                    let reason = format!("{cause:?}");
+                    emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Closed, path: None, reason: Some(&reason) })?;
+                }
                 SwarmEvent::IncomingConnectionError { error, .. } => { let message = error.to_string(); emitter.emit(&LifecycleRecord::OperationalError { code: "connection.incoming", message: &message })?; }
                 SwarmEvent::OutgoingConnectionError { error, .. } => { let message = error.to_string(); emitter.emit(&LifecycleRecord::OperationalError { code: "connection.outgoing", message: &message })?; }
                 _ => {}
@@ -320,7 +332,7 @@ async fn main() -> io::Result<()> {
     }
     relay_admission.set_draining(true);
     registry.set_draining(true);
-    registry.remove_peer(&local_peer_id);
+    registry.clear();
     admission.shutdown(chrono_like_now());
     emitter.terminal(&TerminalResult::simple(
         &args.case_id,

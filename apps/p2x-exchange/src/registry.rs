@@ -335,6 +335,12 @@ impl Registry {
         self.cache(peer_id, request_id, digest, response.clone(), now);
         Ok(response)
     }
+    pub fn clear(&mut self) {
+        self.registrations.clear();
+        self.selector_owners.clear();
+        self.idempotency.clear();
+    }
+
     pub fn remove_peer(&mut self, peer_id: &PeerId) -> bool {
         let Some(record) = self.registrations.remove(peer_id) else {
             return false;
