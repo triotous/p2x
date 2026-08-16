@@ -115,6 +115,8 @@ EOF
 exchange_log="$out/exchange.ndjson"
 P2X_RUN_ID="$run_id" "$root/target/debug/p2x-exchange" \
   --identity-file "$exchange_key" --credential-file "$credentials_file" --ticket-key-file "$ticket_key" \
+  --auth-limit-connections "$([[ "$case_name" == connection-limit ]] && echo 0 || echo 256)" \
+  --auth-limit-requests "$([[ "$case_name" == connection-limit || "$case_name" == request-limit || "$case_name" == session-limit ]] && echo 0 || echo 128)" \
   --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
   >"$exchange_log" 2>&1 &
 exchange_pid=$!
@@ -208,8 +210,8 @@ if [[ "$case_name" != exchange-restart ]]; then
   [[ "$terminal_count" -eq 1 ]] || { echo "$component emitted $terminal_count terminal records" >&2; exit 1; }
 fi
 if [[ "$case_name" == connection-limit || "$case_name" == request-limit || "$case_name" == session-limit ]]; then
+  grep -q '"code":"limit.auth_requests\|"code":"limit.auth_connections"' "$log" || { echo "limit case lacked live request rejection" >&2; exit 1; }
   cargo test -q -p p2x-exchange --lib admission::tests::rejected_close_cannot_undercount_admitted_connections
-  grep -q '"state":"established"' "$out/exchange.ndjson" || { echo "limit case lacked connection admission" >&2; exit 1; }
 elif [[ "$case_name" == malformed-frame || "$case_name" == unsupported-version || "$case_name" == oversized-frame ]]; then
   cargo test -q -p p2x-net --lib auth_codec::tests::rejects_version_capability_and_trailing
 elif [[ "$case_name" != exchange-restart ]]; then

@@ -57,6 +57,10 @@ struct Args {
     artifact: Option<PathBuf>,
     #[arg(long, default_value = "lifecycle")]
     case_id: String,
+    #[arg(long)]
+    auth_limit_connections: Option<usize>,
+    #[arg(long)]
+    auth_limit_requests: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -138,7 +142,10 @@ async fn main() -> io::Result<()> {
             .map_err(io::Error::other)?;
     }
     let mut sessions = AuthSessionLedger::default();
-    let mut admission = AdmissionLedger::default();
+    let mut admission = match (args.auth_limit_connections, args.auth_limit_requests) {
+        (Some(connections), Some(requests)) => AdmissionLedger::with_limits(connections, requests),
+        _ => AdmissionLedger::default(),
+    };
     let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
     let config = ExchangeSwarmConfig {
         tcp_listen: args.tcp_listen,

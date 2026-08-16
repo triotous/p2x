@@ -46,8 +46,9 @@ struct RequestRecord {
     ip: String,
     failed: bool,
 }
-#[derive(Default)]
 pub struct AdmissionLedger {
+    max_connections: usize,
+    max_inflight: usize,
     connections: HashMap<ConnectionId, ConnectionRecord>,
     peer_connections: HashMap<String, usize>,
     ip_connections: HashMap<String, usize>,
@@ -56,7 +57,29 @@ pub struct AdmissionLedger {
     failures: HashMap<String, FailureBucket>,
     requests: HashMap<AdmissionRequestId, RequestRecord>,
 }
+impl Default for AdmissionLedger {
+    fn default() -> Self {
+        Self {
+            max_connections: MAX_CONNECTIONS,
+            max_inflight: MAX_INFLIGHT,
+            connections: HashMap::new(),
+            peer_connections: HashMap::new(),
+            ip_connections: HashMap::new(),
+            inflight: 0,
+            peer_inflight: HashMap::new(),
+            failures: HashMap::new(),
+            requests: HashMap::new(),
+        }
+    }
+}
 impl AdmissionLedger {
+    pub fn with_limits(max_connections: usize, max_inflight: usize) -> Self {
+        Self {
+            max_connections,
+            max_inflight,
+            ..Self::default()
+        }
+    }
     pub fn admit_connection(
         &mut self,
         connection_id: ConnectionId,
@@ -66,7 +89,7 @@ impl AdmissionLedger {
         if self.connections.contains_key(&connection_id) {
             return Admission::Accepted;
         }
-        if self.connections.len() >= MAX_CONNECTIONS
+        if self.connections.len() >= self.max_connections
             || self.ip_connections.get(ip).copied().unwrap_or(0) >= MAX_CONNECTIONS_PER_IP
             || self.peer_connections.get(peer).copied().unwrap_or(0) >= MAX_CONNECTIONS_PER_PEER
         {
@@ -97,7 +120,7 @@ impl AdmissionLedger {
         let Some(record) = self.connections.get(&connection_id).cloned() else {
             return Admission::Rejected(PublicErrorCode::LimitAuthConnections);
         };
-        if self.inflight >= MAX_INFLIGHT
+        if self.inflight >= self.max_inflight
             || self.peer_inflight.get(&record.peer).copied().unwrap_or(0) >= MAX_INFLIGHT_PER_PEER
         {
             return Admission::Rejected(PublicErrorCode::LimitAuthRequests);
@@ -224,7 +247,7 @@ mod tests {
     use super::*;
     #[test]
     fn rejected_close_cannot_undercount_admitted_connections() {
-        let mut ledger = AdmissionLedger::default();
+        let mut ledger = AdmissionLedger::with_limits(2, MAX_INFLIGHT);
         let first = ConnectionId::new_unchecked(1);
         let second = ConnectionId::new_unchecked(2);
         let rejected = ConnectionId::new_unchecked(3);
@@ -249,7 +272,7 @@ mod tests {
     }
     #[test]
     fn auth_is_owned_by_connection_id() {
-        let mut ledger = AdmissionLedger::default();
+        let mut ledger = AdmissionLedger::with_limits(MAX_CONNECTIONS, MAX_INFLIGHT);
         let id = ConnectionId::new_unchecked(7);
         assert_eq!(
             ledger.begin_auth(1u64, id, 0),
@@ -264,7 +287,7 @@ mod tests {
     }
     #[test]
     fn response_delivery_and_close_release_each_request_once() {
-        let mut ledger = AdmissionLedger::default();
+        let mut ledger = AdmissionLedger::with_limits(MAX_CONNECTIONS, MAX_INFLIGHT);
         let connection = ConnectionId::new_unchecked(8);
         ledger.admit_connection(connection, "peer", "ip");
         let request = 3u64;

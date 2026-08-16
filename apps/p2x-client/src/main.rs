@@ -490,7 +490,7 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { response: AuthResponse::Pong { request_id, nonce, .. }, .. }, .. })) if credential.is_some() && request_id == ping_request_id && auth_state.pong(request_id, nonce) == AuthAction::Ready => { readiness_generation = readiness_generation.saturating_add(1); if args.finite_auth_check { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?; return Ok(()); } emitter.emit(&LifecycleRecord::AuthReadiness { ready: true, generation: readiness_generation })?; }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { response: AuthResponse::Rejected { request_id, error }, .. }, .. })) if credential.is_some() && auth_state.rejected(request_id, error.code, unix_now()) != AuthAction::Ignore => {
-                        if matches!(auth_state.phase(), p2x_net::auth_state::AuthPhase::Terminal(_)) {
+                        if args.finite_auth_check || matches!(auth_state.phase(), p2x_net::auth_state::AuthPhase::Terminal(_)) {
                             emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", error.code.as_str()))?;
                             return Ok(());
                         }
@@ -521,6 +521,10 @@ async fn main() -> io::Result<()> {
                         let reason = format!("{cause:?}");
                         emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Closed, path: None, reason: Some(&reason) })?;
                         if expected_exchange == peer_id && credential.is_some() && auth_state.disconnected() == AuthAction::Retry {
+                            if args.finite_auth_check && !auth_state.ready() {
+                                emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", PublicErrorCode::LimitAuthConnections.as_str()))?;
+                                return Ok(());
+                            }
                             exchange_redial_pending = true;
                             emitter.emit(&LifecycleRecord::AuthReadiness { ready: false, generation: readiness_generation })?;
                         }
