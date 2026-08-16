@@ -23,8 +23,14 @@ pub fn handle_request(
             credential_id,
             token_secret,
             requested_role,
-            ..
+            supported_features,
         } => {
+            if supported_features != p2x_protocol::KNOWN_AUTH_FEATURES_V1 {
+                return AuthResponse::Rejected {
+                    request_id: Some(request_id),
+                    error: PublicError::new(PublicErrorCode::ProtocolCapabilityMismatch, false),
+                };
+            }
             let result =
                 provider.authenticate(peer_id, &credential_id, &token_secret, requested_role, now);
             match result {
@@ -94,6 +100,36 @@ mod tests {
     use super::*;
     use crate::authn::*;
     use p2x_protocol::*;
+    #[test]
+    fn unsupported_features_are_rejected_before_credential_lookup() {
+        let (_, token) =
+            TokenSecret::parse("p2x1.id.AwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc").unwrap();
+        let id = CredentialId::new("id").unwrap();
+        let provider = FixedTokenProvider::new(1, []);
+        let mut ledger = AuthSessionLedger::default();
+        assert!(matches!(
+            handle_request(
+                &provider,
+                &mut ledger,
+                "peer",
+                AuthRequest::Authenticate {
+                    request_id: [1; 16],
+                    credential_id: id,
+                    token_secret: token,
+                    requested_role: Role::Client,
+                    supported_features: 1
+                },
+                1
+            ),
+            AuthResponse::Rejected {
+                error: PublicError {
+                    code: PublicErrorCode::ProtocolCapabilityMismatch,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
     #[test]
     fn authenticate_then_ping_is_correlated() {
         let (_, token) =
