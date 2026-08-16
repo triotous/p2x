@@ -220,10 +220,35 @@ if [[ -n "$companion" ]]; then
   grep -q '"code":"auth.pong"' "$out/$companion.ndjson" || { echo "$companion did not authenticate" >&2; exit 1; }
 fi
 if [[ "$case_name" == rotation-overlap || "$case_name" == rotation-revoke-old ]]; then
-  P2X_TOKEN="$rotation_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --case-id rotation-second --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/rotation-second.ndjson" 2>&1 &
+  listen_base="${exchange_addr%/p2p/*}"
+  kill -INT "$exchange_pid" 2>/dev/null || true
+  wait "$exchange_pid" 2>/dev/null || true
+  python3 - "$credentials_file" "$case_name" <<'PY'
+from pathlib import Path
+import sys
+path, case = Path(sys.argv[1]), sys.argv[2]
+text = path.read_text().replace('authorization_revision: 1', 'authorization_revision: 2')
+if case == 'rotation-revoke-old':
+    text = text.replace('    token_sha256: "' + text.split('token_sha256: "', 1)[1].split('"', 1)[0] + '"\n    peer_id:', '    token_sha256: "' + text.split('token_sha256: "', 1)[1].split('"', 1)[0] + '"\n    peer_id:')
+    first = text.find('    revoked: false')
+    text = text[:first] + text[first:].replace('    revoked: false', '    revoked: true', 1)
+path.write_text(text)
+PY
+  P2X_RUN_ID="$run_id-rotation" "$root/target/debug/p2x-exchange" --identity-file "$exchange_key" --credential-file "$credentials_file" --ticket-key-file "$ticket_key" --tcp-listen "$listen_base" --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/exchange-rotation.ndjson" 2>&1 &
+  exchange_pid=$!; pids+=("$exchange_pid")
+  rotation_addr=""
+  for _ in $(seq 1 200); do rotation_addr=$(jq -r 'select(.event == "listener_ready" and (.address | contains("/tcp/"))) | .address' "$out/exchange-rotation.ndjson" 2>/dev/null | head -1 || true); [[ -n "$rotation_addr" ]] && break; sleep .05; done
+  [[ -n "$rotation_addr" ]] || { echo "rotation exchange did not become ready" >&2; exit 1; }
+  P2X_TOKEN="$rotation_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$rotation_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --finite-auth-check --case-id rotation-second --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/rotation-second.ndjson" 2>&1 &
   pids+=("$!")
   for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$out/rotation-second.ndjson" && break; sleep .05; done
   grep -q '"code":"auth.pong"' "$out/rotation-second.ndjson" || { echo "rotated credential did not authenticate" >&2; exit 1; }
+  if [[ "$case_name" == rotation-revoke-old ]]; then
+    P2X_TOKEN="$client_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$rotation_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --finite-auth-check --case-id old-token --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/old-token.ndjson" 2>&1 &
+    pids+=("$!")
+    for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$out/old-token.ndjson" && break; sleep .05; done
+    grep -q '"code":"auth.invalid_credential"' "$out/old-token.ndjson" || { echo "old credential still authenticated" >&2; exit 1; }
+  fi
 fi
 if [[ "$case_name" == exchange-restart ]]; then
   for _ in $(seq 1 200); do grep -q '"event":"auth_readiness","ready":true' "$log" && break; sleep .05; done
