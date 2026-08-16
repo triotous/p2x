@@ -83,6 +83,25 @@ pub enum LifecycleRecord<'a> {
         peer_id: &'a str,
         request_id: String,
     },
+    RegistryTransition {
+        peer_id: &'a str,
+        operation: &'a str,
+        code: &'a str,
+        revision: Option<u64>,
+        registrations: usize,
+        selector_owners: usize,
+        mutations: u64,
+    },
+    ExchangeResources {
+        sessions: usize,
+        relay_admissions: usize,
+        reservations: usize,
+        circuits: usize,
+        registrations: usize,
+        selector_owners: usize,
+        auth_requests: usize,
+        registry_requests: usize,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -267,5 +286,29 @@ mod tests {
         assert_eq!(value["event"], "terminal");
         assert_eq!(value["final_workers"], 0);
         assert_eq!(value["bytes_read"], 0);
+    }
+    #[test]
+    fn exchange_resources_are_machine_readable_counts() {
+        let record = LifecycleRecord::ExchangeResources {
+            sessions: 1,
+            relay_admissions: 1,
+            reservations: 1,
+            circuits: 32,
+            registrations: 1,
+            selector_owners: 2,
+            auth_requests: 0,
+            registry_requests: 0,
+        };
+        let value = serde_json::to_value(EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            component: "exchange",
+            run_id: "run",
+            offset_ms: 0,
+            record: &record,
+        })
+        .unwrap();
+        assert_eq!(value["event"], "exchange_resources");
+        assert_eq!(value["circuits"], 32);
+        assert_eq!(value["selector_owners"], 2);
     }
 }

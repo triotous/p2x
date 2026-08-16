@@ -69,6 +69,16 @@ struct Args {
     drop_first_probe: bool,
     #[arg(long)]
     finite_auth_check: bool,
+    #[arg(long, hide = true)]
+    test_register_without_reservation: bool,
+    #[arg(long, hide = true)]
+    test_suppress_registry_refresh: bool,
+    #[arg(long, hide = true)]
+    test_replay_register_response: bool,
+    #[arg(long, hide = true)]
+    test_drop_reservation_after_register: bool,
+    #[arg(long, hide = true)]
+    test_concurrent_registry_requests: bool,
 }
 
 fn probe_mut(
@@ -268,6 +278,18 @@ fn registry_retry_at(operation: &mut RegistryOperation, now_millis: i64, jitter:
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args = Args::parse();
+    if (args.test_register_without_reservation
+        || args.test_suppress_registry_refresh
+        || args.test_replay_register_response
+        || args.test_drop_reservation_after_register
+        || args.test_concurrent_registry_requests)
+        && std::env::var_os("P2X_ENABLE_TEST_HOOKS").is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "registry test hooks require P2X_ENABLE_TEST_HOOKS=1",
+        ));
+    }
     let run_id = std::env::var("P2X_RUN_ID").unwrap_or_else(|_| "manual".into());
     let emitter = match &args.artifact {
         Some(path) => Emitter::with_artifact("server", &run_id, path)?,
@@ -396,6 +418,9 @@ async fn main() -> io::Result<()> {
     let mut registry_retry_due_at = None;
     let mut registration_revision = None;
     let mut registration_expires_at = 0i64;
+    let mut register_response_replayed = false;
+    let mut changed_register_replayed = false;
+    let mut late_refresh_sent = false;
     if config.mode == RuntimeMode::Product
         && let Some(index) = exchange_addresses.next(args.exchange.len())
     {
@@ -472,7 +497,7 @@ async fn main() -> io::Result<()> {
             _ = resource_tick.tick() => {
                 if config.mode == RuntimeMode::Product {
                     match availability.tick(unix_now()) {
-                        availability::AvailabilityAction::Refresh if !registration_requested && registry_operation.is_none() => {
+                        availability::AvailabilityAction::Refresh if !args.test_suppress_registry_refresh && !registration_requested && registry_operation.is_none() => {
                             if let (Some(peer_id), Some(session_id), Some(revision), Some(services)) = (relay_peer_id, auth_state.current_session(unix_now()), registration_revision, service_config.as_ref()) {
                                 let operation = new_refresh(&mut request_ids, session_id, instance_id, revision, services.requested_lease_seconds, reservation.generation, services.service_set_hash)?;
                                 let outbound = send_registry(&mut swarm, peer_id, &operation);
@@ -483,6 +508,18 @@ async fn main() -> io::Result<()> {
                             registration_expires_at = 0;
                             let snapshot = availability.readiness(unix_now());
                             emitter.emit(&LifecycleRecord::ServerReadiness { ready: false, generation: snapshot.generation, auth: snapshot.auth, reservation: snapshot.reservation, registration: snapshot.registration })?;
+                            if args.test_suppress_registry_refresh
+                                && !late_refresh_sent
+                                && let (Some(peer_id), Some(session_id), Some(revision), Some(services)) = (relay_peer_id, auth_state.current_session(unix_now()), registration_revision, service_config.as_ref())
+                            {
+                                late_refresh_sent = true;
+                                let operation = new_refresh(&mut request_ids, session_id, instance_id, revision, services.requested_lease_seconds, reservation.generation, services.service_set_hash)?;
+                                let outbound = send_registry(&mut swarm, peer_id, &operation);
+                                if pending_registry.begin(outbound) {
+                                    registry_operation = Some(operation);
+                                    registration_requested = true;
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -551,6 +588,10 @@ async fn main() -> io::Result<()> {
                                 if !pending_registry.begin(outbound) { return Err(io::Error::other("registry outbound request limit exceeded")); }
                                 registry_operation = Some(operation);
                                 registration_requested = true;
+                                if args.test_concurrent_registry_requests {
+                                    let duplicate = new_register(&mut request_ids, session_id, instance_id, service_config.as_ref().expect("product services"), reservation.generation)?;
+                                    let _ = send_registry(&mut swarm, peer_id, &duplicate);
+                                }
                             }
                         }
                     }
@@ -703,7 +744,19 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Pong { request_id, nonce, .. } }, .. })) if credential.is_some() && pending_auth.complete(&outbound_id) && request_id == ping_request_id && auth_state.pong(request_id, nonce) == AuthAction::Ready => {
                         readiness_generation = readiness_generation.saturating_add(1);
                         if config.mode == RuntimeMode::Product { let _ = availability.auth_ready(); }
-                        if config.mode == RuntimeMode::Product && !reservation_requested && let (Some(address), Some(connection_id)) = (pending_circuit.clone(), relay_connection_id) {
+                        if config.mode == RuntimeMode::Product
+                            && args.test_register_without_reservation
+                            && registry_operation.is_none()
+                            && let (Some(session_id), Some(services)) = (auth_state.current_session(unix_now()), service_config.as_ref())
+                        {
+                            let operation = new_register(&mut request_ids, session_id, instance_id, services, reservation.generation)?;
+                            let outbound = send_registry(&mut swarm, peer, &operation);
+                            if pending_registry.begin(outbound) {
+                                registry_operation = Some(operation);
+                                registration_requested = true;
+                            }
+                        }
+                        if config.mode == RuntimeMode::Product && !args.test_register_without_reservation && !reservation_requested && let (Some(address), Some(connection_id)) = (pending_circuit.clone(), relay_connection_id) {
                             reservation_generation = reservation_generation.saturating_add(1);
                             reservation.apply(ReservationEvent::GenerationStarted { generation: reservation_generation, peer_id: peer, connection_id }).map_err(io::Error::other)?;
                             let listener_id = swarm.listen_on(address).map_err(io::Error::other)?;
@@ -771,11 +824,43 @@ async fn main() -> io::Result<()> {
                         match response {
                             RegistryResponseV1::Registered { request_id: response_id, instance_id: response_instance, registration_revision: revision, service_set_hash, expires_at, .. }
                                 if operation.accepts_registered(response_id, response_instance == instance_id, service_set_hash, reservation.generation, reservation.is_ready()) => {
+                                if args.test_replay_register_response && !register_response_replayed {
+                                    register_response_replayed = true;
+                                    let Some(peer_id) = relay_peer_id else { continue };
+                                    let outbound = send_registry(&mut swarm, peer_id, &operation);
+                                    if !pending_registry.begin(outbound) { return Err(io::Error::other("registry replay outbound request limit exceeded")); }
+                                    registry_operation = Some(operation);
+                                    registration_requested = true;
+                                    continue;
+                                }
                                 registration_revision = Some(revision);
                                 registration_expires_at = expires_at;
                                 let _ = availability.registered_with_jitter(reservation.generation, expires_at, now, random_jitter_per_mille()?);
                                 let snapshot = availability.readiness(now);
                                 emitter.emit(&LifecycleRecord::ServerReadiness { ready: snapshot.auth && snapshot.reservation && snapshot.registration, generation: snapshot.generation, auth: snapshot.auth, reservation: snapshot.reservation, registration: snapshot.registration })?;
+                                if args.test_replay_register_response
+                                    && register_response_replayed
+                                    && !changed_register_replayed
+                                {
+                                    changed_register_replayed = true;
+                                    let mut changed = operation.clone();
+                                    if let RegistryRequestV1::Register { requested_lease_seconds, .. } = &mut changed.request {
+                                        *requested_lease_seconds = requested_lease_seconds.saturating_add(1);
+                                    }
+                                    let Some(peer_id) = relay_peer_id else { continue };
+                                    let outbound = send_registry(&mut swarm, peer_id, &changed);
+                                    if !pending_registry.begin(outbound) { return Err(io::Error::other("changed registry replay outbound request limit exceeded")); }
+                                    registry_operation = Some(changed);
+                                    registration_requested = true;
+                                }
+                                if args.test_drop_reservation_after_register
+                                    && let Some(listener_id) = circuit_listener_id.take()
+                                {
+                                    swarm.remove_listener(listener_id);
+                                    if let Some(connection_id) = relay_connection_id {
+                                        swarm.close_connection(connection_id);
+                                    }
+                                }
                             }
                             RegistryResponseV1::Refreshed { request_id: response_id, instance_id: response_instance, registration_revision: response_revision, expires_at }
                                 if operation.accepts_refreshed(response_id, response_instance == instance_id, response_revision, reservation.generation, reservation.is_ready(), registration_expires_at > now) => {

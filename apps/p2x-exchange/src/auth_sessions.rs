@@ -217,6 +217,10 @@ impl AuthSessionLedger {
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
+    pub fn clear(&mut self) {
+        self.sessions.clear();
+        self.connections.clear();
+    }
 }
 #[cfg(test)]
 mod tests {

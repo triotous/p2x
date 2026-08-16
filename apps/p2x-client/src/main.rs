@@ -3,7 +3,10 @@ use futures::StreamExt;
 use libp2p::{
     Multiaddr,
     request_response::{Event as RequestResponseEvent, Message as RequestResponseMessage},
-    swarm::SwarmEvent,
+    swarm::{
+        SwarmEvent,
+        dial_opts::{DialOpts, PeerCondition},
+    },
 };
 use p2x_net::{
     AttemptId, PathAction, PathAttempt, PathDecision, PathEvent, PathEventKind,
@@ -159,6 +162,12 @@ struct Args {
     finite_auth_check: bool,
     #[arg(long)]
     finite_relay_ping: bool,
+    #[arg(long, hide = true, default_value_t = 0)]
+    test_hold_relay_seconds: u64,
+    #[arg(long, hide = true, default_value_t = 1)]
+    test_relay_circuit_count: u32,
+    #[arg(long, hide = true, action = clap::ArgAction::Append)]
+    test_relay_target: Vec<Multiaddr>,
     #[arg(long, value_enum)]
     auth_fault: Option<AuthFaultArg>,
 }
@@ -235,6 +244,16 @@ fn drive_path_actions(
 async fn main() -> io::Result<()> {
     let started_at = std::time::Instant::now();
     let args = Args::parse();
+    if (args.test_hold_relay_seconds > 0
+        || args.test_relay_circuit_count != 1
+        || !args.test_relay_target.is_empty())
+        && std::env::var_os("P2X_ENABLE_TEST_HOOKS").is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "relay test hooks require P2X_ENABLE_TEST_HOOKS=1",
+        ));
+    }
     let run_id = std::env::var("P2X_RUN_ID").unwrap_or_else(|_| "manual".into());
     let emitter = match &args.artifact {
         Some(path) => Emitter::with_artifact("client", &run_id, path)?,
@@ -392,6 +411,8 @@ async fn main() -> io::Result<()> {
     let mut exchange_connections = ExchangeConnections::new();
     let mut pending_auth = PendingRequest::new();
     let mut exchange_redial = RedialBackoff::new();
+    let mut test_relay_targets: VecDeque<Multiaddr> = VecDeque::new();
+    let mut test_dialed_targets = HashSet::new();
     let mut readiness_generation = 0u64;
     let mut maintenance = tokio::time::interval(std::time::Duration::from_millis(100));
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerResult>(128);
@@ -399,6 +420,14 @@ async fn main() -> io::Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = maintenance.tick() => {
+                if let Some(address) = test_relay_targets.pop_front() {
+                    let peer = address.iter().filter_map(|part| match part { libp2p::multiaddr::Protocol::P2p(peer) => Some(peer), _ => None }).last().ok_or_else(|| io::Error::other("relay target peer is missing"))?;
+                    if test_dialed_targets.insert(peer) {
+                        let _ = swarm.dial(address);
+                    } else {
+                        swarm.dial(DialOpts::peer_id(peer).condition(PeerCondition::Always).addresses(vec![address]).build()).map_err(io::Error::other)?;
+                    }
+                }
                 if exchange_redial.take_due(unix_millis())
                     && let Some(index) = exchange_addresses.next(args.exchange.len())
                     && let Err(error) = swarm.dial(args.exchange[index].clone())
@@ -552,7 +581,16 @@ async fn main() -> io::Result<()> {
                         }
                         emitter.emit(&LifecycleRecord::AuthReadiness { ready: true, generation: readiness_generation })?;
                         if args.finite_relay_ping && let Some(address) = server_address.clone() {
-                            swarm.dial(address).map_err(io::Error::other)?;
+                            let explicit_targets = !args.test_relay_target.is_empty();
+                            let targets = if explicit_targets { args.test_relay_target.clone() } else { vec![address; args.test_relay_circuit_count as usize] };
+                            if explicit_targets {
+                                test_relay_targets.extend(targets);
+                                continue;
+                            }
+                            for address in targets {
+                                let peer = address.iter().filter_map(|part| match part { libp2p::multiaddr::Protocol::P2p(peer) => Some(peer), _ => None }).last().ok_or_else(|| io::Error::other("relay target peer is missing"))?;
+                                swarm.dial(DialOpts::peer_id(peer).condition(PeerCondition::Always).addresses(vec![address]).build()).map_err(io::Error::other)?;
+                            }
                         }
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Rejected { request_id, error } }, .. })) if credential.is_some() && pending_auth.complete(&outbound_id) && auth_state.rejected(request_id, error.code, unix_now()) != AuthAction::Ignore => {
@@ -576,6 +614,12 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::OutboundFailure { request_id, error: libp2p::request_response::OutboundFailure::ConnectionClosed, .. })) if credential.is_some() => { pending_auth.complete(&request_id); }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Ping(event)) if args.finite_relay_ping && target_peer == Some(event.peer) && event.result.is_ok() && started => {
+                        if args.test_relay_circuit_count > 1 || !args.test_relay_target.is_empty() {
+                            continue;
+                        }
+                        if args.test_hold_relay_seconds > 0 {
+                            tokio::time::sleep(std::time::Duration::from_secs(args.test_hold_relay_seconds)).await;
+                        }
                         emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "relay.ping"))?;
                         return Ok(());
                     }

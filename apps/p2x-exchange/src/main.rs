@@ -110,6 +110,8 @@ struct Args {
     auth_limit_requests: Option<usize>,
     #[arg(long)]
     auth_limit_sessions: Option<usize>,
+    #[arg(long, hide = true)]
+    auth_limit_connections_per_ip: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -202,14 +204,24 @@ async fn main() -> io::Result<()> {
         AuthSessionLedger::default,
         AuthSessionLedger::with_max_sessions,
     );
-    let mut admission = match (args.auth_limit_connections, args.auth_limit_requests) {
-        (Some(connections), Some(requests)) => AdmissionLedger::with_limits(connections, requests),
+    let mut admission = match (
+        args.auth_limit_connections,
+        args.auth_limit_requests,
+        args.auth_limit_connections_per_ip,
+    ) {
+        (Some(connections), Some(requests), Some(per_ip)) => {
+            AdmissionLedger::with_connection_limits(connections, requests, per_ip)
+        }
+        (Some(connections), Some(requests), None) => {
+            AdmissionLedger::with_limits(connections, requests)
+        }
         _ => AdmissionLedger::default(),
     };
     let relay_admission = p2x_net::RelayAdmissionHandle::default();
     let mut registry = p2x_exchange::registry::Registry::default();
     let mut registry_admission = RegistryAdmissionLedger::default();
     let mut reserved_servers = HashSet::new();
+    let mut active_circuits = 0usize;
     registry.set_advertise_addresses(args.advertise.iter().map(ToString::to_string).collect());
     let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
     let config = ExchangeSwarmConfig {
@@ -264,6 +276,16 @@ async fn main() -> io::Result<()> {
                     break;
                 }
                 admission.sweep(chrono_like_now());
+                emitter.emit(&LifecycleRecord::ExchangeResources {
+                    sessions: sessions.len(),
+                    relay_admissions: relay_admission.len(),
+                    reservations: reserved_servers.len(),
+                    circuits: active_circuits,
+                    registrations: registry.len(),
+                    selector_owners: registry.owner_count(),
+                    auth_requests: admission.inflight(),
+                    registry_requests: registry_admission.inflight(),
+                })?;
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { listener_id, address } => {
@@ -305,6 +327,16 @@ async fn main() -> io::Result<()> {
                 SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Registry(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, request_id }, connection_id, .. })) => {
                     if let RegistryAdmission::Rejected(code) = registry_admission.begin(peer, request_id, connection_id, chrono_like_now()) {
                         let response = p2x_protocol::RegistryResponseV1::Rejected { request_id: match &request { p2x_protocol::RegistryRequestV1::Register { request_id, .. } | p2x_protocol::RegistryRequestV1::Refresh { request_id, .. } | p2x_protocol::RegistryRequestV1::Withdraw { request_id, .. } => Some(*request_id) }, error: p2x_protocol::PublicError::new(code, true) };
+                        let peer_name = peer.to_string();
+                        emitter.emit(&LifecycleRecord::RegistryTransition {
+                            peer_id: &peer_name,
+                            operation: "rejected",
+                            code: code.as_str(),
+                            revision: None,
+                            registrations: registry.len(),
+                            selector_owners: registry.owner_count(),
+                            mutations: registry.mutation_count(),
+                        })?;
                         if swarm.behaviour_mut().registry.send_response(channel, response).is_err() { /* no owner was acquired */ }
                         continue;
                     }
@@ -320,6 +352,22 @@ async fn main() -> io::Result<()> {
                         (Some(session), p2x_protocol::RegistryRequestV1::Withdraw { request_id, session_id, instance_id, expected_registration_revision }) if session.principal.role == p2x_protocol::Role::Server && session_id == session.session_id => registry.withdraw(peer, request_id, instance_id, p2x_protocol::RegistrationRevision::new(expected_registration_revision.get()).expect("nonzero revision"), session_id, &session.principal.tenant, session.principal.role, session.principal.scopes, &session.principal.quota_profile, session.principal.authorization_revision, chrono_like_now()).unwrap_or_else(|error| p2x_protocol::RegistryResponseV1::Rejected { request_id: Some(request_id), error: p2x_protocol::PublicError::new(error.code(), error.retryable()) }),
                         _ => p2x_protocol::RegistryResponseV1::Rejected { request_id: registry_request_id, error: p2x_protocol::PublicError::new(p2x_protocol::PublicErrorCode::AuthSessionRequired, false) },
                     };
+                    let (operation, code, revision) = match &response {
+                        p2x_protocol::RegistryResponseV1::Registered { registration_revision, .. } => ("register", "registry.registered", Some(registration_revision.get())),
+                        p2x_protocol::RegistryResponseV1::Refreshed { registration_revision, .. } => ("refresh", "registry.refreshed", Some(registration_revision.get())),
+                        p2x_protocol::RegistryResponseV1::Withdrawn { registration_revision, .. } => ("withdraw", "registry.withdrawn", Some(registration_revision.get())),
+                        p2x_protocol::RegistryResponseV1::Rejected { error, .. } => ("rejected", error.code.as_str(), None),
+                    };
+                    let peer_name = peer.to_string();
+                    emitter.emit(&LifecycleRecord::RegistryTransition {
+                        peer_id: &peer_name,
+                        operation,
+                        code,
+                        revision,
+                        registrations: registry.len(),
+                        selector_owners: registry.owner_count(),
+                        mutations: registry.mutation_count(),
+                    })?;
                     if swarm.behaviour_mut().registry.send_response(channel, response).is_err() {
                         registry_admission.release(peer, request_id, connection_id);
                     }
@@ -337,6 +385,22 @@ async fn main() -> io::Result<()> {
                 | SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Relay(libp2p::relay::Event::ReservationTimedOut { src_peer_id })) => {
                     reserved_servers.remove(&src_peer_id);
                     registry.remove_peer(&src_peer_id);
+                    emitter.emit(&LifecycleRecord::ExchangeResources {
+                        sessions: sessions.len(),
+                        relay_admissions: relay_admission.len(),
+                        reservations: reserved_servers.len(),
+                        circuits: active_circuits,
+                        registrations: registry.len(),
+                        selector_owners: registry.owner_count(),
+                        auth_requests: admission.inflight(),
+                        registry_requests: registry_admission.inflight(),
+                    })?;
+                }
+                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Relay(libp2p::relay::Event::CircuitReqAccepted { .. })) => {
+                    active_circuits = active_circuits.saturating_add(1);
+                }
+                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Relay(libp2p::relay::Event::CircuitClosed { .. })) => {
+                    active_circuits = active_circuits.saturating_sub(1);
                 }
                 SwarmEvent::Behaviour(event) => { let message = format!("{event:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "relay.event", message: &message })?; }
                 SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => { let peer = peer_id.to_string(); let ip = endpoint.get_remote_address().iter().find_map(|p| match p { libp2p::multiaddr::Protocol::Ip4(v) => Some(v.to_string()), libp2p::multiaddr::Protocol::Ip6(v) => Some(v.to_string()), _ => None }).unwrap_or_else(|| "<unknown>".into()); if admission.admit_connection(connection_id, &peer, &ip) != Admission::Accepted { swarm.close_connection(connection_id); continue; } sessions.connection_established(&peer, connection_id); emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Established, path: Some(if endpoint.is_relayed() { p2x_net::probe::ProbePath::Relay } else { p2x_net::probe::ProbePath::Direct }), reason: None })?; }
@@ -448,8 +512,21 @@ async fn main() -> io::Result<()> {
     }
     registry.clear();
     relay_admission.clear();
+    sessions.clear();
+    reserved_servers.clear();
     registry_admission.shutdown();
     admission.shutdown(chrono_like_now());
+    active_circuits = 0;
+    emitter.emit(&LifecycleRecord::ExchangeResources {
+        sessions: sessions.len(),
+        relay_admissions: relay_admission.len(),
+        reservations: reserved_servers.len(),
+        circuits: active_circuits,
+        registrations: registry.len(),
+        selector_owners: registry.owner_count(),
+        auth_requests: admission.inflight(),
+        registry_requests: registry_admission.inflight(),
+    })?;
     emitter.terminal(&TerminalResult::simple(
         &args.case_id,
         "stopped",

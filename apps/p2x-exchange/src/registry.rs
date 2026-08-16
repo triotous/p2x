@@ -85,6 +85,7 @@ pub struct Registry {
     revision_allocator: RevisionAllocator,
     draining: bool,
     advertise_addresses: Vec<String>,
+    mutations: u64,
 }
 #[derive(Default)]
 struct RevisionAllocator {
@@ -173,20 +174,22 @@ impl Registry {
         if !reserved {
             return Err(RegistryError::ReservationRequired);
         }
+        if let Some(cached) = self.idempotency.get(&(peer_id, request_id)) {
+            if cached.digest == digest {
+                return Ok(cached.response.clone());
+            }
+            return Err(RegistryError::Malformed);
+        }
+        if services.as_slice().len() > MAX_SERVICES {
+            return Err(RegistryError::LimitServices);
+        }
         if services.as_slice().is_empty()
-            || services.as_slice().len() > MAX_SERVICES
             || !(10..=60).contains(&lease)
             || !capabilities.contains(Capabilities::RELAY_V2)
             || !capabilities.direct_transport()
             || capabilities.contains(Capabilities::DCUTR)
         {
             return Err(RegistryError::InvalidAdvertisement);
-        }
-        if let Some(cached) = self.idempotency.get(&(peer_id, request_id)) {
-            if cached.digest == digest {
-                return Ok(cached.response.clone());
-            }
-            return Err(RegistryError::Malformed);
         }
         self.sweep(now);
         if self.registrations.len() >= MAX_SERVERS && !self.registrations.contains_key(&peer_id) {
@@ -248,6 +251,7 @@ impl Registry {
             self.selector_owners.insert(key, peer_id);
         }
         self.registrations.insert(peer_id, record);
+        self.mutations = self.mutations.saturating_add(1);
         self.cache(peer_id, request_id, digest, response.clone(), now);
         let _ = session_id;
         Ok(response)
@@ -322,6 +326,7 @@ impl Registry {
         }
         let lease = requested_lease;
         record.expires_at = now.saturating_add(lease as i64);
+        self.mutations = self.mutations.saturating_add(1);
         let response = RegistryResponseV1::Refreshed {
             request_id,
             instance_id,
@@ -392,6 +397,7 @@ impl Registry {
             .remove(&peer_id)
             .expect("record was checked");
         self.remove_indexes(&record);
+        self.mutations = self.mutations.saturating_add(1);
         let response = RegistryResponseV1::Withdrawn {
             request_id,
             instance_id,
@@ -411,6 +417,7 @@ impl Registry {
             return false;
         };
         self.remove_indexes(&record);
+        self.mutations = self.mutations.saturating_add(1);
         true
     }
     pub fn sweep(&mut self, now: i64) {
@@ -438,6 +445,9 @@ impl Registry {
     }
     pub fn owner_count(&self) -> usize {
         self.selector_owners.len()
+    }
+    pub fn mutation_count(&self) -> u64 {
+        self.mutations
     }
 
     pub fn resolve_exact(
@@ -555,6 +565,38 @@ mod tests {
         }
     }
     #[test]
+    fn service_quota_has_a_distinct_limit_error() {
+        let (tenant, quota, _) = data();
+        let services = (0..=MAX_SERVICES)
+            .map(|index| {
+                let mut metadata = BTreeMap::new();
+                metadata.insert(
+                    MetadataKey::new("service").unwrap(),
+                    MetadataValue::new(&format!("service-{index}")).unwrap(),
+                );
+                p2x_protocol::ServiceAdvertisementV1::new(
+                    p2x_protocol::UpstreamId::new(&format!("upstream-{index}")).unwrap(),
+                    UnscopedSelector::new(ProtocolClass::Http, metadata).unwrap(),
+                    Health::Ready,
+                )
+            })
+            .collect();
+        assert_eq!(
+            Registry::default().register(
+                PeerId::random(),
+                &tenant,
+                Role::Server,
+                Scope::RegisterServices.bit(),
+                &quota,
+                1,
+                true,
+                request(ServiceSet::new(services).unwrap(), [9; 16]),
+                0,
+            ),
+            Err(RegistryError::LimitServices)
+        );
+    }
+    #[test]
     fn replacement_conflict_expiry_and_idempotency_are_atomic() {
         let (tenant, quota, services) = data();
         let peer = PeerId::random();
@@ -588,6 +630,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.owner_count(), 1);
+        assert_eq!(registry.mutation_count(), 1);
         assert!(matches!(
             registry.register(
                 PeerId::random(),
@@ -605,6 +648,7 @@ mod tests {
         registry.sweep(40);
         assert_eq!(registry.len(), 0);
         assert_eq!(registry.owner_count(), 0);
+        assert_eq!(registry.mutation_count(), 2);
     }
     #[test]
     fn refresh_and_withdraw_are_session_scoped_and_idempotent() {

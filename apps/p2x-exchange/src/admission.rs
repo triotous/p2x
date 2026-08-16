@@ -49,6 +49,8 @@ struct RequestRecord {
 pub struct AdmissionLedger {
     max_connections: usize,
     max_inflight: usize,
+    max_connections_per_ip: usize,
+    max_connections_per_peer: usize,
     connections: HashMap<ConnectionId, ConnectionRecord>,
     peer_connections: HashMap<String, usize>,
     ip_connections: HashMap<String, usize>,
@@ -62,6 +64,8 @@ impl Default for AdmissionLedger {
         Self {
             max_connections: MAX_CONNECTIONS,
             max_inflight: MAX_INFLIGHT,
+            max_connections_per_ip: MAX_CONNECTIONS_PER_IP,
+            max_connections_per_peer: MAX_CONNECTIONS_PER_PEER,
             connections: HashMap::new(),
             peer_connections: HashMap::new(),
             ip_connections: HashMap::new(),
@@ -80,6 +84,18 @@ impl AdmissionLedger {
             ..Self::default()
         }
     }
+    pub fn with_connection_limits(
+        max_connections: usize,
+        max_inflight: usize,
+        max_connections_per_ip: usize,
+    ) -> Self {
+        Self {
+            max_connections,
+            max_inflight,
+            max_connections_per_ip,
+            ..Self::default()
+        }
+    }
     pub fn admit_connection(
         &mut self,
         connection_id: ConnectionId,
@@ -90,8 +106,9 @@ impl AdmissionLedger {
             return Admission::Accepted;
         }
         if self.connections.len() >= self.max_connections
-            || self.ip_connections.get(ip).copied().unwrap_or(0) >= MAX_CONNECTIONS_PER_IP
-            || self.peer_connections.get(peer).copied().unwrap_or(0) >= MAX_CONNECTIONS_PER_PEER
+            || self.ip_connections.get(ip).copied().unwrap_or(0) >= self.max_connections_per_ip
+            || self.peer_connections.get(peer).copied().unwrap_or(0)
+                >= self.max_connections_per_peer
         {
             return Admission::Rejected(PublicErrorCode::LimitAuthConnections);
         }
@@ -269,6 +286,22 @@ mod tests {
         assert_eq!(ledger.ip_connections("ip"), 1);
         ledger.close_connection(rejected);
         assert_eq!(ledger.connections(), 2);
+    }
+    #[test]
+    fn explicit_per_ip_limit_is_enforced_at_the_boundary() {
+        let mut ledger = AdmissionLedger::with_connection_limits(4, MAX_INFLIGHT, 2);
+        assert_eq!(
+            ledger.admit_connection(ConnectionId::new_unchecked(1), "peer-a", "ip"),
+            Admission::Accepted
+        );
+        assert_eq!(
+            ledger.admit_connection(ConnectionId::new_unchecked(2), "peer-b", "ip"),
+            Admission::Accepted
+        );
+        assert_eq!(
+            ledger.admit_connection(ConnectionId::new_unchecked(3), "peer-c", "ip"),
+            Admission::Rejected(PublicErrorCode::LimitAuthConnections)
+        );
     }
     #[test]
     fn auth_is_owned_by_connection_id() {
