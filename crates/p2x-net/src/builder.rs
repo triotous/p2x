@@ -1,6 +1,8 @@
 use crate::{
     auth_codec::{AUTH_PROTOCOL, AuthCodec},
     probe_stream::ProbeStreamBehaviour,
+    registry_codec::{REGISTRY_PROTOCOL, RegistryCodec},
+    relay_admission::{CircuitAuthorization, RelayAdmissionHandle, ReservationAuthorization},
 };
 use libp2p::core::transport::ListenerId;
 use libp2p::swarm::{NetworkBehaviour, Swarm};
@@ -10,6 +12,7 @@ use thiserror::Error;
 
 pub const IDENTIFY_PROTOCOL: &str = "/p2x/connectivity/0.1.0";
 pub const AUTH_REQUEST_TIMEOUT_SECONDS: u64 = 5;
+pub const REGISTRY_REQUEST_TIMEOUT_SECONDS: u64 = 5;
 pub const PROBE_PROTOCOL: libp2p::StreamProtocol = libp2p::StreamProtocol::new("/p2x/spike/1");
 pub const MAX_STREAMS: usize = 256;
 pub const MAX_NEGOTIATIONS: usize = 64;
@@ -96,6 +99,7 @@ pub struct ExchangeSwarmConfig {
     pub quic_listen: Multiaddr,
     pub allow_public: bool,
     pub relay_profile: RelayProfile,
+    pub relay_admission: Option<RelayAdmissionHandle>,
     pub mode: RuntimeMode,
 }
 
@@ -108,6 +112,7 @@ impl Default for ExchangeSwarmConfig {
                 .expect("valid QUIC default"),
             allow_public: false,
             relay_profile: RelayProfile::DefaultLab,
+            relay_admission: None,
             mode: RuntimeMode::Product,
         }
     }
@@ -220,6 +225,7 @@ pub struct ExchangeBehaviour {
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
     pub auth: libp2p::request_response::Behaviour<AuthCodec>,
+    pub registry: libp2p::request_response::Behaviour<RegistryCodec>,
 }
 #[derive(Debug)]
 pub enum ExchangeEvent {
@@ -227,6 +233,12 @@ pub enum ExchangeEvent {
     Identify(Box<identify::Event>),
     Ping(ping::Event),
     Auth(libp2p::request_response::Event<p2x_protocol::AuthRequest, p2x_protocol::AuthResponse>),
+    Registry(
+        libp2p::request_response::Event<
+            p2x_protocol::RegistryRequestV1,
+            p2x_protocol::RegistryResponseV1,
+        >,
+    ),
 }
 impl From<relay::Event> for ExchangeEvent {
     fn from(v: relay::Event) -> Self {
@@ -236,6 +248,23 @@ impl From<relay::Event> for ExchangeEvent {
 impl From<identify::Event> for ExchangeEvent {
     fn from(v: identify::Event) -> Self {
         Self::Identify(Box::new(v))
+    }
+}
+impl
+    From<
+        libp2p::request_response::Event<
+            p2x_protocol::RegistryRequestV1,
+            p2x_protocol::RegistryResponseV1,
+        >,
+    > for ExchangeEvent
+{
+    fn from(
+        v: libp2p::request_response::Event<
+            p2x_protocol::RegistryRequestV1,
+            p2x_protocol::RegistryResponseV1,
+        >,
+    ) -> Self {
+        Self::Registry(v)
     }
 }
 impl From<libp2p::request_response::Event<p2x_protocol::AuthRequest, p2x_protocol::AuthResponse>>
@@ -262,6 +291,7 @@ pub struct PeerBehaviour {
     pub ping: ping::Behaviour,
     pub probe_stream: libp2p::swarm::behaviour::toggle::Toggle<ProbeStreamBehaviour>,
     pub auth: libp2p::request_response::Behaviour<AuthCodec>,
+    pub registry: libp2p::request_response::Behaviour<RegistryCodec>,
 }
 #[derive(Debug)]
 pub enum PeerEvent {
@@ -271,6 +301,12 @@ pub enum PeerEvent {
     Ping(ping::Event),
     Probe(crate::probe_stream::behaviour::ProbeOutput),
     Auth(libp2p::request_response::Event<p2x_protocol::AuthRequest, p2x_protocol::AuthResponse>),
+    Registry(
+        libp2p::request_response::Event<
+            p2x_protocol::RegistryRequestV1,
+            p2x_protocol::RegistryResponseV1,
+        >,
+    ),
 }
 impl From<relay::client::Event> for PeerEvent {
     fn from(v: relay::client::Event) -> Self {
@@ -290,6 +326,23 @@ impl From<identify::Event> for PeerEvent {
 impl From<ping::Event> for PeerEvent {
     fn from(v: ping::Event) -> Self {
         Self::Ping(v)
+    }
+}
+impl
+    From<
+        libp2p::request_response::Event<
+            p2x_protocol::RegistryRequestV1,
+            p2x_protocol::RegistryResponseV1,
+        >,
+    > for PeerEvent
+{
+    fn from(
+        v: libp2p::request_response::Event<
+            p2x_protocol::RegistryRequestV1,
+            p2x_protocol::RegistryResponseV1,
+        >,
+    ) -> Self {
+        Self::Registry(v)
     }
 }
 impl From<libp2p::request_response::Event<p2x_protocol::AuthRequest, p2x_protocol::AuthResponse>>
@@ -334,8 +387,20 @@ pub fn build_exchange_swarm(
         .map_err(|e| BuildError::Builder(e.to_string()))?
         .with_behaviour(|_| ExchangeBehaviour {
             relay: libp2p::swarm::behaviour::toggle::Toggle::from(
-                (config.mode == RuntimeMode::ConnectivityLab)
-                    .then(|| relay::Behaviour::new(peer_id, config.relay_profile.config())),
+                (config.mode == RuntimeMode::ConnectivityLab || config.relay_admission.is_some())
+                    .then(|| {
+                        let mut relay_config = config.relay_profile.config();
+                        if let Some(admission) = config.relay_admission.clone() {
+                            relay_config.reservation_rate_limiters.insert(
+                                0,
+                                Box::new(ReservationAuthorization::new(admission.clone())),
+                            );
+                            relay_config
+                                .circuit_src_rate_limiters
+                                .insert(0, Box::new(CircuitAuthorization::new(admission)));
+                        }
+                        relay::Behaviour::new(peer_id, relay_config)
+                    }),
             ),
             identify: identify::Behaviour::new(
                 identify::Config::new(IDENTIFY_PROTOCOL.to_owned(), public_key)
@@ -354,6 +419,15 @@ pub fn build_exchange_swarm(
                 )],
                 libp2p::request_response::Config::default()
                     .with_request_timeout(Duration::from_secs(AUTH_REQUEST_TIMEOUT_SECONDS)),
+            ),
+            registry: libp2p::request_response::Behaviour::with_codec(
+                RegistryCodec,
+                [(
+                    libp2p::StreamProtocol::new(REGISTRY_PROTOCOL),
+                    libp2p::request_response::ProtocolSupport::Inbound,
+                )],
+                libp2p::request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(REGISTRY_REQUEST_TIMEOUT_SECONDS)),
             ),
         })
         .map_err(|e| BuildError::Builder(e.to_string()))
@@ -425,6 +499,15 @@ pub fn build_peer_swarm(
                 )],
                 libp2p::request_response::Config::default()
                     .with_request_timeout(Duration::from_secs(AUTH_REQUEST_TIMEOUT_SECONDS)),
+            ),
+            registry: libp2p::request_response::Behaviour::with_codec(
+                RegistryCodec,
+                (config.mode == RuntimeMode::Product).then_some((
+                    libp2p::StreamProtocol::new(REGISTRY_PROTOCOL),
+                    libp2p::request_response::ProtocolSupport::Outbound,
+                )),
+                libp2p::request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(REGISTRY_REQUEST_TIMEOUT_SECONDS)),
             ),
         })
         .map_err(|e| BuildError::Builder(e.to_string()))

@@ -15,6 +15,7 @@ thiserror.workspace = true
 clap.workspace = true
 futures.workspace = true
 getrandom.workspace = true
+sha2.workspace = true
 libp2p.workspace = true
 p2x-net = { path = "../../crates/p2x-net" }
 tokio.workspace = true
