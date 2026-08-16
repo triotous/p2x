@@ -303,6 +303,7 @@ async fn main() -> io::Result<()> {
     let mut relay_peer_id = exchange_trust.as_ref().map(|trust| trust.peer_id);
     let mut relay_connection_id = None;
     let mut circuit_listener_id = None;
+    let mut reservation_generation = 0u64;
     let mut reservation = ReservationContext::new(0);
     let mut pending_circuit = None;
     let mut reservation_requested = false;
@@ -463,7 +464,7 @@ async fn main() -> io::Result<()> {
                         let address = address.to_string();
                         emitter.emit(&LifecycleRecord::ListenerReady { listener_id: &listener, address: &address })?;
                         if address.contains("p2p-circuit") && let (Some(peer_id), Some(connection_id)) = (relay_peer_id, relay_connection_id) {
-                            reservation.apply(ReservationEvent::RelayAddressConfirmed { generation: 1, peer_id, connection_id, listener_id, address: address.parse().map_err(io::Error::other)? }).map_err(io::Error::other)?;
+                            reservation.apply(ReservationEvent::RelayAddressConfirmed { generation: reservation_generation, peer_id, connection_id, listener_id, address: address.parse().map_err(io::Error::other)? }).map_err(io::Error::other)?;
                             if config.mode == RuntimeMode::Product && reservation.is_ready() && !registration_requested
                                 && let Some(session_id) = auth_state.current_session(unix_now())
                             {
@@ -507,13 +508,6 @@ async fn main() -> io::Result<()> {
                             exchange_connections.established(connection_id);
                             if config.mode == RuntimeMode::Product {
                                 relay_connection_id = Some(connection_id);
-                                if let Some(address) = pending_circuit.clone() && !reservation_requested {
-                                    reservation.apply(ReservationEvent::GenerationStarted { generation: 1, peer_id, connection_id }).map_err(io::Error::other)?;
-                                    let listener_id = swarm.listen_on(address).map_err(io::Error::other)?;
-                                    circuit_listener_id = Some(listener_id);
-                                    reservation.apply(ReservationEvent::ReservationRequested { generation: 1, peer_id, connection_id }).map_err(io::Error::other)?;
-                                    reservation_requested = true;
-                                }
                             }
                             exchange_redial.reset();
                             if credential.is_none() {
@@ -533,10 +527,11 @@ async fn main() -> io::Result<()> {
                             && let Some(address) = pending_circuit.clone()
                         {
                             relay_connection_id = Some(connection_id);
-                            reservation.apply(ReservationEvent::GenerationStarted { generation: 1, peer_id, connection_id }).map_err(io::Error::other)?;
+                            reservation_generation = reservation_generation.saturating_add(1);
+                            reservation.apply(ReservationEvent::GenerationStarted { generation: reservation_generation, peer_id, connection_id }).map_err(io::Error::other)?;
                             let listener_id = swarm.listen_on(address).map_err(io::Error::other)?;
                             circuit_listener_id = Some(listener_id);
-                            reservation.apply(ReservationEvent::ReservationRequested { generation: 1, peer_id, connection_id }).map_err(io::Error::other)?;
+                            reservation.apply(ReservationEvent::ReservationRequested { generation: reservation_generation, peer_id, connection_id }).map_err(io::Error::other)?;
                             reservation_requested = true;
                             let relay = peer_id.to_string();
                             emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Requested, exchange_peer_id: &relay, listener_id: None, address: None, generation: 1, renewal: false })?;
@@ -547,7 +542,11 @@ async fn main() -> io::Result<()> {
                             && relay_peer_id == Some(peer_id)
                             && relay_connection_id == Some(connection_id) {
                             let _ = reservation.apply(ReservationEvent::ExchangeLost { generation: reservation.generation, peer_id, connection_id });
+                            reservation_requested = false;
+                            relay_connection_id = None;
                             let _ = availability.reservation_lost();
+                            let snapshot = availability.readiness(unix_now());
+                            emitter.emit(&LifecycleRecord::ServerReadiness { ready: false, generation: snapshot.generation, auth: snapshot.auth, reservation: snapshot.reservation, registration: snapshot.registration })?;
                             registration_revision = None;
                             registration_expires_at = 0;
                             registration_requested = false;
@@ -556,7 +555,7 @@ async fn main() -> io::Result<()> {
                         if config.mode == RuntimeMode::ConnectivityLab
                             && relay_peer_id == Some(peer_id)
                             && relay_connection_id == Some(connection_id) {
-                            reservation.apply(ReservationEvent::ExchangeLost { generation: 1, peer_id, connection_id }).map_err(io::Error::other)?;
+                            reservation.apply(ReservationEvent::ExchangeLost { generation: reservation_generation, peer_id, connection_id }).map_err(io::Error::other)?;
                             emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Degraded, exchange_peer_id: &peer_id.to_string(), listener_id: circuit_listener_id.as_ref().map(|_| "circuit"), address: None, generation: 1, renewal: false })?;
                         }
                         if let Some(book) = connection_book.as_mut() { book.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?; }
@@ -604,13 +603,17 @@ async fn main() -> io::Result<()> {
                         readiness_generation = readiness_generation.saturating_add(1);
                         if config.mode == RuntimeMode::Product { let _ = availability.auth_ready(); }
                         if config.mode == RuntimeMode::Product && !reservation_requested && let (Some(address), Some(connection_id)) = (pending_circuit.clone(), relay_connection_id) {
-                            reservation.apply(ReservationEvent::GenerationStarted { generation: 1, peer_id: peer, connection_id }).map_err(io::Error::other)?;
+                            reservation_generation = reservation_generation.saturating_add(1);
+                            reservation.apply(ReservationEvent::GenerationStarted { generation: reservation_generation, peer_id: peer, connection_id }).map_err(io::Error::other)?;
                             let listener_id = swarm.listen_on(address).map_err(io::Error::other)?;
                             circuit_listener_id = Some(listener_id);
-                            reservation.apply(ReservationEvent::ReservationRequested { generation: 1, peer_id: peer, connection_id }).map_err(io::Error::other)?;
+                            reservation.apply(ReservationEvent::ReservationRequested { generation: reservation_generation, peer_id: peer, connection_id }).map_err(io::Error::other)?;
                             reservation_requested = true;
                         }
-                        if args.finite_auth_check { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?; return Ok(()); } emitter.emit(&LifecycleRecord::AuthReadiness { ready: true, generation: readiness_generation })?;
+                        if args.finite_auth_check { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?; return Ok(()); }
+                        emitter.emit(&LifecycleRecord::AuthReadiness { ready: true, generation: readiness_generation })?;
+                        let snapshot = availability.readiness(unix_now());
+                        emitter.emit(&LifecycleRecord::ServerReadiness { ready: snapshot.auth && snapshot.reservation && snapshot.registration, generation: snapshot.generation, auth: snapshot.auth, reservation: snapshot.reservation, registration: snapshot.registration })?;
                     }
                     SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Rejected { request_id, error } }, .. })) if credential.is_some() && pending_auth.complete(&outbound_id) && auth_state.rejected(request_id, error.code, unix_now()) != AuthAction::Ignore => {
                         if matches!(auth_state.phase(), p2x_net::auth_state::AuthPhase::Terminal(_)) {

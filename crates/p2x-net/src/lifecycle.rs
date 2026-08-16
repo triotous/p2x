@@ -72,6 +72,13 @@ pub enum LifecycleRecord<'a> {
         ready: bool,
         generation: u64,
     },
+    ServerReadiness {
+        ready: bool,
+        generation: u64,
+        auth: bool,
+        reservation: bool,
+        registration: bool,
+    },
     AuthRequestObserved {
         peer_id: &'a str,
         request_id: String,
