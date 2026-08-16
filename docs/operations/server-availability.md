@@ -25,7 +25,7 @@ Reservation and registration retries use jittered exponential backoff from 250ms
 
 On graceful shutdown, readiness becomes false, one current registration is withdrawn with a five-second bound, the circuit listener and exchange connections close, and timers/resources drain. Exchange shutdown rejects new work, drains owned responses for up to five seconds, then clears registry and admission state. The registry is in-memory and single-exchange in this phase; exchange restart empties it.
 
-`tests/registry/local.sh --case all` is the local product-process entry point. It currently proves TCP and QUIC reserve/register/refresh flows, authenticated client Ping over Circuit Relay v2, and same-process exchange restart recovery. The remaining conflict, denial, limit, revocation, lease-expiry, packet, platform, and multi-host cases require the owner-executed checks listed in `tests/registry/README.md`.
+`tests/registry/local.sh --case all` is the local product-process entry point. It proves TCP and QUIC reserve/register/refresh/withdraw, authenticated client Ping over Circuit Relay v2, same-process exchange restart recovery, atomic/conflict/tenant behavior, authorization denial, expiry and cleanup, idempotent replay, request/service/relay boundaries, revocation restart, privacy, and graceful drain. Deployed scale/soak, packet, platform, namespace, and multi-host checks remain final-stage owner-executed procedures in `tests/registry/README.md`.
 
 ## Exchange and relay requirements
 

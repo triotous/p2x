@@ -12,7 +12,7 @@ An unavailable required environment is incomplete verification, not a pass. Runn
 
 Generated test output belongs below `target/` and is ignored by Git. Preserve raw failing artifacts outside version control while debugging; commit only deliberately reviewed and scrubbed evidence. Never commit reusable identities, tokens, private keys, raw tickets, private upstream addresses, public-network details that policy treats as sensitive, or unreviewed packet captures.
 
-`tests/registry/local.sh --case <name>` is the single registry harness entry point; it prepares a run-scoped artifact directory and returns 2 when owner-executed prerequisites are unavailable.
+`tests/registry/local.sh --case <name>` is the single registry harness entry point; it prepares a run-scoped artifact directory, returns 2 for invalid CLI usage, and exits nonzero when a prerequisite or observed assertion fails.
 
 `Dockerfile.test` packages the complete non-interactive test toolchain. Its
 default entry point runs all container-safe automated suites; the privileged
