@@ -96,19 +96,71 @@ fn unix_millis() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
-#[derive(Clone, Copy, Debug)]
-enum RegistryOperation {
-    Register {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegistryOperationKind {
+    Register,
+    Refresh(p2x_protocol::RegistrationRevision),
+    Withdraw(p2x_protocol::RegistrationRevision),
+}
+
+#[derive(Clone, Debug)]
+struct RegistryOperation {
+    request: RegistryRequestV1,
+    kind: RegistryOperationKind,
+    reservation_generation: u64,
+    expected_service_set_hash: [u8; 32],
+    attempts: u32,
+}
+
+impl RegistryOperation {
+    fn request_id(&self) -> [u8; 16] {
+        match &self.request {
+            RegistryRequestV1::Register { request_id, .. }
+            | RegistryRequestV1::Refresh { request_id, .. }
+            | RegistryRequestV1::Withdraw { request_id, .. } => *request_id,
+        }
+    }
+
+    fn session_id(&self) -> [u8; 16] {
+        match &self.request {
+            RegistryRequestV1::Register { session_id, .. }
+            | RegistryRequestV1::Refresh { session_id, .. }
+            | RegistryRequestV1::Withdraw { session_id, .. } => *session_id,
+        }
+    }
+
+    fn accepts_registered(
+        &self,
         request_id: [u8; 16],
-    },
-    Refresh {
+        instance_matches: bool,
+        service_set_hash: [u8; 32],
+        current_reservation_generation: u64,
+        reservation_ready: bool,
+    ) -> bool {
+        self.kind == RegistryOperationKind::Register
+            && self.request_id() == request_id
+            && instance_matches
+            && service_set_hash == self.expected_service_set_hash
+            && self.reservation_generation == current_reservation_generation
+            && reservation_ready
+    }
+
+    fn accepts_refreshed(
+        &self,
         request_id: [u8; 16],
+        instance_matches: bool,
         revision: p2x_protocol::RegistrationRevision,
-    },
-    #[allow(dead_code)]
-    Withdraw {
-        request_id: [u8; 16],
-    },
+        current_reservation_generation: u64,
+        reservation_ready: bool,
+        prior_lease_current: bool,
+    ) -> bool {
+        matches!(self.kind, RegistryOperationKind::Refresh(expected) if expected == revision)
+            && self.request_id() == request_id
+            && instance_matches
+            && self.reservation_generation == current_reservation_generation
+            && reservation_ready
+            && prior_lease_current
+    }
 }
 
 fn random_jitter_per_mille() -> io::Result<i16> {
@@ -122,17 +174,13 @@ struct WorkerResult {
     result: Result<ProbeAck, p2x_net::probe::ProbeError>,
 }
 
-fn send_register(
-    swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
-    peer_id: libp2p::PeerId,
+fn new_register(
     request_ids: &mut p2x_protocol::CorrelationIdGenerator,
     session_id: [u8; 16],
     instance_id: InstanceId,
     services: &config::ServiceConfig,
-) -> io::Result<(
-    libp2p::request_response::OutboundRequestId,
-    RegistryOperation,
-)> {
+    reservation_generation: u64,
+) -> io::Result<RegistryOperation> {
     let request_id = request_ids.allocate().map_err(io::Error::other)?;
     let request = RegistryRequestV1::Register {
         request_id,
@@ -142,24 +190,22 @@ fn send_register(
         capabilities: Capabilities::from_bits(7).expect("known capabilities"),
         services: services.services.clone(),
     };
-    let outbound = swarm
-        .behaviour_mut()
-        .registry
-        .send_request(&peer_id, request);
-    Ok((outbound, RegistryOperation::Register { request_id }))
+    Ok(RegistryOperation {
+        request,
+        kind: RegistryOperationKind::Register,
+        reservation_generation,
+        expected_service_set_hash: services.service_set_hash,
+        attempts: 0,
+    })
 }
 
-fn send_withdraw(
-    swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
-    peer_id: libp2p::PeerId,
+fn new_withdraw(
     request_ids: &mut p2x_protocol::CorrelationIdGenerator,
     session_id: [u8; 16],
     instance_id: InstanceId,
     revision: p2x_protocol::RegistrationRevision,
-) -> io::Result<(
-    libp2p::request_response::OutboundRequestId,
-    RegistryOperation,
-)> {
+    reservation_generation: u64,
+) -> io::Result<RegistryOperation> {
     let request_id = request_ids.allocate().map_err(io::Error::other)?;
     let request = RegistryRequestV1::Withdraw {
         request_id,
@@ -167,25 +213,24 @@ fn send_withdraw(
         instance_id,
         expected_registration_revision: std::num::NonZeroU64::new(revision.get()).expect("nonzero"),
     };
-    let outbound = swarm
-        .behaviour_mut()
-        .registry
-        .send_request(&peer_id, request);
-    Ok((outbound, RegistryOperation::Withdraw { request_id }))
+    Ok(RegistryOperation {
+        request,
+        kind: RegistryOperationKind::Withdraw(revision),
+        reservation_generation,
+        expected_service_set_hash: [0; 32],
+        attempts: 0,
+    })
 }
 
-fn send_refresh(
-    swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
-    peer_id: libp2p::PeerId,
+fn new_refresh(
     request_ids: &mut p2x_protocol::CorrelationIdGenerator,
     session_id: [u8; 16],
     instance_id: InstanceId,
     revision: p2x_protocol::RegistrationRevision,
     lease_seconds: u16,
-) -> io::Result<(
-    libp2p::request_response::OutboundRequestId,
-    RegistryOperation,
-)> {
+    reservation_generation: u64,
+    service_set_hash: [u8; 32],
+) -> io::Result<RegistryOperation> {
     let request_id = request_ids.allocate().map_err(io::Error::other)?;
     let request = RegistryRequestV1::Refresh {
         request_id,
@@ -194,17 +239,31 @@ fn send_refresh(
         expected_registration_revision: std::num::NonZeroU64::new(revision.get()).expect("nonzero"),
         requested_lease_seconds: lease_seconds,
     };
-    let outbound = swarm
+    Ok(RegistryOperation {
+        request,
+        kind: RegistryOperationKind::Refresh(revision),
+        reservation_generation,
+        expected_service_set_hash: service_set_hash,
+        attempts: 0,
+    })
+}
+
+fn send_registry(
+    swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
+    peer_id: libp2p::PeerId,
+    operation: &RegistryOperation,
+) -> libp2p::request_response::OutboundRequestId {
+    swarm
         .behaviour_mut()
         .registry
-        .send_request(&peer_id, request);
-    Ok((
-        outbound,
-        RegistryOperation::Refresh {
-            request_id,
-            revision,
-        },
-    ))
+        .send_request(&peer_id, operation.request.clone())
+}
+
+fn registry_retry_at(operation: &mut RegistryOperation, now_millis: i64, jitter: i16) -> i64 {
+    operation.attempts = operation.attempts.saturating_add(1);
+    let shift = operation.attempts.saturating_sub(1).min(5);
+    let delay = (250i64 << shift).min(10_000);
+    now_millis.saturating_add(delay + delay * i64::from(jitter.clamp(-100, 100)) / 1000)
 }
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -334,6 +393,7 @@ async fn main() -> io::Result<()> {
     let mut pending_registry: PendingRequest<libp2p::request_response::OutboundRequestId> =
         PendingRequest::new();
     let mut registry_operation: Option<RegistryOperation> = None;
+    let mut registry_retry_due_at = None;
     let mut registration_revision = None;
     let mut registration_expires_at = 0i64;
     if config.mode == RuntimeMode::Product
@@ -412,17 +472,30 @@ async fn main() -> io::Result<()> {
             _ = resource_tick.tick() => {
                 if config.mode == RuntimeMode::Product {
                     match availability.tick(unix_now()) {
-                        availability::AvailabilityAction::Refresh if !registration_requested => {
+                        availability::AvailabilityAction::Refresh if !registration_requested && registry_operation.is_none() => {
                             if let (Some(peer_id), Some(session_id), Some(revision), Some(services)) = (relay_peer_id, auth_state.current_session(unix_now()), registration_revision, service_config.as_ref()) {
-                                let (outbound, operation) = send_refresh(&mut swarm, peer_id, &mut request_ids, session_id, instance_id, revision, services.requested_lease_seconds)?;
+                                let operation = new_refresh(&mut request_ids, session_id, instance_id, revision, services.requested_lease_seconds, reservation.generation, services.service_set_hash)?;
+                                let outbound = send_registry(&mut swarm, peer_id, &operation);
                                 if pending_registry.begin(outbound) { registry_operation = Some(operation); registration_requested = true; }
                             }
                         }
                         availability::AvailabilityAction::Publish(false) if registration_expires_at != 0 => {
                             registration_expires_at = 0;
-                            emitter.emit(&LifecycleRecord::ServerReadiness { ready: false, generation: availability.generation(), auth: false, reservation: false, registration: false })?;
+                            let snapshot = availability.readiness(unix_now());
+                            emitter.emit(&LifecycleRecord::ServerReadiness { ready: false, generation: snapshot.generation, auth: snapshot.auth, reservation: snapshot.reservation, registration: snapshot.registration })?;
                         }
                         _ => {}
+                    }
+                    if registry_retry_due_at.is_some_and(|due| unix_millis() >= due)
+                        && !registration_requested
+                        && reservation.is_ready()
+                        && let (Some(peer_id), Some(operation)) = (relay_peer_id, registry_operation.as_ref())
+                    {
+                        let outbound = send_registry(&mut swarm, peer_id, operation);
+                        if pending_registry.begin(outbound) {
+                            registration_requested = true;
+                            registry_retry_due_at = None;
+                        }
                     }
                 }
                 if exchange_redial.take_due(unix_millis())
@@ -470,10 +543,11 @@ async fn main() -> io::Result<()> {
                         emitter.emit(&LifecycleRecord::ListenerReady { listener_id: &listener, address: &address })?;
                         if address.contains("p2p-circuit") && let (Some(peer_id), Some(connection_id)) = (relay_peer_id, relay_connection_id) {
                             reservation.apply(ReservationEvent::RelayAddressConfirmed { generation: reservation_generation, peer_id, connection_id, listener_id, address: address.parse().map_err(io::Error::other)? }).map_err(io::Error::other)?;
-                            if config.mode == RuntimeMode::Product && reservation.is_ready() && !registration_requested
+                            if config.mode == RuntimeMode::Product && reservation.is_ready() && !registration_requested && registry_operation.is_none()
                                 && let Some(session_id) = auth_state.current_session(unix_now())
                             {
-                                let (outbound, operation) = send_register(&mut swarm, peer_id, &mut request_ids, session_id, instance_id, service_config.as_ref().expect("product services"))?;
+                                let operation = new_register(&mut request_ids, session_id, instance_id, service_config.as_ref().expect("product services"), reservation.generation)?;
+                                let outbound = send_registry(&mut swarm, peer_id, &operation);
                                 if !pending_registry.begin(outbound) { return Err(io::Error::other("registry outbound request limit exceeded")); }
                                 registry_operation = Some(operation);
                                 registration_requested = true;
@@ -493,6 +567,7 @@ async fn main() -> io::Result<()> {
                         registration_expires_at = 0;
                         registration_requested = false;
                         registry_operation = None;
+                        registry_retry_due_at = None;
                         emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Degraded, exchange_peer_id: &relay_peer_id.map(|peer| peer.to_string()).unwrap_or_default(), listener_id: Some("circuit"), address: None, generation: reservation.generation, renewal: false })?;
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
@@ -556,6 +631,7 @@ async fn main() -> io::Result<()> {
                             registration_expires_at = 0;
                             registration_requested = false;
                             registry_operation = None;
+                            registry_retry_due_at = None;
                         }
                         if config.mode == RuntimeMode::ConnectivityLab
                             && relay_peer_id == Some(peer_id)
@@ -571,6 +647,7 @@ async fn main() -> io::Result<()> {
                             pending_registry.clear();
                             registration_requested = false;
                             registry_operation = None;
+                            registry_retry_due_at = None;
                             registration_revision = None;
                             registration_expires_at = 0;
                             let _ = availability.session_lost();
@@ -614,6 +691,21 @@ async fn main() -> io::Result<()> {
                             reservation.apply(ReservationEvent::ReservationRequested { generation: reservation_generation, peer_id: peer, connection_id }).map_err(io::Error::other)?;
                             reservation_requested = true;
                         }
+                        if config.mode == RuntimeMode::Product
+                            && reservation.is_ready()
+                            && registration_revision.is_none()
+                            && !registration_requested
+                            && registry_operation.is_none()
+                            && let (Some(session_id), Some(services)) = (auth_state.current_session(unix_now()), service_config.as_ref())
+                        {
+                            let operation = new_register(&mut request_ids, session_id, instance_id, services, reservation.generation)?;
+                            let outbound = send_registry(&mut swarm, peer, &operation);
+                            if pending_registry.begin(outbound) {
+                                registry_operation = Some(operation);
+                                registry_retry_due_at = None;
+                                registration_requested = true;
+                            }
+                        }
                         if args.finite_auth_check { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "auth.pong"))?; return Ok(()); }
                         emitter.emit(&LifecycleRecord::AuthReadiness { ready: true, generation: readiness_generation })?;
                         let snapshot = availability.readiness(unix_now());
@@ -640,8 +732,9 @@ async fn main() -> io::Result<()> {
                             if config.mode == RuntimeMode::Product {
                                 let _ = availability.reservation_ready(reservation.generation);
                             }
-                            if config.mode == RuntimeMode::Product && reservation.is_ready() && !registration_requested && let Some(session_id) = auth_state.current_session(unix_now()) {
-                                let (outbound, operation) = send_register(&mut swarm, peer_id, &mut request_ids, session_id, instance_id, service_config.as_ref().expect("product services"))?;
+                            if config.mode == RuntimeMode::Product && reservation.is_ready() && !registration_requested && registry_operation.is_none() && let Some(session_id) = auth_state.current_session(unix_now()) {
+                                let operation = new_register(&mut request_ids, session_id, instance_id, service_config.as_ref().expect("product services"), reservation.generation)?;
+                                let outbound = send_registry(&mut swarm, peer_id, &operation);
                                 if !pending_registry.begin(outbound) { return Err(io::Error::other("registry outbound request limit exceeded")); }
                                 registry_operation = Some(operation);
                                 registration_requested = true;
@@ -652,38 +745,84 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::Behaviour(PeerEvent::Registry(RequestResponseEvent::Message { message: RequestResponseMessage::Response { request_id: outbound_id, response }, .. })) if pending_registry.complete(&outbound_id) => {
                         registration_requested = false;
-                        match (registry_operation.take(), response) {
-                            (Some(RegistryOperation::Register { request_id }), RegistryResponseV1::Registered { request_id: response_id, instance_id: response_instance, registration_revision: revision, expires_at, .. }) if request_id == response_id && response_instance == instance_id => {
+                        registry_retry_due_at = None;
+                        let Some(mut operation) = registry_operation.take() else { continue };
+                        let now = unix_now();
+                        match response {
+                            RegistryResponseV1::Registered { request_id: response_id, instance_id: response_instance, registration_revision: revision, service_set_hash, expires_at, .. }
+                                if operation.accepts_registered(response_id, response_instance == instance_id, service_set_hash, reservation.generation, reservation.is_ready()) => {
                                 registration_revision = Some(revision);
                                 registration_expires_at = expires_at;
-                                let _ = availability.reservation_ready(reservation.generation);
-                                let _ = availability.registered(availability.generation(), expires_at, unix_now());
-                                let snapshot = availability.readiness(unix_now());
+                                let _ = availability.registered_with_jitter(reservation.generation, expires_at, now, random_jitter_per_mille()?);
+                                let snapshot = availability.readiness(now);
                                 emitter.emit(&LifecycleRecord::ServerReadiness { ready: snapshot.auth && snapshot.reservation && snapshot.registration, generation: snapshot.generation, auth: snapshot.auth, reservation: snapshot.reservation, registration: snapshot.registration })?;
                             }
-                            (Some(RegistryOperation::Refresh { request_id, revision, .. }), RegistryResponseV1::Refreshed { request_id: response_id, instance_id: response_instance, registration_revision: response_revision, expires_at }) if request_id == response_id && response_instance == instance_id && response_revision == revision => {
+                            RegistryResponseV1::Refreshed { request_id: response_id, instance_id: response_instance, registration_revision: response_revision, expires_at }
+                                if operation.accepts_refreshed(response_id, response_instance == instance_id, response_revision, reservation.generation, reservation.is_ready(), registration_expires_at > now) => {
                                 registration_expires_at = expires_at;
-                                let _ = availability.registered(availability.generation(), expires_at, unix_now());
-                                let snapshot = availability.readiness(unix_now());
+                                let _ = availability.registered_with_jitter(reservation.generation, expires_at, now, random_jitter_per_mille()?);
+                                let snapshot = availability.readiness(now);
                                 emitter.emit(&LifecycleRecord::ServerReadiness { ready: snapshot.auth && snapshot.reservation && snapshot.registration, generation: snapshot.generation, auth: snapshot.auth, reservation: snapshot.reservation, registration: snapshot.registration })?;
                             }
-                            _ => { let _ = availability.registration_lost(); }
+                            RegistryResponseV1::Rejected { request_id: Some(response_id), error }
+                                if response_id == operation.request_id() => {
+                                match error.code {
+                                    PublicErrorCode::RegistryStaleRevision | PublicErrorCode::RegistryNotFound => {
+                                        let _ = availability.registration_lost();
+                                        registration_expires_at = 0;
+                                        registration_revision = None;
+                                        if let (Some(session_id), Some(services)) = (auth_state.current_session(now), service_config.as_ref()) {
+                                            operation = new_register(&mut request_ids, session_id, instance_id, services, reservation.generation)?;
+                                            registry_retry_due_at = Some(registry_retry_at(&mut operation, unix_millis(), random_jitter_per_mille()?));
+                                            registry_operation = Some(operation);
+                                        }
+                                    }
+                                    PublicErrorCode::AuthSessionRequired | PublicErrorCode::AuthSessionExpired => {
+                                        registration_revision = None;
+                                        if let (Some(session_id), Some(services)) = (auth_state.current_session(now), service_config.as_ref())
+                                            && session_id != operation.session_id()
+                                        {
+                                            operation = new_register(&mut request_ids, session_id, instance_id, services, reservation.generation)?;
+                                            registry_retry_due_at = Some(registry_retry_at(&mut operation, unix_millis(), random_jitter_per_mille()?));
+                                            registry_operation = Some(operation);
+                                        }
+                                    }
+                                    PublicErrorCode::ExchangeOverloaded
+                                    | PublicErrorCode::ExchangeTimeout
+                                    | PublicErrorCode::LimitRegistryRequests
+                                    | PublicErrorCode::ExchangeDraining => {
+                                        registry_retry_due_at = Some(registry_retry_at(&mut operation, unix_millis(), random_jitter_per_mille()?));
+                                        registry_operation = Some(operation);
+                                    }
+                                    PublicErrorCode::RegistryReservationRequired => {
+                                        let _ = availability.registration_lost();
+                                        registration_expires_at = 0;
+                                        registration_revision = None;
+                                    }
+                                    _ => {
+                                        let _ = availability.registration_lost();
+                                        registration_expires_at = 0;
+                                        registration_revision = None;
+                                        let message = error.code.as_str();
+                                        emitter.emit(&LifecycleRecord::OperationalError { code: "registry.terminal", message })?;
+                                    }
+                                }
+                            }
+                            _ => {
+                                registration_revision = None;
+                                registration_expires_at = 0;
+                                let _ = availability.registration_lost();
+                                emitter.emit(&LifecycleRecord::OperationalError { code: "registry.correlation", message: "registry response did not match the pending operation" })?;
+                            }
                         }
                     }
                     SwarmEvent::Behaviour(PeerEvent::Registry(RequestResponseEvent::OutboundFailure { request_id, .. })) if pending_registry.complete(&request_id) => {
                         registration_requested = false;
-                        registry_operation = None;
-                        let _ = availability.registration_lost();
-                        if config.mode == RuntimeMode::Product
-                            && reservation.is_ready()
-                            && !registration_requested
-                            && let (Some(peer_id), Some(session_id), Some(services)) = (relay_peer_id, auth_state.current_session(unix_now()), service_config.as_ref())
-                        {
-                            let (outbound, operation) = send_register(&mut swarm, peer_id, &mut request_ids, session_id, instance_id, services)?;
-                            if pending_registry.begin(outbound) {
-                                registry_operation = Some(operation);
-                                registration_requested = true;
+                        if let Some(operation) = registry_operation.as_mut() {
+                            if operation.kind == RegistryOperationKind::Register {
+                                let _ = availability.registration_lost();
                             }
+                            registry_retry_due_at = Some(registry_retry_at(operation, unix_millis(), random_jitter_per_mille()?));
                         }
                     }
                     SwarmEvent::Behaviour(PeerEvent::Relay(_)) => {}
@@ -733,21 +872,33 @@ async fn main() -> io::Result<()> {
             }
         }
     }
+    if config.mode == RuntimeMode::Product {
+        let _ = availability.begin_shutdown();
+        let snapshot = availability.readiness(unix_now());
+        emitter.emit(&LifecycleRecord::ServerReadiness {
+            ready: false,
+            generation: snapshot.generation,
+            auth: snapshot.auth,
+            reservation: snapshot.reservation,
+            registration: snapshot.registration,
+        })?;
+    }
     if config.mode == RuntimeMode::Product
         && let (Some(peer_id), Some(session_id), Some(revision)) = (
             relay_peer_id,
             auth_state.current_session(unix_now()),
             registration_revision,
         )
-        && let Ok((outbound, RegistryOperation::Withdraw { request_id })) = send_withdraw(
-            &mut swarm,
-            peer_id,
+        && let Ok(operation) = new_withdraw(
             &mut request_ids,
             session_id,
             instance_id,
             revision,
+            reservation.generation,
         )
     {
+        let request_id = operation.request_id();
+        let outbound = send_registry(&mut swarm, peer_id, &operation);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let SwarmEvent::Behaviour(PeerEvent::Registry(RequestResponseEvent::Message {
@@ -772,7 +923,15 @@ async fn main() -> io::Result<()> {
             }
         })
         .await;
+        availability.withdrawn();
     }
+    if let Some(listener_id) = circuit_listener_id {
+        swarm.remove_listener(listener_id);
+    }
+    if let Some(connection_id) = relay_connection_id {
+        swarm.close_connection(connection_id);
+    }
+    availability.stopped();
     worker_admission.close_and_discard();
     emitter.terminal(&TerminalResult::simple(
         &args.case_id,
@@ -780,4 +939,53 @@ async fn main() -> io::Result<()> {
         "shutdown",
     ))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn operation(kind: RegistryOperationKind) -> RegistryOperation {
+        RegistryOperation {
+            request: RegistryRequestV1::Withdraw {
+                request_id: [1; 16],
+                session_id: [2; 16],
+                instance_id: InstanceId::new([3; 16]),
+                expected_registration_revision: std::num::NonZeroU64::new(7).unwrap(),
+            },
+            kind,
+            reservation_generation: 4,
+            expected_service_set_hash: [5; 32],
+            attempts: 0,
+        }
+    }
+
+    #[test]
+    fn register_correlation_rejects_stale_hash_and_generation() {
+        let operation = operation(RegistryOperationKind::Register);
+        assert!(operation.accepts_registered([1; 16], true, [5; 32], 4, true));
+        assert!(!operation.accepts_registered([1; 16], true, [6; 32], 4, true));
+        assert!(!operation.accepts_registered([1; 16], true, [5; 32], 5, true));
+    }
+
+    #[test]
+    fn late_refresh_cannot_resurrect_an_expired_lease() {
+        let revision = p2x_protocol::RegistrationRevision::new(7).unwrap();
+        let operation = operation(RegistryOperationKind::Refresh(revision));
+        assert!(operation.accepts_refreshed([1; 16], true, revision, 4, true, true));
+        assert!(!operation.accepts_refreshed([1; 16], true, revision, 4, true, false));
+    }
+
+    #[test]
+    fn registry_retry_preserves_request_bytes_and_is_bounded() {
+        let mut operation = operation(RegistryOperationKind::Register);
+        let hash = operation.request.hash();
+        assert_eq!(registry_retry_at(&mut operation, 1_000, -100), 1_225);
+        for _ in 0..20 {
+            let due = registry_retry_at(&mut operation, 0, 100);
+            assert!(due <= 11_000);
+        }
+        assert_eq!(operation.request.hash(), hash);
+        assert_eq!(operation.request_id(), [1; 16]);
+    }
 }

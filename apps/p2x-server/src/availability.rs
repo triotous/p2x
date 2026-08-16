@@ -102,14 +102,27 @@ impl Availability {
     }
 
     pub fn registered(&mut self, generation: u64, expires_at: i64, now: i64) -> AvailabilityAction {
+        self.registered_with_jitter(generation, expires_at, now, 0)
+    }
+
+    pub fn registered_with_jitter(
+        &mut self,
+        generation: u64,
+        expires_at: i64,
+        now: i64,
+        jitter_per_mille: i16,
+    ) -> AvailabilityAction {
         if generation != self.generation || !self.auth || !self.reservation || expires_at <= now {
             self.registration_expires_at = 0;
+            self.was_ready = false;
             self.state = AvailabilityState::Degraded;
             return AvailabilityAction::Publish(false);
         }
         self.registration_expires_at = expires_at;
-        let refresh = i64::from(self.refresh_seconds)
-            .min(expires_at.saturating_sub(now).saturating_sub(5).max(1));
+        let base_refresh = i64::from(self.refresh_seconds);
+        let jittered_refresh = base_refresh
+            .saturating_add(base_refresh * i64::from(jitter_per_mille.clamp(-100, 100)) / 1000);
+        let refresh = jittered_refresh.min(expires_at.saturating_sub(now).saturating_sub(5).max(1));
         self.refresh_at = now.saturating_add(refresh);
         self.state = AvailabilityState::Ready;
         if !self.was_ready {
@@ -122,6 +135,7 @@ impl Availability {
     pub fn tick(&mut self, now: i64) -> AvailabilityAction {
         if self.state == AvailabilityState::Ready && now >= self.registration_expires_at {
             self.registration_expires_at = 0;
+            self.was_ready = false;
             self.state = AvailabilityState::Degraded;
             return AvailabilityAction::Publish(false);
         }
@@ -131,7 +145,8 @@ impl Availability {
         AvailabilityAction::Publish(
             self.readiness(now).auth
                 && self.readiness(now).reservation
-                && self.readiness(now).registration,
+                && self.readiness(now).registration
+                && !self.readiness(now).draining,
         )
     }
 
@@ -178,9 +193,9 @@ impl Availability {
 
     pub fn readiness(&self, now: i64) -> AvailabilitySnapshot {
         AvailabilitySnapshot {
-            auth: self.auth && !self.draining(),
-            reservation: self.reservation && !self.draining(),
-            registration: self.registration_expires_at > now && !self.draining(),
+            auth: self.auth,
+            reservation: self.reservation,
+            registration: self.registration_expires_at > now,
             draining: self.draining(),
             generation: self.readiness_generation,
         }
@@ -234,5 +249,40 @@ mod tests {
         state.reservation_ready(0);
         state.registered(0, 30, 0);
         assert_eq!(state.tick(10), AvailabilityAction::Refresh);
+    }
+
+    #[test]
+    fn refresh_jitter_is_bounded_and_readiness_generation_tracks_recovery() {
+        let mut early = Availability::with_refresh_seconds([1; 16], 10);
+        early.auth_ready();
+        early.reservation_ready(0);
+        early.registered_with_jitter(0, 30, 0, -100);
+        assert_eq!(early.tick(8), AvailabilityAction::Publish(true));
+        assert_eq!(early.tick(9), AvailabilityAction::Refresh);
+
+        let mut late = Availability::with_refresh_seconds([1; 16], 10);
+        late.auth_ready();
+        late.reservation_ready(0);
+        late.registered_with_jitter(0, 30, 0, 100);
+        assert_eq!(late.tick(10), AvailabilityAction::Publish(true));
+        assert_eq!(late.tick(11), AvailabilityAction::Refresh);
+        assert_eq!(late.readiness_generation(), 1);
+        assert_eq!(late.tick(30), AvailabilityAction::Publish(false));
+        late.registered(0, 60, 31);
+        assert_eq!(late.readiness_generation(), 2);
+    }
+
+    #[test]
+    fn draining_publishes_false_without_erasing_current_component_gates() {
+        let mut state = Availability::new([1; 16]);
+        state.auth_ready();
+        state.reservation_ready(0);
+        state.registered(0, 30, 0);
+        assert_eq!(state.begin_shutdown(), AvailabilityAction::Withdraw);
+        let snapshot = state.readiness(1);
+        assert!(snapshot.auth);
+        assert!(snapshot.reservation);
+        assert!(snapshot.registration);
+        assert!(snapshot.draining);
     }
 }
