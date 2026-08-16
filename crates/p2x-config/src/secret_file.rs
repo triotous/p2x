@@ -6,6 +6,7 @@ use std::{
     path::PathBuf,
 };
 use thiserror::Error;
+use zeroize::Zeroize;
 pub const MAX_SECRET_FILE: usize = 4096;
 #[derive(Debug, Error)]
 pub enum SecretFileError {
@@ -35,6 +36,7 @@ pub fn read_secret_file(path: &Path) -> Result<Vec<u8>, SecretFileError> {
     file.take((MAX_SECRET_FILE + 1) as u64)
         .read_to_end(&mut bytes)?;
     if bytes.is_empty() || bytes.len() > MAX_SECRET_FILE || bytes.len() as u64 != metadata.len() {
+        bytes.zeroize();
         return Err(SecretFileError::InvalidSize);
     }
     Ok(bytes)

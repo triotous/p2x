@@ -3,6 +3,7 @@ use p2x_protocol::PublicErrorCode;
 pub const AUTH_TIMEOUT_SECONDS: i64 = 5;
 const BACKOFF_BASE_SECONDS: i64 = 1;
 const BACKOFF_MAX_SECONDS: i64 = 30;
+const BACKOFF_JITTER_PER_MILLE: i64 = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthPhase {
@@ -117,6 +118,14 @@ impl AuthState {
         }
     }
     pub fn transport_failure(&mut self, code: PublicErrorCode, now: i64) -> AuthAction {
+        self.transport_failure_with_jitter(code, now, 0)
+    }
+    pub fn transport_failure_with_jitter(
+        &mut self,
+        code: PublicErrorCode,
+        now: i64,
+        jitter_per_mille: i16,
+    ) -> AuthAction {
         if matches!(
             code,
             PublicErrorCode::ProtocolCapabilityMismatch
@@ -125,7 +134,7 @@ impl AuthState {
             self.phase = AuthPhase::Terminal(code);
             return AuthAction::Terminal(code);
         }
-        self.enter_backoff(now);
+        self.enter_backoff(now, jitter_per_mille);
         AuthAction::Retry
     }
     pub fn rejected(
@@ -160,7 +169,7 @@ impl AuthState {
                 | PublicErrorCode::ExchangeOverloaded
                 | PublicErrorCode::LimitAuthRequests
         ) {
-            self.enter_backoff(now);
+            self.enter_backoff(now, 0);
             AuthAction::Retry
         } else {
             self.phase = AuthPhase::Terminal(code);
@@ -168,25 +177,36 @@ impl AuthState {
         }
     }
     pub fn timeout(&mut self, now: i64) -> AuthAction {
+        self.timeout_with_jitter(now, 0)
+    }
+    pub fn timeout_with_jitter(&mut self, now: i64, jitter_per_mille: i16) -> AuthAction {
         match self.phase {
             AuthPhase::Authenticating { deadline, .. }
             | AuthPhase::AwaitingPong { deadline, .. }
                 if now >= deadline =>
             {
-                self.enter_backoff(now);
+                self.enter_backoff(now, jitter_per_mille);
                 AuthAction::Retry
             }
             _ => AuthAction::Ignore,
         }
     }
-    pub fn tick(&mut self, request_id: [u8; 16], now: i64) -> AuthAction {
+    pub fn tick_with_jitter(
+        &mut self,
+        request_id: [u8; 16],
+        now: i64,
+        jitter_per_mille: i16,
+    ) -> AuthAction {
         if let AuthPhase::Backoff { until } = self.phase
             && now >= until
         {
             self.phase = AuthPhase::Disconnected;
             return self.connected(request_id, now);
         }
-        self.timeout(now)
+        self.timeout_with_jitter(now, jitter_per_mille)
+    }
+    pub fn tick(&mut self, request_id: [u8; 16], now: i64) -> AuthAction {
+        self.tick_with_jitter(request_id, now, 0)
     }
     pub fn disconnected(&mut self) -> AuthAction {
         if matches!(
@@ -204,12 +224,15 @@ impl AuthState {
     pub fn ready(&self) -> bool {
         matches!(self.phase, AuthPhase::Authenticated { .. })
     }
-    fn enter_backoff(&mut self, now: i64) {
+    fn enter_backoff(&mut self, now: i64, jitter_per_mille: i16) {
         self.attempts = self.attempts.saturating_add(1);
         let shift = self.attempts.saturating_sub(1).min(5);
         let delay = (BACKOFF_BASE_SECONDS << shift).min(BACKOFF_MAX_SECONDS);
+        let jitter =
+            (delay * BACKOFF_JITTER_PER_MILLE * i64::from(jitter_per_mille.clamp(-1000, 1000)))
+                / 1000;
         self.phase = AuthPhase::Backoff {
-            until: now.saturating_add(delay),
+            until: now.saturating_add(delay + jitter),
         };
     }
 }

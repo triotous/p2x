@@ -137,6 +137,11 @@ pub struct VerificationKey {
 pub struct VerificationKeyRing {
     keys: Vec<VerificationKey>,
 }
+impl p2x_protocol::ticket::TicketKeyResolver for VerificationKeyRing {
+    fn key(&self, key_id: [u8; 16], now: i64) -> Option<&ed25519_dalek::VerifyingKey> {
+        self.get(key_id, now).map(|key| &key.public)
+    }
+}
 impl VerificationKeyRing {
     pub fn load(path: &Path) -> Result<Self, TicketKeyError> {
         let file = VerificationKeyFile::load(path)?;
@@ -184,6 +189,13 @@ impl VerificationKeyRing {
         self.keys.iter().find(|k| {
             k.key_id == key_id && now >= k.activates_at && k.retires_at.is_none_or(|t| now < t)
         })
+    }
+    pub fn verify(
+        &self,
+        envelope: &[u8],
+        expected: &p2x_protocol::ticket::TicketValidation<'_>,
+    ) -> Result<p2x_protocol::ticket::VerifiedTicket, p2x_protocol::ticket::TicketError> {
+        p2x_protocol::ticket::verify_with_key_resolver(envelope, self, expected)
     }
 }
 #[cfg(test)]
