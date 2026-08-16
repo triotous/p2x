@@ -151,6 +151,13 @@ impl Availability {
     }
 
     pub fn reservation_lost(&mut self) -> AvailabilityAction {
+        self.reservation_lost_for(self.generation)
+    }
+
+    pub fn reservation_lost_for(&mut self, generation: u64) -> AvailabilityAction {
+        if generation != self.generation {
+            return AvailabilityAction::Publish(false);
+        }
         self.reservation = false;
         self.registration_expires_at = 0;
         self.was_ready = false;
@@ -240,6 +247,16 @@ mod tests {
             AvailabilityAction::Publish(false)
         );
         assert!(!state.readiness(0).reservation);
+    }
+
+    #[test]
+    fn duplicate_loss_for_one_generation_only_advances_once() {
+        let mut state = Availability::new([1; 16]);
+        state.auth_ready();
+        state.reservation_ready(0);
+        state.reservation_lost_for(0);
+        state.reservation_lost_for(0);
+        assert_eq!(state.generation(), 1);
     }
 
     #[test]

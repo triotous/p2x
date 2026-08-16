@@ -562,13 +562,18 @@ async fn main() -> io::Result<()> {
                         }
                     }
                     SwarmEvent::ExternalAddrExpired { address } if address.to_string().contains("p2p-circuit") => {
-                        let _ = availability.reservation_lost();
-                        registration_revision = None;
-                        registration_expires_at = 0;
-                        registration_requested = false;
-                        registry_operation = None;
-                        registry_retry_due_at = None;
-                        emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Degraded, exchange_peer_id: &relay_peer_id.map(|peer| peer.to_string()).unwrap_or_default(), listener_id: Some("circuit"), address: None, generation: reservation.generation, renewal: false })?;
+                        if reservation.canonical_address.as_ref() == Some(&address)
+                            && let (Some(peer_id), Some(connection_id), Some(listener_id)) = (reservation.exchange_peer_id, reservation.exchange_connection_id, reservation.listener_id)
+                        {
+                            let _ = reservation.apply(ReservationEvent::RelayAddressLost { generation: reservation.generation, peer_id, connection_id, listener_id, address });
+                            let _ = availability.reservation_lost_for(reservation.generation);
+                            registration_revision = None;
+                            registration_expires_at = 0;
+                            registration_requested = false;
+                            registry_operation = None;
+                            registry_retry_due_at = None;
+                            emitter.emit(&LifecycleRecord::ReservationTransition { state: LifecycleReservationState::Degraded, exchange_peer_id: &peer_id.to_string(), listener_id: Some("circuit"), address: None, generation: reservation.generation, renewal: false })?;
+                        }
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                         let path = if endpoint.is_relayed() {
@@ -621,10 +626,13 @@ async fn main() -> io::Result<()> {
                         if config.mode == RuntimeMode::Product
                             && relay_peer_id == Some(peer_id)
                             && relay_connection_id == Some(connection_id) {
+                            if let Some(listener_id) = circuit_listener_id.take() {
+                                swarm.remove_listener(listener_id);
+                            }
                             let _ = reservation.apply(ReservationEvent::ExchangeLost { generation: reservation.generation, peer_id, connection_id });
                             reservation_requested = false;
                             relay_connection_id = None;
-                            let _ = availability.reservation_lost();
+                            let _ = availability.reservation_lost_for(reservation.generation);
                             let snapshot = availability.readiness(unix_now());
                             emitter.emit(&LifecycleRecord::ServerReadiness { ready: false, generation: snapshot.generation, auth: snapshot.auth, reservation: snapshot.reservation, registration: snapshot.registration })?;
                             registration_revision = None;
@@ -669,7 +677,19 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::ListenerError { error, .. } => {
                         let message = error.to_string(); emitter.emit(&LifecycleRecord::OperationalError { code: "listener.error", message: &message })?;
                     }
-                    SwarmEvent::ListenerClosed { reason, .. } => {
+                    SwarmEvent::ListenerClosed { listener_id, reason, .. } => {
+                        if circuit_listener_id == Some(listener_id)
+                            && let (Some(peer_id), Some(connection_id)) = (reservation.exchange_peer_id, reservation.exchange_connection_id)
+                        {
+                            let _ = reservation.apply(ReservationEvent::ListenerClosed { generation: reservation.generation, peer_id, connection_id, listener_id });
+                            let _ = availability.reservation_lost_for(reservation.generation);
+                            circuit_listener_id = None;
+                            registration_revision = None;
+                            registration_expires_at = 0;
+                            registration_requested = false;
+                            registry_operation = None;
+                            registry_retry_due_at = None;
+                        }
                         let message = format!("{reason:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "listener.closed", message: &message })?;
                     }
                     SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Authenticated { session_id, request_id, expires_at, .. } }, .. })) if pending_auth.complete(&outbound_id) => {
