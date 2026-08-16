@@ -1,15 +1,18 @@
 use libp2p::PeerId;
 use p2x_protocol::{
     Capabilities, Health, InstanceId, PublicErrorCode, QuotaProfile, RegistrationRevision,
-    RegistryRequestV1, RegistryResponseV1, Role, Scope, ServiceSet, Tenant,
+    RegistryRequestV1, RegistryResponseV1, Role, Scope, ScopedSelector, ServiceSet, Tenant,
 };
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, VecDeque},
+    num::NonZeroU64,
+};
 
 const MAX_SERVERS: usize = 64;
 const MAX_SERVICES: usize = 32;
 const MAX_IDEMPOTENCY_PER_PEER: usize = 8;
 const MAX_IDEMPOTENCY_GLOBAL: usize = 2048;
+const REVISION_ATTEMPTS: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegistrationRecord {
@@ -37,6 +40,7 @@ pub enum RegistryError {
     Overloaded,
     Draining,
     Unauthorized,
+    Malformed,
 }
 impl RegistryError {
     pub const fn code(self) -> PublicErrorCode {
@@ -51,6 +55,7 @@ impl RegistryError {
             Self::Overloaded => PublicErrorCode::ExchangeOverloaded,
             Self::Draining => PublicErrorCode::ExchangeDraining,
             Self::Unauthorized => PublicErrorCode::AuthRoleForbidden,
+            Self::Malformed => PublicErrorCode::ProtocolMalformed,
         }
     }
 }
@@ -70,16 +75,31 @@ pub struct Registry {
     advertise_addresses: Vec<String>,
 }
 #[derive(Default)]
-struct RevisionAllocator;
+struct RevisionAllocator {
+    candidates: Option<VecDeque<u64>>,
+}
 impl RevisionAllocator {
     fn next_unique<'a>(
         &mut self,
-        mut records: impl Iterator<Item = &'a RegistrationRecord>,
+        records: impl Iterator<Item = &'a RegistrationRecord>,
     ) -> Option<RegistrationRevision> {
-        let mut bytes = [0; 8];
-        getrandom::fill(&mut bytes).ok()?;
-        let revision = RegistrationRevision::new(u64::from_be_bytes(bytes))?;
-        (!records.any(|record| record.registration_revision == revision)).then_some(revision)
+        let used = records
+            .map(|record| record.registration_revision.get())
+            .collect::<std::collections::HashSet<_>>();
+        for _ in 0..REVISION_ATTEMPTS {
+            let value = match self.candidates.as_mut() {
+                Some(values) => values.pop_front().unwrap_or(0),
+                None => {
+                    let mut bytes = [0; 8];
+                    getrandom::fill(&mut bytes).ok()?;
+                    u64::from_be_bytes(bytes)
+                }
+            };
+            if value != 0 && !used.contains(&value) {
+                return RegistrationRevision::new(value);
+            }
+        }
+        None
     }
 }
 
@@ -89,6 +109,13 @@ impl Registry {
     }
     pub fn set_advertise_addresses(&mut self, addresses: Vec<String>) {
         self.advertise_addresses = addresses;
+    }
+
+    #[cfg(test)]
+    fn set_revision_candidates(&mut self, candidates: Vec<u64>) {
+        self.revision_allocator = RevisionAllocator {
+            candidates: Some(candidates.into()),
+        };
     }
     #[allow(clippy::too_many_arguments)]
     pub fn register(
@@ -121,12 +148,12 @@ impl Registry {
             ),
             _ => return Err(RegistryError::InvalidAdvertisement),
         };
-        let digest = request_digest(&request);
+        let digest = request.hash();
         if let Some(cached) = self.idempotency.get(&(peer_id, request_id)) {
             if cached.digest == digest {
                 return Ok(cached.response.clone());
             }
-            return Err(RegistryError::InvalidAdvertisement);
+            return Err(RegistryError::Malformed);
         }
         if self.draining {
             return Err(RegistryError::Draining);
@@ -145,6 +172,7 @@ impl Registry {
             || !(10..=60).contains(&lease)
             || !capabilities.contains(Capabilities::RELAY_V2)
             || !capabilities.direct_transport()
+            || capabilities.contains(Capabilities::DCUTR)
         {
             return Err(RegistryError::InvalidAdvertisement);
         }
@@ -225,6 +253,7 @@ impl Registry {
         quota: &QuotaProfile,
         authorization_revision: u64,
         requested_lease: u16,
+        session_id: [u8; 16],
         now: i64,
     ) -> Result<RegistryResponseV1, RegistryError> {
         if self.draining {
@@ -242,17 +271,28 @@ impl Registry {
         if !(10..=60).contains(&requested_lease) {
             return Err(RegistryError::InvalidAdvertisement);
         }
-        let digest = request_digest_fields(&[
-            &request_id,
-            instance_id.as_bytes(),
-            &revision.get().to_be_bytes(),
-            &requested_lease.to_be_bytes(),
-        ]);
+        let request = RegistryRequestV1::Refresh {
+            request_id,
+            session_id,
+            instance_id,
+            expected_registration_revision: NonZeroU64::new(revision.get())
+                .expect("nonzero revision"),
+            requested_lease_seconds: requested_lease,
+        };
+        let digest = request.hash();
         if let Some(cached) = self.idempotency.get(&(peer_id, request_id)) {
             if cached.digest == digest {
                 return Ok(cached.response.clone());
             }
-            return Err(RegistryError::InvalidAdvertisement);
+            return Err(RegistryError::Malformed);
+        }
+        if self
+            .registrations
+            .get(&peer_id)
+            .is_some_and(|record| record.expires_at <= now)
+        {
+            self.remove_peer(&peer_id);
+            return Err(RegistryError::NotFound);
         }
         let record = self
             .registrations
@@ -285,6 +325,7 @@ impl Registry {
         request_id: [u8; 16],
         instance_id: InstanceId,
         revision: RegistrationRevision,
+        session_id: [u8; 16],
         tenant: &Tenant,
         role: Role,
         scopes: u32,
@@ -292,22 +333,33 @@ impl Registry {
         authorization_revision: u64,
         now: i64,
     ) -> Result<RegistryResponseV1, RegistryError> {
-        let digest = request_digest_fields(&[
-            &request_id,
-            instance_id.as_bytes(),
-            &revision.get().to_be_bytes(),
-        ]);
-        if let Some(cached) = self.idempotency.get(&(peer_id, request_id)) {
-            if cached.digest == digest {
-                return Ok(cached.response.clone());
-            }
-            return Err(RegistryError::InvalidAdvertisement);
-        }
+        let request = RegistryRequestV1::Withdraw {
+            request_id,
+            session_id,
+            instance_id,
+            expected_registration_revision: NonZeroU64::new(revision.get())
+                .expect("nonzero revision"),
+        };
+        let digest = request.hash();
         if role != Role::Server
             || scopes & Scope::RegisterServices.bit() == 0
             || quota.as_str() != "standard"
         {
             return Err(RegistryError::Unauthorized);
+        }
+        if let Some(cached) = self.idempotency.get(&(peer_id, request_id)) {
+            if cached.digest == digest {
+                return Ok(cached.response.clone());
+            }
+            return Err(RegistryError::Malformed);
+        }
+        if self
+            .registrations
+            .get(&peer_id)
+            .is_some_and(|record| record.expires_at <= now)
+        {
+            self.remove_peer(&peer_id);
+            return Err(RegistryError::NotFound);
         }
         let record = self
             .registrations
@@ -374,6 +426,35 @@ impl Registry {
     pub fn owner_count(&self) -> usize {
         self.selector_owners.len()
     }
+
+    pub fn resolve_exact(
+        &self,
+        selector: &ScopedSelector,
+        now: i64,
+    ) -> Result<&RegistrationRecord, RegistryError> {
+        let key = (
+            selector.tenant().clone(),
+            selector.selector().fingerprint(selector.tenant()),
+        );
+        let peer = self
+            .selector_owners
+            .get(&key)
+            .ok_or(RegistryError::NotFound)?;
+        let record = self
+            .registrations
+            .get(peer)
+            .ok_or(RegistryError::NotFound)?;
+        if record.expires_at <= now {
+            return Err(RegistryError::NotFound);
+        }
+        if record.services.as_slice().iter().any(|service| {
+            service.selector() == selector.selector() && service.health() == Health::Ready
+        }) {
+            Ok(record)
+        } else {
+            Err(RegistryError::Offline)
+        }
+    }
     fn remove_indexes(&mut self, record: &RegistrationRecord) {
         for service in record.services.as_slice() {
             self.selector_owners.remove(&(
@@ -390,19 +471,30 @@ impl Registry {
         response: RegistryResponseV1,
         created_at: i64,
     ) {
-        if self.idempotency.len() >= MAX_IDEMPOTENCY_GLOBAL {
-            self.idempotency.clear();
-        }
         let peer_entries = self
+            .idempotency
+            .iter()
+            .filter(|((owner, _), _)| *owner == peer)
+            .min_by_key(|(key, cached)| (cached.created_at, key.1))
+            .map(|(key, _)| *key);
+        if self.idempotency.len() >= MAX_IDEMPOTENCY_GLOBAL
+            && let Some(oldest) = self
+                .idempotency
+                .iter()
+                .min_by_key(|(key, cached)| (cached.created_at, key.1))
+                .map(|(key, _)| *key)
+        {
+            self.idempotency.remove(&oldest);
+        }
+        if self
             .idempotency
             .keys()
             .filter(|(owner, _)| *owner == peer)
-            .copied()
-            .collect::<Vec<_>>();
-        if peer_entries.len() >= MAX_IDEMPOTENCY_PER_PEER
-            && let Some(oldest) = peer_entries.first()
+            .count()
+            >= MAX_IDEMPOTENCY_PER_PEER
+            && let Some(oldest) = peer_entries
         {
-            self.idempotency.remove(oldest);
+            self.idempotency.remove(&oldest);
         }
         self.idempotency.insert(
             (peer, request_id),
@@ -414,30 +506,8 @@ impl Registry {
         );
     }
 }
-fn request_digest(request: &RegistryRequestV1) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{request:?}").as_bytes());
-    hasher.finalize().into()
-}
-fn request_digest_fields(fields: &[&[u8]]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    for field in fields {
-        hasher.update((*field).len().to_be_bytes());
-        hasher.update(field);
-    }
-    hasher.finalize().into()
-}
 fn service_set_hash(services: &ServiceSet) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    for service in services.as_slice() {
-        hasher.update(service.upstream_id().as_str().as_bytes());
-        hasher.update(service.selector().canonical_bytes(None));
-        hasher.update([match service.health() {
-            Health::Ready => 0,
-            Health::Unavailable => 1,
-        }]);
-    }
-    hasher.finalize().into()
+    services.hash()
 }
 
 #[cfg(test)]
@@ -562,6 +632,7 @@ mod tests {
                 &quota,
                 7,
                 30,
+                [2; 16],
                 20,
             )
             .unwrap();
@@ -580,6 +651,7 @@ mod tests {
                     &quota,
                     7,
                     30,
+                    [2; 16],
                     99
                 )
                 .unwrap()
@@ -591,6 +663,7 @@ mod tests {
                     [3; 16],
                     instance,
                     revision,
+                    [3; 16],
                     &tenant,
                     Role::Server,
                     3,
@@ -607,6 +680,78 @@ mod tests {
         );
         assert!(registry.is_empty());
     }
+    #[test]
+    fn expired_refresh_removes_record_and_rejects_resurrection() {
+        let (tenant, quota, services) = data();
+        let peer = PeerId::random();
+        let mut registry = Registry::default();
+        let response = registry
+            .register(
+                peer,
+                &tenant,
+                Role::Server,
+                3,
+                &quota,
+                1,
+                true,
+                request(services, [1; 16]),
+                10,
+            )
+            .unwrap();
+        let (instance, revision) = match response {
+            RegistryResponseV1::Registered {
+                instance_id,
+                registration_revision,
+                ..
+            } => (instance_id, registration_revision),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            registry.refresh(
+                peer,
+                [2; 16],
+                instance,
+                revision,
+                true,
+                &tenant,
+                Role::Server,
+                3,
+                &quota,
+                1,
+                30,
+                [2; 16],
+                40
+            ),
+            Err(RegistryError::NotFound)
+        );
+        assert!(registry.is_empty());
+        assert_eq!(registry.owner_count(), 0);
+    }
+
+    #[test]
+    fn revision_allocator_exhaustion_is_atomic() {
+        let (tenant, quota, services) = data();
+        let peer = PeerId::random();
+        let mut registry = Registry::default();
+        registry.set_revision_candidates(vec![0; REVISION_ATTEMPTS]);
+        assert_eq!(
+            registry.register(
+                peer,
+                &tenant,
+                Role::Server,
+                3,
+                &quota,
+                1,
+                true,
+                request(services, [1; 16]),
+                10
+            ),
+            Err(RegistryError::Overloaded)
+        );
+        assert!(registry.is_empty());
+        assert_eq!(registry.owner_count(), 0);
+    }
+
     #[test]
     fn removal_is_idempotent_and_requires_reservation() {
         let (tenant, quota, services) = data();

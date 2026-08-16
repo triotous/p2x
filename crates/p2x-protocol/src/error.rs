@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[non_exhaustive]
@@ -31,6 +32,10 @@ pub enum PublicErrorCode {
     LimitRegistryRequests,
     ExchangeDraining,
 }
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("unknown public error code")]
+pub struct UnknownPublicErrorCode;
+
 impl PublicErrorCode {
     const ALL: &'static [Self] = &[
         Self::AuthInvalidCredential,
@@ -92,12 +97,12 @@ impl PublicErrorCode {
             Self::ExchangeDraining => "exchange.draining",
         }
     }
-    pub fn try_from_wire(value: &str) -> Result<Self, ()> {
+    pub fn try_from_wire(value: &str) -> Result<Self, UnknownPublicErrorCode> {
         Self::ALL
             .iter()
             .copied()
             .find(|code| code.as_str() == value)
-            .ok_or(())
+            .ok_or(UnknownPublicErrorCode)
     }
 
     pub fn parse(value: &str) -> Self {
