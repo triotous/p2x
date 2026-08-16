@@ -415,7 +415,7 @@ async fn main() -> io::Result<()> {
                         }
                         availability::AvailabilityAction::Publish(false) if registration_expires_at != 0 => {
                             registration_expires_at = 0;
-                            emitter.emit(&LifecycleRecord::AuthReadiness { ready: false, generation: readiness_generation })?;
+                            emitter.emit(&LifecycleRecord::ServerReadiness { ready: false, generation: availability.generation(), auth: false, reservation: false, registration: false })?;
                         }
                         _ => {}
                     }
@@ -651,10 +651,14 @@ async fn main() -> io::Result<()> {
                                 registration_expires_at = expires_at;
                                 let _ = availability.reservation_ready(reservation.generation);
                                 let _ = availability.registered(availability.generation(), expires_at, unix_now());
+                                let snapshot = availability.readiness(unix_now());
+                                emitter.emit(&LifecycleRecord::ServerReadiness { ready: snapshot.auth && snapshot.reservation && snapshot.registration, generation: snapshot.generation, auth: snapshot.auth, reservation: snapshot.reservation, registration: snapshot.registration })?;
                             }
                             (Some(RegistryOperation::Refresh { request_id, revision, .. }), RegistryResponseV1::Refreshed { request_id: response_id, instance_id: response_instance, registration_revision: response_revision, expires_at }) if request_id == response_id && response_instance == instance_id && response_revision == revision => {
                                 registration_expires_at = expires_at;
                                 let _ = availability.registered(availability.generation(), expires_at, unix_now());
+                                let snapshot = availability.readiness(unix_now());
+                                emitter.emit(&LifecycleRecord::ServerReadiness { ready: snapshot.auth && snapshot.reservation && snapshot.registration, generation: snapshot.generation, auth: snapshot.auth, reservation: snapshot.reservation, registration: snapshot.registration })?;
                             }
                             _ => { let _ = availability.registration_lost(); }
                         }
