@@ -36,10 +36,13 @@ pub enum AvailabilityAction {
 pub struct Availability {
     state: AvailabilityState,
     generation: u64,
+    readiness_generation: u64,
+    was_ready: bool,
     auth: bool,
     reservation: bool,
     registration_expires_at: i64,
     refresh_at: i64,
+    refresh_seconds: u16,
     instance_id: [u8; 16],
 }
 
@@ -48,10 +51,13 @@ impl Availability {
         Self {
             state: AvailabilityState::Starting,
             generation: 0,
+            readiness_generation: 0,
+            was_ready: false,
             auth: false,
             reservation: false,
             registration_expires_at: 0,
             refresh_at: i64::MAX,
+            refresh_seconds: 10,
             instance_id,
         }
     }
@@ -64,6 +70,9 @@ impl Availability {
     }
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+    pub const fn readiness_generation(&self) -> u64 {
+        self.readiness_generation
     }
 
     pub fn auth_ready(&mut self) -> AvailabilityAction {
@@ -95,8 +104,14 @@ impl Availability {
             return AvailabilityAction::Publish(false);
         }
         self.registration_expires_at = expires_at;
-        self.refresh_at = now + ((expires_at - now) / 3).max(1);
+        let refresh = i64::from(self.refresh_seconds)
+            .min(expires_at.saturating_sub(now).saturating_sub(5).max(1));
+        self.refresh_at = now.saturating_add(refresh);
         self.state = AvailabilityState::Ready;
+        if !self.was_ready {
+            self.was_ready = true;
+            self.readiness_generation = self.readiness_generation.saturating_add(1);
+        }
         AvailabilityAction::Publish(true)
     }
 
@@ -119,6 +134,7 @@ impl Availability {
     pub fn reservation_lost(&mut self) -> AvailabilityAction {
         self.reservation = false;
         self.registration_expires_at = 0;
+        self.was_ready = false;
         if !self.draining() {
             self.state = AvailabilityState::Degraded;
         }
@@ -130,12 +146,14 @@ impl Availability {
         self.auth = false;
         self.reservation = false;
         self.registration_expires_at = 0;
+        self.was_ready = false;
         self.state = AvailabilityState::Degraded;
         AvailabilityAction::Authenticate
     }
 
     pub fn registration_lost(&mut self) -> AvailabilityAction {
         self.registration_expires_at = 0;
+        self.was_ready = false;
         if !self.draining() {
             self.state = AvailabilityState::Degraded;
         }
@@ -144,6 +162,7 @@ impl Availability {
 
     pub fn begin_shutdown(&mut self) -> AvailabilityAction {
         self.state = AvailabilityState::Draining;
+        self.was_ready = false;
         AvailabilityAction::Withdraw
     }
     pub fn withdrawn(&mut self) {
@@ -159,7 +178,7 @@ impl Availability {
             reservation: self.reservation && !self.draining(),
             registration: self.registration_expires_at > now && !self.draining(),
             draining: self.draining(),
-            generation: self.generation,
+            generation: self.readiness_generation,
         }
     }
 
