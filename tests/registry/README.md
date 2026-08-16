@@ -197,12 +197,25 @@ observed.
    record.
 4. Stop server and require every permit and logical resource to be released.
 
-The 128-global admission boundary and every release terminal are additionally covered by
-`cargo test -p p2x-exchange registry_admission::tests`; the local product process case
-uses the production rolling-rate boundary and the separate per-peer concurrent case.
+The production 128-global value and every release terminal are additionally covered by
+`cargo test -p p2x-exchange registry_admission::tests`; this case uses the production
+rolling-rate boundary.
 
 ```text
 ./tests/registry/local.sh --case registry-limit
+```
+
+### `registry-global-limit`
+
+1. Start product exchange with the guarded live-test registry limits set to global N=1
+   and per-peer N=2, so the two limits are distinguishable.
+2. Send two concurrent Register requests from one authenticated/reserved server.
+3. Require exactly one accepted operation and require the global N+1 operation to return
+   `limit.registry_requests`.
+4. Stop the actor and require the global permit count and all resources to be zero.
+
+```text
+./tests/registry/local.sh --case registry-global-limit
 ```
 
 ### `service-limit`
