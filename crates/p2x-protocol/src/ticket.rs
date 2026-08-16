@@ -389,22 +389,30 @@ pub fn verify_with_key_resolver<R: TicketKeyResolver>(
     resolver: &R,
     expected: &TicketValidation<'_>,
 ) -> Result<VerifiedTicket, TicketError> {
-    let (key_id, _, _) = decode_envelope(envelope)?;
+    let (key_id, claims, signature) = decode_envelope(envelope)?;
     let key = resolver
         .key(key_id, expected.now)
         .ok_or(TicketError::Invalid)?;
-    verify_and_validate(envelope, key_id, key, expected)
+    verify_decoded(key_id, claims, signature, key, expected)
 }
+#[cfg(test)]
 fn verify_and_validate(
     e: &[u8],
-    key_id: [u8; 16],
+    _key_id: [u8; 16],
     key: &VerifyingKey,
     expected: &TicketValidation<'_>,
 ) -> Result<VerifiedTicket, TicketError> {
     let (envelope_key_id, c, sig) = decode_envelope(e)?;
-    if envelope_key_id != key_id {
-        return Err(TicketError::Invalid);
-    }
+    verify_decoded(envelope_key_id, c, sig, key, expected)
+}
+fn verify_decoded(
+    key_id: [u8; 16],
+    c: ConnectionTicketClaimsV1,
+    sig: Signature,
+    key: &VerifyingKey,
+    expected: &TicketValidation<'_>,
+) -> Result<VerifiedTicket, TicketError> {
+    let _ = key_id;
     let bytes = c.encode()?;
     let mut message = b"p2x-ticket-v1\0".to_vec();
     message.extend_from_slice(&(bytes.len() as u16).to_be_bytes());

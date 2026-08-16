@@ -72,6 +72,10 @@ pub enum LifecycleRecord<'a> {
         ready: bool,
         generation: u64,
     },
+    AuthRequestObserved {
+        peer_id: &'a str,
+        request_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]

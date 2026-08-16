@@ -3,6 +3,7 @@ use libp2p_identity::{Keypair, PeerId};
 use sha2::{Digest, Sha256};
 use std::{fmt, path::PathBuf};
 use thiserror::Error;
+use zeroize::Zeroize;
 #[derive(Clone, Debug)]
 pub struct IdentityConfig {
     pub path: PathBuf,
@@ -62,6 +63,8 @@ pub fn load_or_create_identity(config: &IdentityConfig) -> Result<LoadedIdentity
     };
     let keypair =
         Keypair::from_protobuf_encoding(&bytes).map_err(|_| IdentityError::InvalidEncoding)?;
+    let mut bytes = bytes;
+    bytes.zeroize();
     if keypair.key_type() != libp2p_identity::KeyType::Ed25519 {
         return Err(IdentityError::InvalidEncoding);
     }

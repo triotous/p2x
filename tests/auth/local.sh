@@ -151,7 +151,15 @@ if [[ "$case_name" == pin-mismatch ]]; then
     --exchange "$exchange_addr" --exchange-peer-id "$bad_pin" --credential-env P2X_TOKEN \
     --case-id "$case_name" >"$out/client.ndjson" 2>&1 && { echo "pin mismatch unexpectedly succeeded" >&2; exit 1; } || true
   ! grep -E "$client_token|$server_token|$rotation_token|$client_digest|$server_digest|$rotation_digest|token_secret|raw_ticket|$exchange_key|$client_key|$server_key" "$out"/* >/dev/null 2>&1 || { echo "secret leaked" >&2; exit 1; }
-  printf '{"case":"%s","passed":true,"code":"auth.exchange_identity_mismatch","auth_requests":0}\n' "$case_name" | tee "$out/summary.json"
+  auth_requests=$(grep -c '"event":"auth_request_observed"' "$out/exchange.ndjson" || true)
+  [[ "$auth_requests" -eq 0 ]] || { echo "pin mismatch emitted $auth_requests auth requests" >&2; exit 1; }
+  python3 - "$out" "$case_name" <<'PY'
+import json, pathlib, sys
+out, case = pathlib.Path(sys.argv[1]), sys.argv[2]
+summary = {'case': case, 'passed': True, 'observed_auth_requests': 0}
+(out / 'summary.json').write_text(json.dumps(summary) + '\n')
+print(json.dumps(summary))
+PY
   exit 0
 fi
 

@@ -5,6 +5,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use thiserror::Error;
+use zeroize::Zeroize;
 
 #[derive(Debug, Error)]
 pub enum TicketKeyError {
@@ -43,12 +44,15 @@ impl TicketKey {
     }
 
     pub fn load(path: &Path) -> Result<Self, TicketKeyError> {
-        let b = read_secret_file(path)?;
-        if b.first() != Some(&1) || b.len() != 33 {
-            return Err(TicketKeyError::Invalid);
-        }
-        let seed: [u8; 32] = b[1..].try_into().map_err(|_| TicketKeyError::Invalid)?;
-        Ok(Self::from_seed(seed))
+        let mut b = read_secret_file(path)?;
+        let result = if b.first() != Some(&1) || b.len() != 33 {
+            Err(TicketKeyError::Invalid)
+        } else {
+            let seed: [u8; 32] = b[1..].try_into().map_err(|_| TicketKeyError::Invalid)?;
+            Ok(Self::from_seed(seed))
+        };
+        b.zeroize();
+        result
     }
     pub fn create(path: &Path) -> Result<Self, TicketKeyError> {
         let mut seed = [0u8; 32];

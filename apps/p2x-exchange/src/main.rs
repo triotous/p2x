@@ -180,6 +180,8 @@ async fn main() -> io::Result<()> {
                     emitter.emit(&LifecycleRecord::ListenerReady { listener_id: &listener_id, address: &advertised })?;
                 }
                 SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request_id, request, channel }, connection_id, .. })) => {
+                    let peer_name = peer.to_string();
+                    emitter.emit(&LifecycleRecord::AuthRequestObserved { peer_id: &peer_name, request_id: request_id.to_string() })?;
                     let wire_request_id = match &request {
                         p2x_protocol::AuthRequest::Authenticate { request_id, .. } | p2x_protocol::AuthRequest::Ping { request_id, .. } => Some(*request_id),
                     };
