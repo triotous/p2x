@@ -98,11 +98,9 @@ impl ConnectionManager {
         endpoint: &ConnectedPoint,
         now: Instant,
     ) -> Result<(), p2x_net::connection_book::ConnectionBookError> {
-        self.ensure_peer(server)
-            .map_err(|_| p2x_net::connection_book::ConnectionBookError::Capacity)?;
         self.peers
             .get_mut(&server)
-            .expect("ensured peer state")
+            .ok_or(p2x_net::connection_book::ConnectionBookError::Capacity)?
             .book
             .on_connection_established(server, connection_id, endpoint, now)
     }
@@ -124,14 +122,13 @@ impl ConnectionManager {
         connection_id: ConnectionId,
         now: Instant,
     ) -> Result<(), p2x_net::connection_book::ConnectionBookError> {
-        self.ensure_peer(server)
-            .map_err(|_| p2x_net::connection_book::ConnectionBookError::Capacity)?;
         self.peers
             .get_mut(&server)
-            .expect("ensured peer state")
+            .ok_or(p2x_net::connection_book::ConnectionBookError::Capacity)?
             .book
             .on_dcutr_succeeded(server, connection_id, now)
     }
+
     pub fn close_active(&mut self, server: PeerId) {
         if let Some(state) = self.peers.get_mut(&server) {
             state.active = state.active.saturating_sub(1);
@@ -291,26 +288,6 @@ impl ConnectionManager {
         Ok((attempt, actions))
     }
 
-    fn ensure_peer(&mut self, server: PeerId) -> Result<(), PublicErrorCode> {
-        if self.peers.contains_key(&server) {
-            return Ok(());
-        }
-        if self.peers.len() >= self.limits.max_peer_states {
-            self.evict()?;
-        }
-        self.peers.insert(
-            server,
-            PeerState {
-                book: ConnectionBook::new(self.exchange_peer_id),
-                pending: 0,
-                active: 0,
-                last_used: self.sequence,
-                draining: false,
-            },
-        );
-        Ok(())
-    }
-
     fn evict(&mut self) -> Result<(), PublicErrorCode> {
         let victim = self
             .peers
@@ -430,34 +407,6 @@ mod tests {
         manager.finish_path(server, Some(PathDecision::Direct(direct)));
         manager.finish_path(server, None);
         assert_eq!(manager.pending_count(), 0);
-    }
-
-    #[test]
-    fn established_connection_is_retained_before_path_admission() {
-        let exchange = PeerId::random();
-        let server = PeerId::random();
-        let mut manager = ConnectionManager::new(
-            exchange,
-            PathPolicy::default(),
-            SetupLimits {
-                max_peer_states: 1,
-                max_pending_setups: 1,
-                max_pending_per_server: 1,
-            },
-        );
-        let connection = ConnectionId::new_unchecked(1);
-        let endpoint = libp2p::core::ConnectedPoint::Dialer {
-            address: format!("/ip4/127.0.0.1/tcp/1/p2p/{server}")
-                .parse()
-                .unwrap(),
-            role_override: libp2p::core::Endpoint::Dialer,
-            port_use: libp2p::core::transport::PortUse::New,
-        };
-        manager
-            .on_connection_established(server, connection, &endpoint, Instant::now())
-            .unwrap();
-        assert_eq!(manager.peer_count(), 1);
-        assert_eq!(manager.direct(server), None);
     }
 
     #[test]
