@@ -843,12 +843,13 @@ async fn main() -> io::Result<()> {
                         let open = proxy_open.take().ok_or_else(|| io::Error::other("proxy stream opened without grant"))?;
                         if let Some(current) = proxy_attempt.as_mut() {
                             let _ = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ExactOpenSucceeded { request_id: PathRequestId(request_id.0), connection: connection_id } });
-                            let _ = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::PayloadAccepted });
                         }
-
+                        let timeout = proxy_setup_deadline
+                            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_secs(5)))
+                            .unwrap_or_else(|| std::time::Duration::from_secs(5));
                         let tx = proxy_result_tx.clone();
                         tokio::spawn(async move {
-                            let result = proxy_open::authorize_empty_stream(stream, &open, std::time::Duration::from_secs(5)).await;
+                            let result = proxy_open::authorize_empty_stream(stream, &open, timeout).await;
                             let _ = tx.send(ProxyResult { request_id: open.request_id, result }).await;
                         });
                         let _ = (peer_id, connection_id, selected_proxy_connection, proxy_request_id);
