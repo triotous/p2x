@@ -71,11 +71,16 @@ impl ConnectionManager {
         self.pending += 1;
         Ok(())
     }
-    pub fn release(&mut self, server: PeerId) {
-        if let Some(state) = self.peers.get_mut(&server) {
-            state.pending = state.pending.saturating_sub(1);
-            self.pending = self.pending.saturating_sub(1);
+    pub fn release(&mut self, server: PeerId) -> bool {
+        let Some(state) = self.peers.get_mut(&server) else {
+            return false;
+        };
+        if state.pending == 0 {
+            return false;
         }
+        state.pending -= 1;
+        self.pending -= 1;
+        true
     }
     pub fn mark_active(&mut self, server: PeerId) {
         if let Some(state) = self.peers.get_mut(&server) {
@@ -239,9 +244,10 @@ mod tests {
             manager.admit(second),
             Err(PublicErrorCode::LimitPeerConnections)
         );
-        manager.release(first);
+        assert!(manager.release(first));
         manager.admit(second).unwrap();
-        manager.release(second);
+        assert!(manager.release(second));
+        assert!(!manager.release(second));
         assert_eq!(manager.pending_count(), 0);
     }
 
