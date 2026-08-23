@@ -110,16 +110,16 @@ impl ProxyStreamBehaviour {
         if deadline <= now {
             return Err("peer.setup_timeout");
         }
-        self.open_on_at_deadline_inner(peer_id, connection_id, open, deadline)
+        self.open_on_at_deadline_inner(peer_id, connection_id, open, now, deadline)
     }
     pub fn open_on_at(
         &mut self,
         peer_id: PeerId,
         connection_id: ConnectionId,
         open: OpenProxyStreamV1,
-        _now: Instant,
+        now: Instant,
     ) -> Result<ProxyRequestId, &'static str> {
-        self.open_on_at_deadline_inner(peer_id, connection_id, open, _now + OPEN_DEADLINE)
+        self.open_on_at_deadline_inner(peer_id, connection_id, open, now, now + OPEN_DEADLINE)
     }
 
     fn open_on_at_deadline_inner(
@@ -127,6 +127,7 @@ impl ProxyStreamBehaviour {
         peer_id: PeerId,
         connection_id: ConnectionId,
         open: OpenProxyStreamV1,
+        _now: Instant,
         deadline: Instant,
     ) -> Result<ProxyRequestId, &'static str> {
         if !self.outbound_enabled {
@@ -159,6 +160,7 @@ impl ProxyStreamBehaviour {
                     peer_id,
                     connection_id,
                     open,
+                    deadline,
                 },
                 deadline,
                 phase: Phase::Queued,
@@ -322,11 +324,10 @@ impl NetworkBehaviour for ProxyStreamBehaviour {
             self.known.remove(&(closed.peer_id, closed.connection_id));
             let inbound = self
                 .inbound_connections
-                .get(&(closed.peer_id, closed.connection_id))
-                .copied()
+                .remove(&(closed.peer_id, closed.connection_id))
                 .unwrap_or(0);
             for _ in 0..inbound {
-                self.inbound_release_on(closed.peer_id, closed.connection_id);
+                self.release_inbound(closed.peer_id, None);
             }
             let requests = self
                 .pending

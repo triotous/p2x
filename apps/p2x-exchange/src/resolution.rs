@@ -137,6 +137,13 @@ impl<'a> Resolver<'a> {
         registry: &Registry,
         now: i64,
     ) -> ResolveResponseV1 {
+        if !client_capabilities.contains(Capabilities::RELAY_V2) {
+            return rejected(
+                Some(request_id),
+                PublicErrorCode::ProtocolCapabilityMismatch,
+                false,
+            );
+        }
         let Some(session) = client_session
             .filter(|session| session.session_id == session_id && session.expires_at > now)
         else {
@@ -183,7 +190,12 @@ impl<'a> Resolver<'a> {
             client_capabilities.bits() & resolved.server_capabilities.bits(),
         )
         .unwrap_or_else(Capabilities::empty);
-        if !compatible.contains(Capabilities::RELAY_V2) {
+        if !client_capabilities.contains(Capabilities::RELAY_V2)
+            || !resolved
+                .server_capabilities
+                .contains(Capabilities::RELAY_V2)
+            || !compatible.contains(Capabilities::RELAY_V2)
+        {
             return rejected(
                 Some(request_id),
                 PublicErrorCode::ProtocolCapabilityMismatch,
@@ -449,6 +461,49 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(resolver.issued(), 1);
         assert_eq!(resolver.cache_len(), 1);
+    }
+
+    #[test]
+    fn resolution_requires_relay_capability_on_both_sides() {
+        let key = TicketKey::from_seed([9; 32]);
+        let mut resolver = Resolver::new(PeerId::random(), &key);
+        let client = PeerId::random();
+        let request = ResolveRequestV1::Resolve {
+            request_id: [1; 16],
+            session_id: [2; 16],
+            selector: p2x_protocol::UnscopedSelector::new(
+                p2x_protocol::ProtocolClass::Http,
+                [(
+                    p2x_protocol::MetadataKey::new("service").unwrap(),
+                    p2x_protocol::MetadataValue::new("orders").unwrap(),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap(),
+            client_capabilities: Capabilities::DIRECT_TCP,
+        };
+        let response = resolver.resolve_and_authorize(
+            client,
+            ConnectionId::new_unchecked(1),
+            &request,
+            "1",
+            Some(&session(client, Role::Client, Scope::OpenProxyStream.bit())),
+            |_| None,
+            |_| false,
+            &Registry::default(),
+            1,
+        );
+        assert!(matches!(
+            response,
+            ResolveResponseV1::Rejected {
+                error: PublicError {
+                    code: PublicErrorCode::ProtocolCapabilityMismatch,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]

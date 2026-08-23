@@ -10,7 +10,6 @@ use p2x_protocol::OpenProxyStreamV1;
 use std::{
     collections::VecDeque,
     task::{Context, Poll},
-    time::Duration,
 };
 
 const MAX_HANDLER_QUEUE: usize = 64;
@@ -24,6 +23,7 @@ pub struct OpenProxy {
     pub peer_id: libp2p::PeerId,
     pub connection_id: ConnectionId,
     pub open: OpenProxyStreamV1,
+    pub deadline: std::time::Instant,
 }
 #[derive(Debug)]
 pub enum ProxyEvent {
@@ -84,6 +84,17 @@ impl ConnectionHandler for ProxyHandler {
             return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(event));
         }
         if let Some(open) = self.queue.pop_front() {
+            let timeout = open
+                .deadline
+                .saturating_duration_since(std::time::Instant::now());
+            if timeout.is_zero() {
+                return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
+                    ProxyEvent::OutboundFailed {
+                        request_id: open.request_id,
+                        code: "peer.setup_timeout",
+                    },
+                ));
+            }
             return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest {
                 protocol: SubstreamProtocol::new(
                     ProxyUpgrade {
@@ -91,7 +102,7 @@ impl ConnectionHandler for ProxyHandler {
                     },
                     open,
                 )
-                .with_timeout(Duration::from_secs(5)),
+                .with_timeout(timeout),
             });
         }
         Poll::Pending
