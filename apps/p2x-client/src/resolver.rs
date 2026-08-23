@@ -371,6 +371,10 @@ impl ResolverState {
     pub fn cached_tickets(&self) -> usize {
         0
     }
+
+    pub fn has_pending(&self, request_id: [u8; 16]) -> bool {
+        self.pending.contains_key(&request_id)
+    }
 }
 #[cfg(test)]
 mod tests {
