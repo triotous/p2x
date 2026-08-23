@@ -1145,6 +1145,14 @@ async fn main() -> io::Result<()> {
             }
             Some(candidate) = proxy_rx.recv() => {
                 let request_id = candidate.open.as_ref().ok().map(|open| open.request_id);
+                emitter.emit(&LifecycleRecord::ProxyAuthorization {
+                    peer_id: &candidate.peer_id.to_string(),
+                    connection_id_hash: stable_hash(candidate.connection_id),
+                    request_id_hash: request_id.map(stable_hash).unwrap_or_default(),
+                    stream_id_hash: None,
+                    authorized: false,
+                    code: Some(PublicErrorCode::PeerDraining.as_str()),
+                })?;
                 let _ = candidate.decision.send(
                     p2x_protocol::ProxyOpenResponseV1::Rejected {
                         request_id,

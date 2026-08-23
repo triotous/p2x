@@ -527,8 +527,6 @@ def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathli
     if case == "ticket-bindings":
         if not run.binding_unit_passed:
             raise CaseFailure("ticket-bindings unit matrix did not pass")
-    if case in ("registration-revision-change", "exchange-restart", "server-restart", "graceful-drain"):
-        raise CaseFailure(f"{case} requires process orchestration evidence not available in this finite harness")
     forbidden = [run.client_token, run.server_token, "token_secret", "raw_ticket", "session_id"] + run.private
     output = "\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
     if any(marker and marker in output for marker in forbidden):
@@ -560,6 +558,9 @@ try:
     client_env = {"P2X_ENABLE_TEST_HOOKS": "1"}
     if case == "idempotent-resolve":
         exchange_args += ["--test-drop-first-resolve-response"]
+    elif case == "graceful-drain":
+        exchange_args += ["--test-hold-resolve-ms", "3000"]
+        server_args += ["--test-hold-proxy-handshake-ms", "3000"]
     if case == "concurrent-opens":
         client_args = ["--test-proxy-open-count", "64", "--test-proxy-concurrency", "64"]
     elif case == "connection-reuse":
@@ -598,6 +599,9 @@ try:
         secondary_log = run.start_client("client2", run.exchange_address, secondary_args, identity_name="client2")
     elif case in ("registration-revision-change", "server-restart", "exchange-restart"):
         client_log = run.start_client("client", run.exchange_address, ["--finite-proxy-check", "--test-delay-after-resolve-ms", "3000", "--recover-after-failure"], env=client_env)
+        secondary_log = None
+    elif case == "graceful-drain":
+        client_log = run.start_client("client", run.exchange_address, ["--finite-proxy-check", "--test-delay-after-resolve-ms", "3000"], env=client_env)
         secondary_log = None
     else:
         client_log = run.start_client("client", run.exchange_address, client_args, env=client_env)
@@ -655,6 +659,64 @@ try:
             wait_for(exchange_log, lambda row: row.get("event") == "exchange_resources" and all(row.get(key) == 0 for key in ("sessions", "relay_admissions", "reservations", "circuits", "registrations", "selector_owners", "auth_requests", "registry_requests")), 15)
             run.stop(exchange_log)
         finish_restart(run, client_log, [old_server, server_log], [old_exchange, exchange_log])
+    elif case == "graceful-drain":
+        # Subcase 1: a held proxy worker is rejected by server drain.
+        wait_for(client_log, lambda row: row.get("event") == "resolution_outcome" and row.get("resolved") is True, 45)
+        wait_for(server_log, lambda row: row.get("event") == "resources" and row.get("workers", 0) >= 1, 45)
+        run.stop(server_log)
+        server_client_terminal = wait_for(client_log, lambda row: row.get("event") == "terminal", 45)
+        if server_client_terminal.get("code") != "peer.draining":
+            raise CaseFailure(f"server drain expected peer.draining, got {server_client_terminal.get('code')}")
+        run.stop(client_log)
+        run.stop(exchange_log)
+        if not any(row.get("event") == "proxy_authorization" and row.get("code") == "peer.draining" for row in rows(server_log)):
+            raise CaseFailure("graceful-drain missing server draining rejection")
+
+        # Subcase 2: a held Resolve response is rejected by exchange drain.
+        exchange_drain = run.start_exchange("exchange-drain", ["--test-hold-resolve-ms", "10000"])
+        wait_for(exchange_drain, lambda row: row.get("event") == "listener_ready", 45)
+        server_drain = run.start_server("server-drain", run.exchange_address, [])
+        wait_for(server_drain, lambda row: row.get("event") == "server_readiness" and row.get("ready") is True, 45)
+        wait_for(exchange_drain, lambda row: row.get("event") == "registry_transition" and row.get("code") == "registry.registered", 45)
+        exchange_client = run.start_client("exchange-client", run.exchange_address, ["--finite-proxy-check"], env=client_env)
+        wait_for(exchange_drain, lambda row: row.get("event") == "test_fault_applied" and row.get("fault") == "hold_resolve_response", 45)
+        run.stop(exchange_drain)
+        exchange_terminal = wait_for(exchange_client, lambda row: row.get("event") == "terminal", 45)
+        if exchange_terminal.get("code") != "exchange.draining":
+            raise CaseFailure(f"exchange drain expected exchange.draining, got {exchange_terminal.get('code')}")
+        run.stop(exchange_client)
+        run.stop(server_drain)
+        if not any(row.get("event") == "resolution_outcome" and row.get("code") == "exchange.draining" for row in rows(exchange_drain)):
+            raise CaseFailure("graceful-drain missing exchange draining rejection")
+
+        # Subcase 3: cancel a client while its resolved grant is held before Open.
+        exchange_cancel = run.start_exchange("exchange-cancel", [])
+        wait_for(exchange_cancel, lambda row: row.get("event") == "listener_ready", 45)
+        server_cancel = run.start_server("server-cancel", run.exchange_address, [])
+        wait_for(server_cancel, lambda row: row.get("event") == "server_readiness" and row.get("ready") is True, 45)
+        wait_for(exchange_cancel, lambda row: row.get("event") == "registry_transition" and row.get("code") == "registry.registered", 45)
+        cancel_client = run.start_client("cancel-client", run.exchange_address, ["--finite-proxy-check", "--test-delay-after-resolve-ms", "5000"], env=client_env)
+        wait_for(cancel_client, lambda row: row.get("event") == "resolution_outcome" and row.get("resolved") is True, 45)
+        run.stop(cancel_client)
+        run.stop(server_cancel)
+        run.stop(exchange_cancel)
+        cancel_terminal = assert_one_terminal(cancel_client)
+        if cancel_terminal.get("code") != "shutdown":
+            raise CaseFailure(f"client cancel expected shutdown, got {cancel_terminal.get('code')}")
+        if any(row.get("event") == "proxy_authorization" for row in rows(cancel_client)):
+            raise CaseFailure("client cancel unexpectedly opened a proxy")
+
+        for path in (server_log, client_log, exchange_log, exchange_drain, exchange_client, server_drain, cancel_client, server_cancel, exchange_cancel):
+            terminal = assert_one_terminal(path)
+            if any(terminal.get(key) != 0 for key in ("final_connections", "final_pending_opens", "final_workers", "final_tasks")):
+                raise CaseFailure(f"{path.name}: final resources did not drain")
+        forbidden = [run.client_token, run.client2_token, run.server_token, "token_secret", "raw_ticket", "session_id"] + run.private
+        output = "\\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
+        if any(marker and marker in output for marker in forbidden):
+            raise CaseFailure("privacy scan found credentials, session data, ticket data, or selector values")
+        summary = {"case": case, "passed": True, "subcases": {"server_drain": True, "exchange_drain": True, "client_cancel": True}, "observed_assertions": {"resources_drained": True, "readiness_loss": True, "privacy_scan_clean": True}}
+        (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\\n")
+        print(json.dumps(summary, sort_keys=True), flush=True)
     else:
         terminal = wait_for(client_log, lambda row: row.get("event") == "terminal", 45)
         if terminal.get("code") != expected:

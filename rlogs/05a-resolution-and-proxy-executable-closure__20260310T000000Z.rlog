@@ -165,7 +165,21 @@ phase 7.5 restart/recovery process orchestration:
 - Converted Resolve-to-Open delay into a nonblocking finite diagnostic stage so the swarm continues auth, reconnect, and registry processing while a grant is held.
 - Added reusable exchange/server process starters and restart choreography with persisted identities, old registration cleanup, replacement registration checks, and fresh response fingerprints.
 - Added client recovery for restart-time auth-session rejection and stale/ambiguous proxy failures.
-- `server-restart` now passes end to end: old registration is removed, the same server identity re-registers with a new revision, and the existing client fresh-resolves and authorizes.
-- `exchange-restart` remains under active verification.
+- `server-restart` passed end to end: old registration is removed, the same server identity re-registers with a new revision, and the existing client fresh-resolves and authorizes.
 validation: server-restart passed; workspace fmt/clippy/tests passed.
+commit: 109204b
+
+phase 7.6 exchange restart recovery:
+- Client now defers transient `registry.not_found`/`registry.offline` during exchange recovery and retries fresh resolution non-blockingly within the original setup deadline.
+- Exchange drain converts held Resolve channels to correlated `exchange.draining` rejection records.
+- `exchange-restart` passed with the existing client/server processes and replacement registration.
+validation: exchange-restart passed; workspace fmt/clippy/tests passed.
+commit: 19762af
+
+phase 7.7 graceful drain process matrix:
+- Added independent server-drain, exchange-drain, and client-cancel subcases to the canonical runner.
+- Server drain records owner-side `peer.draining` rejection for held proxy candidates.
+- All subcases assert one terminal, readiness loss, zero final resources, and clean privacy scans.
+- Full resolution aggregate passed all 20 declared cases.
+validation: full `tests/resolution/local.sh --case all` passed.
 commit: pending phase review

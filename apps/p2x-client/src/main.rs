@@ -579,6 +579,9 @@ async fn main() -> io::Result<()> {
     let mut resolve_request: Option<ResolveRequestV1> = None;
     let mut resolve_retried = false;
     let mut recovery_resolve_retried = false;
+    let mut exchange_restarted = false;
+    let mut recovery_retry_deadline: Option<std::time::Instant> = None;
+    let mut deferred_resolve_retry_at: Option<std::time::Instant> = None;
     let mut resolve_sent_at: Option<std::time::Instant> = None;
     let mut resolve_setup_deadline: Option<std::time::Instant> = None;
     let mut proxy_open: Option<OpenProxyStreamV1> = None;
@@ -638,6 +641,26 @@ async fn main() -> io::Result<()> {
                     emitter.emit(&LifecycleRecord::OperationalError { code: "connection.outgoing", message: &message })?;
                 }
                 let now = std::time::Instant::now();
+                if deferred_resolve_retry_at.is_some_and(|due| due <= now)
+                    && resolve_request.is_none()
+                    && (exchange_restarted || recovery_resolve_retried)
+                    && resolve_setup_deadline.is_some_and(|deadline| now < deadline)
+                    && let (Some(route), Some(session_id), Some(binding)) = (
+                        routes.as_ref().and_then(|config| config.routes.first()),
+                        auth_state.current_session_id(unix_now()),
+                        auth_state.current_session(unix_now()).map(|session| session.principal_binding()),
+                    ) {
+                        resolver_state.invalidate(&binding, &route.selector);
+                        let request_id = request_ids.allocate().map_err(io::Error::other)?;
+                        let request = resolver_state.begin(request_id, binding, session_id, route.selector.clone(), unix_now()).map_err(|code| io::Error::other(code.as_str()))?.ok_or_else(|| io::Error::other("resolve request was paced"))?;
+                        let outbound = swarm.behaviour_mut().resolve.send_request(&expected_exchange, request.clone());
+                        if !pending_resolve.begin(outbound) { return Err(io::Error::other("resolve outbound request limit exceeded")); }
+                        resolve_request = Some(request);
+                        resolve_retried = false;
+                        resolve_sent_at = Some(now);
+                        deferred_resolve_retry_at = None;
+                        emitter.emit(&LifecycleRecord::OperationalError { code: "proxy.recovering", message: "retrying while replacement registration converges" })?;
+                }
                 if !resolve_retried
                     && resolve_sent_at.is_some_and(|sent| now.duration_since(sent) >= std::time::Duration::from_secs(5))
                     && resolve_setup_deadline.is_some_and(|deadline| now < deadline)
@@ -1262,19 +1285,16 @@ async fn main() -> io::Result<()> {
                             Ok(_) => {}
                             Err(code) => {
                                 if args.recover_after_failure
-                                    && recovery_resolve_retried
+                                    && (recovery_resolve_retried || exchange_restarted)
                                     && matches!(code, PublicErrorCode::RegistryNotFound | PublicErrorCode::RegistryOffline)
                                     && resolve_setup_deadline.is_some_and(|deadline| std::time::Instant::now() < deadline)
+                                    && recovery_retry_deadline.is_none_or(|deadline| std::time::Instant::now() < deadline)
                                 {
                                     recovery_resolve_retried = false;
+                                    exchange_restarted = false;
+                                    recovery_retry_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(15));
                                     resolver_state.invalidate(&binding, &selector);
-                                    let request_id = request_ids.allocate().map_err(io::Error::other)?;
-                                    let request = resolver_state.begin(request_id, binding.clone(), session_id, selector.clone(), unix_now()).map_err(|error| io::Error::other(error.as_str()))?.ok_or_else(|| io::Error::other("resolve request was paced"))?;
-                                    let outbound = swarm.behaviour_mut().resolve.send_request(&expected_exchange, request.clone());
-                                    if !pending_resolve.begin(outbound) { return Err(io::Error::other("resolve outbound request limit exceeded")); }
-                                    resolve_request = Some(request);
-                                    resolve_retried = false;
-                                    resolve_sent_at = Some(std::time::Instant::now());
+                                    deferred_resolve_retry_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
                                     emitter.emit(&LifecycleRecord::OperationalError { code: "proxy.recovering", message: "retrying while replacement registration converges" })?;
                                     continue;
                                 }
@@ -1371,6 +1391,10 @@ async fn main() -> io::Result<()> {
                         if expected_exchange == peer_id && credential.is_some() && exchange_connections.closed(&connection_id) == ConnectionLoss::Final {
                             let was_ready = auth_state.ready();
                             auth_state.disconnected();
+                            if args.recover_after_failure && was_ready {
+                                exchange_restarted = true;
+                                recovery_retry_deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(15));
+                            }
                             pending_auth.clear();
                             if args.finite_auth_check && !was_ready {
                                 emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", PublicErrorCode::LimitAuthConnections.as_str()))?;

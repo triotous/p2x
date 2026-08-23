@@ -627,6 +627,20 @@ async fn main() -> io::Result<()> {
             request_id: Some(request_id),
             error: PublicError::new(PublicErrorCode::ExchangeDraining, true),
         };
+        let fingerprint = response
+            .canonical_bytes()
+            .map(stable_hash)
+            .unwrap_or_default();
+        emitter.emit(&LifecycleRecord::ResolutionOutcome {
+            peer_id: &held.peer.to_string(),
+            request_id_hash: stable_hash(request_id),
+            request_fingerprint: 0,
+            response_fingerprint: fingerprint,
+            issuance_count: 0,
+            resolved: false,
+            ticket_issued: false,
+            code: Some(PublicErrorCode::ExchangeDraining.as_str()),
+        })?;
         if swarm
             .behaviour_mut()
             .resolve
