@@ -59,6 +59,8 @@ pub struct ProxyStreamBehaviour {
     inbound_events: VecDeque<ProxyOutput>,
     inbound_workers: HashMap<PeerId, usize>,
     inbound_connections: HashMap<(PeerId, ConnectionId), usize>,
+    max_inbound_workers: usize,
+    max_inbound_workers_per_peer: usize,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
@@ -81,11 +83,28 @@ impl ProxyStreamBehaviour {
         }
     }
     pub fn server() -> Self {
+        Self::server_with_limits(MAX_INBOUND_WORKERS, MAX_INBOUND_WORKERS_PER_PEER)
+    }
+
+    pub fn server_with_limits(max_workers: usize, max_workers_per_peer: usize) -> Self {
         Self {
             inbound_enabled: true,
             outbound_enabled: false,
+            max_inbound_workers: max_workers.clamp(1, MAX_INBOUND_WORKERS),
+            max_inbound_workers_per_peer: max_workers_per_peer
+                .clamp(1, MAX_INBOUND_WORKERS_PER_PEER),
             ..Self::default()
         }
+    }
+
+    pub fn set_inbound_limits(&mut self, max_workers: usize, max_workers_per_peer: usize) {
+        self.max_inbound_workers = max_workers.clamp(1, MAX_INBOUND_WORKERS);
+        self.max_inbound_workers_per_peer =
+            max_workers_per_peer.clamp(1, MAX_INBOUND_WORKERS_PER_PEER);
+    }
+
+    pub fn inbound_count(&self) -> usize {
+        self.inbound_workers.values().sum()
     }
     pub fn set_draining(&mut self, draining: bool) {
         self.draining = draining;
@@ -193,7 +212,7 @@ impl ProxyStreamBehaviour {
     ) -> Result<(), &'static str> {
         let total: usize = self.inbound_workers.values().sum();
         let count = self.inbound_workers.entry(peer_id).or_default();
-        if total >= MAX_INBOUND_WORKERS || *count >= MAX_INBOUND_WORKERS_PER_PEER {
+        if total >= self.max_inbound_workers || *count >= self.max_inbound_workers_per_peer {
             return Err("limit.proxy_streams");
         }
         *count += 1;

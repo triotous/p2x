@@ -45,6 +45,7 @@ struct Limits {
     max_peer_states: Option<usize>,
     max_pending_setups: Option<usize>,
     max_pending_per_server: Option<usize>,
+    max_route_opens: Option<usize>,
 }
 #[derive(Clone, Debug)]
 pub struct Route {
@@ -56,6 +57,7 @@ pub struct ClientLimits {
     pub max_peer_states: usize,
     pub max_pending_setups: usize,
     pub max_pending_per_server: usize,
+    pub max_route_opens: usize,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClientNetwork {
@@ -97,6 +99,7 @@ impl ClientConfig {
             max_peer_states: file.limits.max_peer_states.unwrap_or(64),
             max_pending_setups: file.limits.max_pending_setups.unwrap_or(128),
             max_pending_per_server: file.limits.max_pending_per_server.unwrap_or(64),
+            max_route_opens: file.limits.max_route_opens.unwrap_or(128),
         };
         if limits.max_peer_states == 0
             || limits.max_peer_states > 256
@@ -104,6 +107,8 @@ impl ClientConfig {
             || limits.max_pending_setups > 512
             || limits.max_pending_per_server == 0
             || limits.max_pending_per_server > 128
+            || limits.max_route_opens == 0
+            || limits.max_route_opens > 128
         {
             return Err(RouteConfigError::Invalid("invalid client limits".into()));
         }

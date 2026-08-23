@@ -365,11 +365,6 @@ async fn main() -> io::Result<()> {
             .map_err(io::Error::other)?,
         )
     };
-    let mut ticket_admission = ticket_admission::TicketAdmissionLedger::new(
-        ticket_admission::MAX_REPLAY_ENTRIES,
-        args.ticket_clock_skew as i64,
-    )
-    .map_err(|code| io::Error::new(io::ErrorKind::InvalidInput, code.as_str()))?;
     let service_config = if args.unsafe_connectivity_lab {
         None
     } else {
@@ -383,6 +378,15 @@ async fn main() -> io::Result<()> {
             .map_err(io::Error::other)?,
         )
     };
+    let mut ticket_admission = ticket_admission::TicketAdmissionLedger::new(
+        service_config
+            .as_ref()
+            .map_or(ticket_admission::MAX_REPLAY_ENTRIES, |config| {
+                config.proxy.max_replay_entries
+            }),
+        args.ticket_clock_skew as i64,
+    )
+    .map_err(|code| io::Error::new(io::ErrorKind::InvalidInput, code.as_str()))?;
     if args.credential_env.is_none() && !args.unsafe_connectivity_lab {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -407,6 +411,14 @@ async fn main() -> io::Result<()> {
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
     start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
+    if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut()
+        && let Some(service_config) = service_config.as_ref()
+    {
+        proxy.set_inbound_limits(
+            service_config.proxy.max_workers,
+            service_config.proxy.max_workers_per_client,
+        );
+    }
     let mut credential: Option<(p2x_protocol::CredentialId, p2x_protocol::TokenSecret)> = None;
     let mut relay_peer_id = exchange_trust.as_ref().map(|trust| trust.peer_id);
     let mut relay_connection_id = None;
@@ -418,8 +430,12 @@ async fn main() -> io::Result<()> {
     let mut connection_paths = HashMap::new();
     let mut worker_admission = WorkerAdmission::default();
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerResult>(128);
-    let (proxy_tx, mut proxy_rx) = mpsc::channel::<proxy_open::Candidate>(256);
-    let (proxy_release_tx, mut proxy_release_rx) = mpsc::channel::<proxy_open::Release>(256);
+    let proxy_limit = service_config
+        .as_ref()
+        .map_or(256, |config| config.proxy.max_workers);
+    let (proxy_tx, mut proxy_rx) = mpsc::channel::<proxy_open::Candidate>(proxy_limit);
+    let (proxy_release_tx, mut proxy_release_rx) =
+        mpsc::channel::<proxy_open::Release>(proxy_limit);
     let mut proxy_workers = 0usize;
     let mut resource_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut first_probe_dropped = false;
@@ -590,7 +606,12 @@ async fn main() -> io::Result<()> {
                 let connections = connection_book.as_ref().map(ConnectionBook::len).unwrap_or(connection_paths.len());
                 let pending_opens = swarm.behaviour().probe_stream.as_ref().map_or(0, |probe| probe.pending_count())
                     + swarm.behaviour().proxy_stream.as_ref().map_or(0, |proxy| proxy.pending_count());
-                emitter.emit(&LifecycleRecord::Resources { connections, pending_opens, workers: worker_admission.admitted() + proxy_workers, tasks: worker_admission.admitted() + proxy_workers })?;
+                let configured_proxy_workers = swarm
+                    .behaviour()
+                    .proxy_stream
+                    .as_ref()
+                    .map_or(0, |proxy| proxy.inbound_count());
+                emitter.emit(&LifecycleRecord::Resources { connections, pending_opens, workers: worker_admission.admitted() + configured_proxy_workers, tasks: worker_admission.admitted() + configured_proxy_workers })?;
             }
             Some(release) = proxy_release_rx.recv() => {
                 if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() { proxy.inbound_release_on(release.peer_id, release.connection_id); }
@@ -607,9 +628,12 @@ async fn main() -> io::Result<()> {
                             (Some(ring), Some(session), Some(services), Some((_, expires_at))) => {
                                 let service = services.service(&open.upstream_id);
                                 match service {
-                                    Some(service) => match ticket_admission.authorize_open(ring, relay_peer_id.unwrap_or(*swarm.local_peer_id()), candidate.peer_id, *swarm.local_peer_id(), session.tenant(), service, registration_revision, expires_at, session.authorization_revision(), &open, now, owner_fingerprint) {
-                                        ticket_admission::TicketAdmission::Authorized(_) => proxy_open::random_stream_id().map(|stream_id| p2x_protocol::ProxyOpenResponseV1::Authorized { request_id: open.request_id, stream_id }).unwrap_or_else(|code| p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: Some(open.request_id), error: p2x_protocol::PublicError::new(code, true) }),
-                                        ticket_admission::TicketAdmission::Rejected(code) => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: Some(open.request_id), error: p2x_protocol::PublicError::new(code, matches!(code, PublicErrorCode::RegistryStaleRevision | PublicErrorCode::LimitProxyStreams)) },
+                                    Some(service) => {
+                                        let admission = ticket_admission.authorize_open(ring, relay_peer_id.unwrap_or(*swarm.local_peer_id()), candidate.peer_id, *swarm.local_peer_id(), session.tenant(), service, registration_revision, expires_at, session.authorization_revision(), &open, now, owner_fingerprint);
+                                        match admission {
+                                            ticket_admission::TicketAdmission::Authorized(_) => proxy_open::random_stream_id().map(|stream_id| p2x_protocol::ProxyOpenResponseV1::Authorized { request_id: open.request_id, stream_id }).unwrap_or_else(|code| p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: Some(open.request_id), error: p2x_protocol::PublicError::new(code, true) }),
+                                            ticket_admission::TicketAdmission::Rejected(code) => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: Some(open.request_id), error: p2x_protocol::PublicError::new(code, matches!(code, PublicErrorCode::RegistryStaleRevision | PublicErrorCode::LimitProxyStreams)) },
+                                        }
                                     },
                                     None => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: Some(open.request_id), error: p2x_protocol::PublicError::new(PublicErrorCode::RegistryStaleRevision, true) },
                                 }

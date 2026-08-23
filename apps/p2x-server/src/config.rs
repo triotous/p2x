@@ -17,6 +17,15 @@ struct File {
     schema_version: u8,
     registration: Registration,
     services: Vec<Entry>,
+    proxy: Option<Proxy>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Proxy {
+    max_workers: Option<usize>,
+    max_workers_per_client: Option<usize>,
+    max_replay_entries: Option<usize>,
+    ticket_clock_skew: Option<u64>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,11 +48,20 @@ struct Selector {
 }
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
+pub struct ProxyLimits {
+    pub max_workers: usize,
+    pub max_workers_per_client: usize,
+    pub max_replay_entries: usize,
+    pub ticket_clock_skew: u64,
+}
+#[derive(Clone, Debug)]
 pub struct ServiceConfig {
     pub requested_lease_seconds: u16,
     pub refresh_seconds: u16,
     pub services: ServiceSet,
     pub service_set_hash: [u8; 32],
+    #[allow(dead_code)]
+    pub proxy: ProxyLimits,
 }
 impl ServiceConfig {
     #[allow(dead_code)]
@@ -115,12 +133,35 @@ impl ServiceConfig {
         }
         let services =
             ServiceSet::new(services).map_err(|e| ServiceConfigError::Invalid(e.to_string()))?;
+        let proxy = file.proxy.unwrap_or(Proxy {
+            max_workers: None,
+            max_workers_per_client: None,
+            max_replay_entries: None,
+            ticket_clock_skew: None,
+        });
+        let proxy = ProxyLimits {
+            max_workers: proxy.max_workers.unwrap_or(256),
+            max_workers_per_client: proxy.max_workers_per_client.unwrap_or(32),
+            max_replay_entries: proxy.max_replay_entries.unwrap_or(8_192),
+            ticket_clock_skew: proxy.ticket_clock_skew.unwrap_or(5),
+        };
+        if proxy.max_workers == 0
+            || proxy.max_workers > 2_048
+            || proxy.max_workers_per_client == 0
+            || proxy.max_workers_per_client > 256
+            || proxy.max_replay_entries == 0
+            || proxy.max_replay_entries > 65_536
+            || proxy.ticket_clock_skew > 30
+        {
+            return Err(ServiceConfigError::Invalid("invalid proxy limits".into()));
+        }
         let service_set_hash = services.hash();
         Ok(Self {
             requested_lease_seconds: lease,
             refresh_seconds: refresh,
             services,
             service_set_hash,
+            proxy,
         })
     }
 }

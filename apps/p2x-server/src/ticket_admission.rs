@@ -7,6 +7,15 @@ use p2x_protocol::{
 use std::collections::HashMap;
 
 pub const MAX_REPLAY_ENTRIES: usize = 8_192;
+pub const MAX_REPLAY_ENTRIES_HARD: usize = 65_536;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidationCandidate {
+    pub ticket_id: [u8; 16],
+    pub claims: p2x_protocol::ticket::ConnectionTicketClaimsV1,
+    pub owner_fingerprint: [u8; 32],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TicketAdmission {
     Authorized([u8; 16]),
@@ -30,7 +39,7 @@ impl Default for TicketAdmissionLedger {
 }
 impl TicketAdmissionLedger {
     pub fn new(capacity: usize, clock_skew: i64) -> Result<Self, PublicErrorCode> {
-        if capacity == 0 || capacity > 65_536 || !(0..=30).contains(&clock_skew) {
+        if capacity == 0 || capacity > MAX_REPLAY_ENTRIES_HARD || !(0..=30).contains(&clock_skew) {
             return Err(PublicErrorCode::ProtocolMalformed);
         }
         Ok(Self {
@@ -93,6 +102,96 @@ impl TicketAdmissionLedger {
         self.validate_and_consume(ring, open.ticket.as_bytes(), &expected, owner_fingerprint)
     }
 
+    #[allow(dead_code)]
+    pub fn verify_candidate(
+        &self,
+        ring: &VerificationKeyRing,
+        envelope: &[u8],
+        now: i64,
+    ) -> Result<ValidationCandidate, PublicErrorCode> {
+        let ticket = p2x_protocol::ticket::verify_signature_with_key_resolver(
+            envelope,
+            ring,
+            now,
+            self.clock_skew,
+        )
+        .map_err(|error| match error {
+            p2x_protocol::ticket::TicketError::Expired => PublicErrorCode::AuthTicketExpired,
+            _ => PublicErrorCode::AuthTicketInvalid,
+        })?;
+        Ok(ValidationCandidate {
+            ticket_id: ticket.ticket_id(),
+            claims: ticket.claims().clone(),
+            owner_fingerprint: [0; 32],
+        })
+    }
+
+    pub fn consume_candidate(
+        &mut self,
+        candidate: ValidationCandidate,
+        now: i64,
+    ) -> TicketAdmission {
+        self.sweep(now);
+        if self.replay.contains_key(&candidate.ticket_id) {
+            return TicketAdmission::Rejected(PublicErrorCode::AuthTicketReplayed);
+        }
+        if self.replay.len() >= self.capacity {
+            return TicketAdmission::Rejected(PublicErrorCode::LimitProxyStreams);
+        }
+        self.replay.insert(
+            candidate.ticket_id,
+            ReplayEntry {
+                expires_at: candidate.claims.expires_at(),
+                owner_fingerprint: candidate.owner_fingerprint,
+            },
+        );
+        TicketAdmission::Authorized(candidate.ticket_id)
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn authorize_candidate(
+        &mut self,
+        candidate: ValidationCandidate,
+        issuer: PeerId,
+        client: PeerId,
+        server: PeerId,
+        tenant: &Tenant,
+        service: &ServiceAdvertisementV1,
+        registration_revision: Option<RegistrationRevision>,
+        registration_expires_at: i64,
+        authorization_revision: u64,
+        open: &OpenProxyStreamV1,
+        now: i64,
+    ) -> TicketAdmission {
+        let Some(registration_revision) = registration_revision else {
+            return TicketAdmission::Rejected(PublicErrorCode::RegistryStaleRevision);
+        };
+        if registration_expires_at <= now || service.health() != p2x_protocol::Health::Ready {
+            return TicketAdmission::Rejected(PublicErrorCode::RegistryStaleRevision);
+        }
+        let selector_fingerprint = service.selector().fingerprint(tenant);
+        let issuer_bytes = issuer.to_bytes();
+        let client_bytes = client.to_bytes();
+        let server_bytes = server.to_bytes();
+        let claims = &candidate.claims;
+        if open.upstream_id != *service.upstream_id()
+            || open.registration_revision != registration_revision
+            || claims.issuer_exchange_peer_id() != issuer_bytes
+            || claims.client_peer_id() != client_bytes
+            || claims.server_peer_id() != server_bytes
+            || claims.tenant() != tenant.as_str()
+            || claims.upstream_id() != service.upstream_id().as_str()
+            || claims.selector_fingerprint() != selector_fingerprint
+            || claims.registration_revision() != registration_revision.get()
+            || claims.authorization_revision() != authorization_revision
+            || claims.permissions() != p2x_protocol::Scope::OpenProxyStream.bit()
+            || claims.max_streams() != 1
+        {
+            return TicketAdmission::Rejected(PublicErrorCode::AuthTicketInvalid);
+        }
+        self.consume_candidate(candidate, now)
+    }
+
     pub fn validate_and_consume(
         &mut self,
         ring: &VerificationKeyRing,
@@ -100,7 +199,6 @@ impl TicketAdmissionLedger {
         expected: &TicketValidation<'_>,
         owner_fingerprint: [u8; 32],
     ) -> TicketAdmission {
-        self.sweep(expected.now);
         let ticket = match ring.verify(envelope, expected) {
             Ok(ticket) => ticket,
             Err(p2x_protocol::ticket::TicketError::Expired) => {
@@ -108,21 +206,14 @@ impl TicketAdmissionLedger {
             }
             Err(_) => return TicketAdmission::Rejected(PublicErrorCode::AuthTicketInvalid),
         };
-        let ticket_id = ticket.ticket_id();
-        if self.replay.contains_key(&ticket_id) {
-            return TicketAdmission::Rejected(PublicErrorCode::AuthTicketReplayed);
-        }
-        if self.replay.len() >= self.capacity {
-            return TicketAdmission::Rejected(PublicErrorCode::LimitProxyStreams);
-        }
-        self.replay.insert(
-            ticket_id,
-            ReplayEntry {
-                expires_at: ticket.claims().expires_at(),
+        self.consume_candidate(
+            ValidationCandidate {
+                ticket_id: ticket.ticket_id(),
+                claims: ticket.claims().clone(),
                 owner_fingerprint,
             },
-        );
-        TicketAdmission::Authorized(ticket_id)
+            expected.now,
+        )
     }
     pub fn sweep(&mut self, now: i64) {
         let skew = self.clock_skew;

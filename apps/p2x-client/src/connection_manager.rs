@@ -3,7 +3,7 @@ use p2x_net::{ConnectionBook, ConnectionId, PathAttempt, PathDecision, PathEvent
 use p2x_protocol::Capabilities;
 use p2x_protocol::PublicErrorCode;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -24,7 +24,20 @@ struct PeerState {
     active: usize,
     last_used: u64,
     draining: bool,
+    relay_dial_generation: u64,
+    relay_dial_active: bool,
+    dcutr_generation: u64,
+    waiters: HashSet<u64>,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionSetupAction {
+    DialRelay { generation: u64 },
+    JoinRelayDial { generation: u64 },
+    ReuseRelay { connection: ConnectionId },
+    StartDcutr { generation: u64 },
+    Close { connection: ConnectionId },
+}
+
 pub struct ConnectionManager {
     exchange_peer_id: PeerId,
     policy: PathPolicy,
@@ -67,11 +80,104 @@ impl ConnectionManager {
                 active: 0,
                 last_used: self.sequence,
                 draining: false,
+                relay_dial_generation: 0,
+                relay_dial_active: false,
+                dcutr_generation: 0,
+                waiters: HashSet::new(),
             },
         );
         self.pending += 1;
         Ok(())
     }
+    pub fn begin_relay_setup(
+        &mut self,
+        server: PeerId,
+        waiter_id: u64,
+    ) -> Result<ConnectionSetupAction, PublicErrorCode> {
+        self.admit(server)?;
+        let state = self.peers.get_mut(&server).expect("admitted peer exists");
+        state.waiters.insert(waiter_id);
+        if let Some(connection) = state.book.relay(server).map(|record| record.connection_id) {
+            return Ok(ConnectionSetupAction::ReuseRelay { connection });
+        }
+        if state.relay_dial_active {
+            return Ok(ConnectionSetupAction::JoinRelayDial {
+                generation: state.relay_dial_generation,
+            });
+        }
+        state.relay_dial_generation = state.relay_dial_generation.saturating_add(1);
+        state.relay_dial_active = true;
+        Ok(ConnectionSetupAction::DialRelay {
+            generation: state.relay_dial_generation,
+        })
+    }
+
+    pub fn relay_dial_finished(&mut self, server: PeerId, generation: u64) -> bool {
+        let Some(state) = self.peers.get_mut(&server) else {
+            return false;
+        };
+        if state.relay_dial_generation != generation {
+            return false;
+        }
+        state.relay_dial_active = false;
+        true
+    }
+
+    pub fn begin_dcutr(&mut self, server: PeerId) -> Option<ConnectionSetupAction> {
+        let state = self.peers.get_mut(&server)?;
+        if state.book.direct(server).is_some() {
+            return None;
+        }
+        state.dcutr_generation = state.dcutr_generation.saturating_add(1);
+        Some(ConnectionSetupAction::StartDcutr {
+            generation: state.dcutr_generation,
+        })
+    }
+
+    pub fn generation_current(&self, server: PeerId, generation: u64) -> bool {
+        self.peers
+            .get(&server)
+            .is_some_and(|state| state.relay_dial_generation == generation)
+    }
+
+    pub fn release_waiter(&mut self, server: PeerId, waiter_id: u64) -> bool {
+        self.peers
+            .get_mut(&server)
+            .is_some_and(|state| state.waiters.remove(&waiter_id))
+    }
+
+    pub fn pool_close_actions(&mut self, server: PeerId) -> Vec<ConnectionSetupAction> {
+        let Some(state) = self.peers.get_mut(&server) else {
+            return Vec::new();
+        };
+        let mut keep = HashSet::new();
+        if let Some(record) = state.book.relay(server) {
+            keep.insert(record.connection_id);
+        }
+        for transport in [
+            p2x_net::connection_book::TransportKind::Quic,
+            p2x_net::connection_book::TransportKind::Tcp,
+        ] {
+            if let Some(record) = state.book.iter().find(|record| {
+                record.dcutr_confirmed
+                    && record.path == p2x_net::connection_book::PathKind::Direct(transport)
+            }) {
+                keep.insert(record.connection_id);
+            }
+        }
+        let surplus = state
+            .book
+            .iter()
+            .filter(|record| !keep.contains(&record.connection_id) && !record.closing)
+            .map(|record| record.connection_id)
+            .collect::<Vec<_>>();
+        surplus
+            .into_iter()
+            .filter(|connection| state.book.mark_closing(server, *connection))
+            .map(|connection| ConnectionSetupAction::Close { connection })
+            .collect()
+    }
+
     pub fn release(&mut self, server: PeerId) -> bool {
         let Some(state) = self.peers.get_mut(&server) else {
             return false;
@@ -133,6 +239,12 @@ impl ConnectionManager {
         if let Some(state) = self.peers.get_mut(&server) {
             state.active = state.active.saturating_sub(1);
         }
+    }
+
+    pub fn waiter_count(&self, server: PeerId) -> usize {
+        self.peers
+            .get(&server)
+            .map_or(0, |state| state.waiters.len())
     }
 
     pub fn direct(&self, server: PeerId) -> Option<ConnectionId> {
@@ -360,6 +472,50 @@ mod tests {
     }
 
     #[test]
+    fn relay_setup_singleflight_reuses_one_generation() {
+        let server = PeerId::random();
+        let mut manager = ConnectionManager::new(
+            PeerId::random(),
+            PathPolicy::default(),
+            SetupLimits {
+                max_peer_states: 1,
+                max_pending_setups: 4,
+                max_pending_per_server: 4,
+            },
+        );
+        assert_eq!(
+            manager.begin_relay_setup(server, 1).unwrap(),
+            ConnectionSetupAction::DialRelay { generation: 1 }
+        );
+        assert_eq!(
+            manager.begin_relay_setup(server, 2).unwrap(),
+            ConnectionSetupAction::JoinRelayDial { generation: 1 }
+        );
+        assert!(!manager.relay_dial_finished(server, 2));
+        assert!(manager.relay_dial_finished(server, 1));
+        assert_eq!(manager.waiter_count(server), 2);
+        assert!(manager.release_waiter(server, 1));
+        assert!(!manager.release_waiter(server, 1));
+    }
+
+    #[test]
+    fn stale_dial_generation_is_ignored() {
+        let server = PeerId::random();
+        let mut manager = ConnectionManager::new(
+            PeerId::random(),
+            PathPolicy::default(),
+            SetupLimits {
+                max_peer_states: 1,
+                max_pending_setups: 2,
+                max_pending_per_server: 2,
+            },
+        );
+        assert!(manager.begin_relay_setup(server, 1).is_ok());
+        assert!(!manager.generation_current(server, 2));
+        assert!(!manager.relay_dial_finished(server, 2));
+    }
+
+    #[test]
     fn manager_path_uses_confirmed_direct_before_relay() {
         let exchange = PeerId::random();
         let server = PeerId::random();
@@ -410,6 +566,42 @@ mod tests {
         manager.finish_path(server, Some(PathDecision::Direct(direct)));
         manager.finish_path(server, None);
         assert_eq!(manager.pending_count(), 0);
+    }
+
+    #[test]
+    fn pool_close_marks_surplus_connections_before_dispatch() {
+        let exchange = PeerId::random();
+        let server = PeerId::random();
+        let mut manager = ConnectionManager::new(
+            exchange,
+            PathPolicy::default(),
+            SetupLimits {
+                max_peer_states: 1,
+                max_pending_setups: 2,
+                max_pending_per_server: 2,
+            },
+        );
+        manager.admit(server).unwrap();
+        let now = Instant::now();
+        let first = ConnectionId::new_unchecked(1);
+        let second = ConnectionId::new_unchecked(2);
+        let relay = format!("/ip4/127.0.0.1/tcp/1/p2p/{exchange}/p2p-circuit/p2p/{server}")
+            .parse::<libp2p::Multiaddr>()
+            .unwrap();
+        let endpoint = |address| libp2p::core::ConnectedPoint::Dialer {
+            address,
+            role_override: libp2p::core::Endpoint::Dialer,
+            port_use: libp2p::core::transport::PortUse::New,
+        };
+        manager
+            .on_connection_established(server, first, &endpoint(relay.clone()), now)
+            .unwrap();
+        manager
+            .on_connection_established(server, second, &endpoint(relay), now)
+            .unwrap();
+        let closes = manager.pool_close_actions(server);
+        assert_eq!(closes.len(), 1);
+        assert!(manager.relay(server) == Some(first) || manager.relay(server) == Some(second));
     }
 
     #[test]

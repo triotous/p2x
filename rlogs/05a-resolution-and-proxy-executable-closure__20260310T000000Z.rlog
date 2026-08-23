@@ -44,4 +44,16 @@ validation:
 - cargo test -p p2x-client --all-targets --all-features: passed (19 tests).
 - cargo clippy -p p2x-client --all-targets --all-features -D warnings: passed.
 - Integration of finite multi-open dispatch remains in the next owner phase; no live case is claimed by this commit.
-commit: phase 6.4 pending review
+commit: phase 6.4 committed as 4aef483
+
+phase 6.5 connection ownership and server admission:
+- Added per-server relay dial generations, singleflight/join actions, DCUtR generation tracking, waiter release, connection reuse action, surplus close marking, and generation tests to ConnectionManager.
+- Added validated server proxy limit configuration and applied worker/replay settings to live behavior/channel ownership.
+- Added immutable ticket signature verification candidate and owner-side claim/live validation API while preserving the compatibility authorize path.
+- Added inbound behavior counters for lifecycle resource reporting.
+validation:
+- cargo fmt --all: passed.
+- cargo test p2x-client/p2x-server all targets/features: passed.
+- cargo clippy p2x-client/p2x-server all targets/features -D warnings: passed.
+- Full worker split is not claimed until main dispatch consumes ValidationCandidate directly.
+commit: phase 6.5 pending review
