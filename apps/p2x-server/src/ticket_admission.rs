@@ -169,6 +169,11 @@ impl TicketAdmissionLedger {
         if registration_expires_at <= now || service.health() != p2x_protocol::Health::Ready {
             return TicketAdmission::Rejected(PublicErrorCode::RegistryStaleRevision);
         }
+        if open.registration_revision != registration_revision
+            || candidate.claims.registration_revision() != registration_revision.get()
+        {
+            return TicketAdmission::Rejected(PublicErrorCode::RegistryStaleRevision);
+        }
         let selector_fingerprint = service.selector().fingerprint(tenant);
         let issuer_bytes = issuer.to_bytes();
         let client_bytes = client.to_bytes();
@@ -182,7 +187,6 @@ impl TicketAdmissionLedger {
             || claims.tenant() != tenant.as_str()
             || claims.upstream_id() != service.upstream_id().as_str()
             || claims.selector_fingerprint() != selector_fingerprint
-            || claims.registration_revision() != registration_revision.get()
             || claims.authorization_revision() != authorization_revision
             || claims.permissions() != p2x_protocol::Scope::OpenProxyStream.bit()
             || claims.max_streams() != 1
@@ -292,6 +296,74 @@ mod tests {
             TicketAdmission::Authorized([5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5])
         ));
         assert_eq!(admission.len(), 1);
+    }
+
+    #[test]
+    fn stale_current_registration_rejects_before_replay_consume() {
+        use std::collections::BTreeMap;
+        let signer = TicketSigner::from_seed([9; 32]);
+        let peer = libp2p::identity::Keypair::generate_ed25519();
+        let id = libp2p::PeerId::from_public_key(&peer.public());
+        let tenant = Tenant::new("tenant").unwrap();
+        let selector = p2x_protocol::UnscopedSelector::new(
+            p2x_protocol::ProtocolClass::Http,
+            BTreeMap::from([(
+                p2x_protocol::MetadataKey::new("service").unwrap(),
+                p2x_protocol::MetadataValue::new("orders").unwrap(),
+            )]),
+        )
+        .unwrap();
+        let service = ServiceAdvertisementV1::new(
+            p2x_protocol::UpstreamId::new("orders").unwrap(),
+            selector,
+            p2x_protocol::Health::Ready,
+        );
+        let claims = ConnectionTicketClaimsV1::new(
+            id.to_bytes().to_vec(),
+            tenant.as_str().into(),
+            id.to_bytes().to_vec(),
+            id.to_bytes().to_vec(),
+            "orders".into(),
+            [3; 32],
+            1,
+            2,
+            4,
+            10,
+            20,
+            [5; 16],
+            1,
+        )
+        .unwrap();
+        let envelope = signer.sign(&claims).unwrap();
+        let open = OpenProxyStreamV1 {
+            request_id: [1; 16],
+            ticket: p2x_protocol::RawTicket::new(envelope.as_bytes().to_vec()).unwrap(),
+            upstream_id: p2x_protocol::UpstreamId::new("orders").unwrap(),
+            registration_revision: RegistrationRevision::new(1).unwrap(),
+            ingress_kind: p2x_protocol::IngressKind::FixedTcp,
+        };
+        let mut admission = TicketAdmissionLedger::new(1, 0).unwrap();
+        assert_eq!(
+            admission.authorize_candidate(
+                ValidationCandidate {
+                    ticket_id: [5; 16],
+                    claims,
+                    owner_fingerprint: [7; 32],
+                },
+                id,
+                id,
+                id,
+                &tenant,
+                &service,
+                RegistrationRevision::new(2),
+                30,
+                2,
+                &open,
+                15,
+            ),
+            TicketAdmission::Rejected(PublicErrorCode::RegistryStaleRevision)
+        );
+        assert_eq!(admission.len(), 0);
     }
 
     #[test]

@@ -147,4 +147,10 @@ phase 7.2 limits process orchestration:
 - `resolve-limit` passed with held N=1 and a real second client receiving `limit.resolve_requests`; no extra ticket state was allocated.
 - `proxy-limit` passed with a held N=1 worker and a real second client receiving `limit.proxy_streams`; server emitted live worker and rejection evidence.
 validation: both limit cases passed; shell syntax, workspace fmt/clippy/tests passed.
+commit: 79098a0
+
+phase 7.3 stale revision classification:
+- Current server registration revision mismatches now return `registry.stale_revision` before replay consumption, while claim/tenant/authorization mismatches remain `auth.ticket_invalid`.
+- Added a regression test proving a stale current revision rejects without allocating replay state.
+validation: server Clippy and targeted stale-revision test passed.
 commit: pending phase review
