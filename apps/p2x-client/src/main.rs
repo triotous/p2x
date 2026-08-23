@@ -6,6 +6,8 @@ mod connection_manager;
 mod proxy_open;
 #[allow(dead_code)]
 mod resolver;
+#[allow(dead_code)]
+mod route_open;
 
 use clap::{Parser, ValueEnum};
 use connection_manager::{ConnectionManager, SetupLimits};
@@ -64,6 +66,14 @@ enum Path {
     Both,
     Direct,
     Relay,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OpenMutation {
+    None,
+    TicketByte,
+    UpstreamId,
+    Revision,
 }
 
 fn forced_path_matches(path: Path, observed_path: ProbePath) -> bool {
@@ -172,6 +182,20 @@ struct Args {
     worker_timeout_secs: u64,
     #[arg(long, default_value_t = false)]
     suppress_dcutr_result: bool,
+    #[arg(long, hide = true, value_parser = clap::value_parser!(u64).range(1..=128))]
+    test_proxy_open_count: Option<u64>,
+    #[arg(long, hide = true, value_parser = clap::value_parser!(u64).range(1..=128))]
+    test_proxy_concurrency: Option<u64>,
+    #[arg(long, hide = true, value_parser = clap::value_parser!(u64).range(0..=10_000))]
+    test_delay_after_resolve_ms: Option<u64>,
+    #[arg(long, hide = true)]
+    test_replay_first_ticket: bool,
+    #[arg(long, hide = true, value_enum, default_value_t = OpenMutation::None)]
+    test_open_mutation: OpenMutation,
+    #[arg(long, hide = true)]
+    test_fail_first_direct_open_before_handshake: bool,
+    #[arg(long, hide = true, value_parser = clap::value_parser!(u64).range(0..=10_000))]
+    test_hold_proxy_handshake_ms: Option<u64>,
     #[arg(long, default_value_t = false)]
     recover_after_failure: bool,
     #[arg(long)]
@@ -332,6 +356,7 @@ async fn main() -> io::Result<()> {
         && args.routes_file.is_none()
         && !args.finite_auth_check
         && !args.finite_relay_ping
+        && args.test_proxy_open_count.is_none()
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -344,6 +369,25 @@ async fn main() -> io::Result<()> {
         .map(config::ClientConfig::load)
         .transpose()
         .map_err(io::Error::other)?;
+    let route_test_hook_used = args.test_proxy_open_count.is_some()
+        || args.test_proxy_concurrency.is_some()
+        || args.test_delay_after_resolve_ms.is_some()
+        || args.test_replay_first_ticket
+        || !matches!(args.test_open_mutation, OpenMutation::None)
+        || args.test_fail_first_direct_open_before_handshake
+        || args.test_hold_proxy_handshake_ms.is_some();
+    if route_test_hook_used && std::env::var("P2X_ENABLE_TEST_HOOKS").ok().as_deref() != Some("1") {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "route test hooks require P2X_ENABLE_TEST_HOOKS=1",
+        ));
+    }
+    if args.test_proxy_concurrency.unwrap_or(1) > args.test_proxy_open_count.unwrap_or(1) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "proxy concurrency cannot exceed proxy open count",
+        ));
+    }
     if (args.test_hold_relay_seconds > 0
         || args.test_relay_circuit_count != 1
         || !args.test_relay_target.is_empty())
@@ -536,6 +580,7 @@ async fn main() -> io::Result<()> {
     let mut resolve_retried = false;
     let mut resolve_setup_deadline: Option<std::time::Instant> = None;
     let mut proxy_open: Option<OpenProxyStreamV1> = None;
+    let _route_owner = route_test_hook_used.then(route_open::RouteOpenSupervisor::default);
     let mut proxy_request_id: Option<[u8; 16]> = None;
     let mut selected_proxy_connection: Option<libp2p::swarm::ConnectionId> = None;
     let mut proxy_setup_deadline: Option<std::time::Instant> = None;

@@ -33,4 +33,15 @@ validation:
 - cargo fmt --all: passed.
 - cargo test p2x-client/p2x-exchange/p2x-protocol all targets/features: passed.
 - cargo clippy for changed client/exchange/protocol targets with -D warnings: passed.
-commit: phase 6.3 pending review
+commit: phase 6.3 committed as 8461981
+
+phase 6.4 bounded client route-open owner:
+- Added apps/p2x-client/src/route_open.rs with bounded per-open ownership, request correlation, absolute deadlines, one resolve retransmission, cancellation, waiter promotion, path-action conversion, pre-handshake fallback routing, and one fresh-ticket retry classification.
+- Added guarded CLI validation for route-open count/concurrency, delay, mutation, replay, direct-failure, and handshake-hold controls; normal defaults remain unchanged.
+- Added route-owner resource counters and lifecycle test-fault record type; existing main swarm remains the sole executor.
+validation:
+- cargo fmt --all: passed.
+- cargo test -p p2x-client --all-targets --all-features: passed (19 tests).
+- cargo clippy -p p2x-client --all-targets --all-features -D warnings: passed.
+- Integration of finite multi-open dispatch remains in the next owner phase; no live case is claimed by this commit.
+commit: phase 6.4 pending review
