@@ -949,8 +949,19 @@ async fn main() -> io::Result<()> {
                                     if terminal.is_some() {
                                         return Err(io::Error::other("proxy path setup failed"));
                                     }
-                                    if should_dial {
-                                        swarm.dial(address).map_err(io::Error::other)?;
+                                    if should_dial && let Err(error) = swarm.dial(address) {
+                                            let _ = manager.release(peer);
+                                            let message = error.to_string();
+                                            emitter.emit(&LifecycleRecord::OperationalError {
+                                                code: "peer.connection_failed",
+                                                message: &message,
+                                            })?;
+                                            emitter.terminal(&TerminalResult::simple(
+                                                &args.case_id,
+                                                "failed",
+                                                PublicErrorCode::PeerConnectionFailed.as_str(),
+                                            ))?;
+                                        return Ok(());
                                     }
                                 } else {
                                     swarm.dial(address.clone()).map_err(io::Error::other)?;
