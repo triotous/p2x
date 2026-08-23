@@ -28,9 +28,15 @@ fn valid_relay_address(address: &[u8], exchange: Option<PeerId>, server: PeerId)
             _ => None,
         })
         .collect::<Vec<_>>();
-    circuit.is_some()
-        && exchange.is_none_or(|exchange| peers.first() == Some(&exchange))
+    let Some(circuit) = circuit else {
+        return false;
+    };
+    peers.len() == 2
+        && peers.first().copied() == exchange
+        && peers.first().and_then(|_| parts.get(circuit.wrapping_sub(1)))
+            .is_some_and(|part| matches!(part, libp2p::multiaddr::Protocol::P2p(peer) if Some(*peer) == exchange))
         && peers.last() == Some(&server)
+        && matches!(parts.last(), Some(libp2p::multiaddr::Protocol::P2p(peer)) if *peer == server)
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedServiceMetadata {
@@ -373,6 +379,11 @@ mod tests {
             .unwrap()
             .to_vec();
         assert!(valid_relay_address(&address, Some(exchange), server));
+        let wrong = format!("/ip4/127.0.0.1/tcp/1/p2p/{server}/p2p-circuit/p2p/{server}")
+            .parse::<libp2p::Multiaddr>()
+            .unwrap()
+            .to_vec();
+        assert!(!valid_relay_address(&wrong, Some(exchange), server));
     }
 
     #[test]

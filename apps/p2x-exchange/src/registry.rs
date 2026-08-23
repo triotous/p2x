@@ -494,8 +494,16 @@ impl Registry {
         let relay_addresses = record
             .relay_addresses
             .iter()
-            .map(|address| address.as_bytes().to_vec())
-            .collect();
+            .filter_map(|address| {
+                address
+                    .parse::<libp2p::Multiaddr>()
+                    .ok()
+                    .map(|address| address.to_vec())
+            })
+            .collect::<Vec<_>>();
+        if relay_addresses.is_empty() {
+            return Err(RegistryError::Offline);
+        }
         Ok(ResolvedRegistration {
             server_peer_id: record.peer_id,
             tenant: record.tenant.clone(),
