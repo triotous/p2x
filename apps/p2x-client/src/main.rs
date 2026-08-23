@@ -683,6 +683,11 @@ async fn main() -> io::Result<()> {
                             }
                         }
                         if target_peer == Some(peer_id) {
+                            if let Some(manager) = connection_manager.as_mut()
+                                && proxy_server == Some(peer_id)
+                            {
+                                manager.on_connection_established(peer_id, connection_id, &endpoint, std::time::Instant::now()).map_err(io::Error::other)?;
+                            }
                             if let Err(error) = connections.on_connection_established(peer_id, connection_id, &endpoint, std::time::Instant::now()) {
                                 swarm.close_connection(connection_id);
                                 let message = error.to_string();
@@ -825,15 +830,17 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Proxy(ProxyOutput::OutboundOpened { request_id, peer_id, connection_id, stream })) if pending_proxy == Some(request_id) => {
                         let open = proxy_open.take().ok_or_else(|| io::Error::other("proxy stream opened without grant"))?;
+                        let selected = if selected_proxy_connection == Some(connection_id) {
+                            PathDecision::Direct(connection_id)
+                        } else {
+                            PathDecision::Relay(connection_id)
+                        };
                         if let Some(manager) = connection_manager.as_mut() {
-                            manager.finish_path(peer_id, Some(if selected_proxy_connection == Some(connection_id) {
-                                PathDecision::Direct(connection_id)
-                            } else {
-                                PathDecision::Relay(connection_id)
-                            }));
+                            manager.finish_path(peer_id, Some(selected));
                         }
                         if let Some(current) = proxy_attempt.as_mut() {
                             let _ = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ExactOpenSucceeded { request_id: PathRequestId(request_id.0), connection: connection_id } });
+                            let _ = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::PayloadAccepted });
                         }
 
                         let tx = proxy_result_tx.clone();
@@ -853,6 +860,9 @@ async fn main() -> io::Result<()> {
                                 continue;
                             }
                         }
+                        if let Some(manager) = connection_manager.as_mut() {
+                            let _ = manager.release(peer_id);
+                        }
                         emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code))?;
                         return Ok(());
                     }
@@ -867,6 +877,11 @@ async fn main() -> io::Result<()> {
                         return Ok(());
                     }
                     SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => {
+                        if let Some(manager) = connection_manager.as_mut()
+                            && proxy_server == Some(peer_id)
+                        {
+                            manager.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?;
+                        }
                         connections.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?;
                         if let Some(current) = attempt.as_mut() {
                             let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ConnectionClosed(connection_id) });
@@ -954,6 +969,11 @@ async fn main() -> io::Result<()> {
                         }
                         match event.result {
                             Ok(connection_id) => {
+                                if let Some(manager) = connection_manager.as_mut()
+                                    && proxy_server == Some(event.remote_peer_id)
+                                {
+                                    manager.on_dcutr_succeeded(event.remote_peer_id, connection_id, std::time::Instant::now()).map_err(io::Error::other)?;
+                                }
                                 connections.on_dcutr_succeeded(event.remote_peer_id, connection_id, std::time::Instant::now()).map_err(io::Error::other)?;
                                 if target_peer == Some(event.remote_peer_id)
                                     && forced_path_matches(args.path, ProbePath::Direct)
