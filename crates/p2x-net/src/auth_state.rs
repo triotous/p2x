@@ -685,6 +685,35 @@ mod tests {
     const AUTH: [u8; 16] = [1; 16];
     const PING: [u8; 16] = [2; 16];
     const SESSION: [u8; 16] = [3; 16];
+    #[allow(clippy::too_many_arguments)]
+    fn auth_context(
+        state: &mut AuthState,
+        request_id: [u8; 16],
+        session_id: [u8; 16],
+        expires_at: i64,
+        ping_request_id: [u8; 16],
+        nonce: u64,
+        now: i64,
+        tenant: Tenant,
+        role: Role,
+        scopes: u32,
+        quota: QuotaProfile,
+        revision: u64,
+    ) -> AuthAction {
+        state.authenticated_with_context(
+            request_id,
+            session_id,
+            expires_at,
+            tenant,
+            role,
+            scopes,
+            quota,
+            revision,
+            ping_request_id,
+            nonce,
+            now,
+        )
+    }
     fn auth(
         state: &mut AuthState,
         request_id: [u8; 16],
@@ -694,18 +723,19 @@ mod tests {
         nonce: u64,
         now: i64,
     ) -> AuthAction {
-        state.authenticated_with_context(
+        auth_context(
+            state,
             request_id,
             session_id,
             expires_at,
+            ping_request_id,
+            nonce,
+            now,
             Tenant::new("tenant").unwrap(),
             Role::Client,
             Scope::OpenProxyStream.bit(),
             QuotaProfile::new("standard").unwrap(),
             1,
-            ping_request_id,
-            nonce,
-            now,
         )
     }
     #[test]
@@ -813,6 +843,38 @@ mod tests {
         );
         auth(&mut state, [4; 16], [5; 16], 200, [6; 16], 8, 50);
         assert_eq!(state.current_session_id(99), Some(SESSION));
+    }
+
+    #[test]
+    fn committed_session_retains_the_complete_principal_context() {
+        let mut state = AuthState::new();
+        state.connected(AUTH, 0);
+        let tenant = Tenant::new("tenant-a").unwrap();
+        let quota = QuotaProfile::new("standard").unwrap();
+        auth_context(
+            &mut state,
+            AUTH,
+            SESSION,
+            100,
+            PING,
+            7,
+            0,
+            tenant.clone(),
+            Role::Client,
+            Scope::OpenProxyStream.bit() | Scope::ReserveRelay.bit(),
+            quota.clone(),
+            42,
+        );
+        assert_eq!(state.pong(PING, 7), AuthAction::Ready);
+        let lease = state.current_session(99).unwrap();
+        assert_eq!(lease.session_id(), SESSION);
+        assert_eq!(lease.tenant(), &tenant);
+        assert_eq!(lease.role(), Role::Client);
+        assert!(lease.has_scope(Scope::ReserveRelay));
+        assert_eq!(lease.quota_profile(), &quota);
+        assert_eq!(lease.authorization_revision(), 42);
+        assert_eq!(lease.established_at(), 0);
+        assert_eq!(lease.expires_at(), 100);
     }
 
     #[test]

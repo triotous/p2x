@@ -177,9 +177,10 @@ impl ProxyStreamBehaviour {
         self.release_inbound(peer_id, Some(connection_id));
     }
     fn release_inbound(&mut self, peer_id: PeerId, connection_id: Option<ConnectionId>) {
-        if let Some(connection_id) = connection_id
-            && let Some(count) = self.inbound_connections.get_mut(&(peer_id, connection_id))
-        {
+        if let Some(connection_id) = connection_id {
+            let Some(count) = self.inbound_connections.get_mut(&(peer_id, connection_id)) else {
+                return;
+            };
             *count = count.saturating_sub(1);
             if *count == 0 {
                 self.inbound_connections.remove(&(peer_id, connection_id));
