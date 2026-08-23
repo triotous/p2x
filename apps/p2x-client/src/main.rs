@@ -860,9 +860,6 @@ async fn main() -> io::Result<()> {
                                 continue;
                             }
                         }
-                        if let Some(manager) = connection_manager.as_mut() {
-                            let _ = manager.release(peer_id);
-                        }
                         emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code))?;
                         return Ok(());
                     }
@@ -883,6 +880,26 @@ async fn main() -> io::Result<()> {
                             manager.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?;
                         }
                         connections.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?;
+                        if let Some(current) = proxy_attempt.as_mut()
+                            && proxy_server == Some(peer_id)
+                        {
+                            let actions = current.apply(PathEvent {
+                                attempt_id: current.id,
+                                now: std::time::Instant::now(),
+                                kind: PathEventKind::ConnectionClosed(connection_id),
+                            });
+                            if !actions.is_empty() {
+                                if let Some(manager) = connection_manager.as_mut() {
+                                    let _ = manager.release(peer_id);
+                                }
+                                proxy_open = None;
+                                pending_proxy = None;
+                                emitter.emit(&LifecycleRecord::OperationalError {
+                                    code: "peer.connection_failed",
+                                    message: "proxy path connection closed",
+                                })?;
+                            }
+                        }
                         if let Some(current) = attempt.as_mut() {
                             let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ConnectionClosed(connection_id) });
                             drive_path_actions(probe_mut(&mut swarm)?, current, peer_id, &emitter, actions, &mut launched)?;
@@ -973,6 +990,15 @@ async fn main() -> io::Result<()> {
                                     && proxy_server == Some(event.remote_peer_id)
                                 {
                                     manager.on_dcutr_succeeded(event.remote_peer_id, connection_id, std::time::Instant::now()).map_err(io::Error::other)?;
+                                    if let (Some(current), Some(open), Some(deadline)) = (proxy_attempt.as_mut(), proxy_open.as_ref().cloned(), proxy_setup_deadline) {
+                                        let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::DirectReady(connection_id) });
+                                        let proxy = swarm.behaviour_mut().proxy_stream.as_mut().ok_or_else(|| io::Error::other("proxy is unavailable in product mode"))?;
+                                        let mut terminal = None;
+                                        drive_proxy_path_actions(proxy, current, event.remote_peer_id, &open, deadline, &emitter, actions, &mut pending_proxy, &mut selected_proxy_connection, &mut terminal)?;
+                                        if terminal.is_some() {
+                                            return Err(io::Error::other("proxy path setup failed"));
+                                        }
+                                    }
                                 }
                                 connections.on_dcutr_succeeded(event.remote_peer_id, connection_id, std::time::Instant::now()).map_err(io::Error::other)?;
                                 if target_peer == Some(event.remote_peer_id)
