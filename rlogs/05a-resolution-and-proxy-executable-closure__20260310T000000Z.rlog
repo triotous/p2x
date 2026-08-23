@@ -159,4 +159,13 @@ phase 7.4 restart-safe server request IDs:
 - Replaced server process-local request-ID restart from `1` with a fresh random nonzero start, preventing stale exchange idempotency collisions after a same-identity server restart.
 - Targeted server stale-revision admission test passed; workspace fmt/clippy/tests passed.
 - Initial server-restart process attempt exposed a second recovery issue: replacement server registration events and client fresh resolve still need deterministic owner correlation.
+commit: 109204b
+
+phase 7.5 restart/recovery process orchestration:
+- Converted Resolve-to-Open delay into a nonblocking finite diagnostic stage so the swarm continues auth, reconnect, and registry processing while a grant is held.
+- Added reusable exchange/server process starters and restart choreography with persisted identities, old registration cleanup, replacement registration checks, and fresh response fingerprints.
+- Added client recovery for restart-time auth-session rejection and stale/ambiguous proxy failures.
+- `server-restart` now passes end to end: old registration is removed, the same server identity re-registers with a new revision, and the existing client fresh-resolves and authorizes.
+- `exchange-restart` remains under active verification.
+validation: server-restart passed; workspace fmt/clippy/tests passed.
 commit: pending phase review

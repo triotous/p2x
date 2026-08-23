@@ -596,6 +596,9 @@ try:
         if case == "resolve-limit":
             secondary_args += ["--test-delay-after-resolve-ms", "1000"]
         secondary_log = run.start_client("client2", run.exchange_address, secondary_args, identity_name="client2")
+    elif case in ("registration-revision-change", "server-restart", "exchange-restart"):
+        client_log = run.start_client("client", run.exchange_address, ["--finite-proxy-check", "--test-delay-after-resolve-ms", "3000", "--recover-after-failure"], env=client_env)
+        secondary_log = None
     else:
         client_log = run.start_client("client", run.exchange_address, client_args, env=client_env)
         secondary_log = None
@@ -621,6 +624,37 @@ try:
         wait_for(exchange_log, lambda row: row.get("event") == "exchange_resources" and all(row.get(key) == 0 for key in ("sessions", "relay_admissions", "reservations", "circuits", "registrations", "selector_owners", "auth_requests", "registry_requests")), 15)
         run.stop(exchange_log)
         finish_limits(run, client_log, secondary_log, server_log, exchange_log)
+    elif case in ("registration-revision-change", "server-restart", "exchange-restart"):
+        wait_for(client_log, lambda row: row.get("event") == "resolution_outcome" and row.get("resolved") is True, 45)
+        old_server = server_log
+        old_exchange = exchange_log
+        old_revisions = [row.get("revision") for row in rows(exchange_log) if row.get("event") == "registry_transition" and row.get("code") == "registry.registered" and row.get("revision") is not None]
+        if case == "exchange-restart":
+            run.stop(exchange_log, graceful=False)
+            exchange_log = run.start_exchange("exchange-restarted", exchange_args)
+            wait_for(exchange_log, lambda row: row.get("event") == "listener_ready", 45)
+            wait_for(exchange_log, lambda row: row.get("event") == "registry_transition" and row.get("code") == "registry.registered" and row.get("revision") is not None, 45)
+            wait_for(server_log, lambda row: row.get("event") == "server_readiness" and row.get("ready") is True, 45)
+        else:
+            run.stop(server_log, graceful=False)
+            wait_for(exchange_log, lambda row: row.get("event") == "exchange_resources" and row.get("registrations") == 0, 15)
+            server_log = run.start_server("server-restarted", run.exchange_address, server_args)
+            wait_for(exchange_log, lambda row: row.get("event") == "registry_transition" and row.get("code") == "registry.registered" and row.get("revision") not in old_revisions, 45)
+            wait_for(server_log, lambda row: row.get("event") == "server_readiness" and row.get("ready") is True, 45)
+        terminal = wait_for(client_log, lambda row: row.get("event") == "terminal", 45)
+        if terminal.get("code") != expected:
+            raise CaseFailure(f"client expected {expected}, got {terminal.get('code')}")
+        run.stop(client_log)
+        if case == "exchange-restart":
+            run.stop(server_log)
+        else:
+            run.stop(server_log)
+        if exchange_log != old_exchange:
+            run.stop(exchange_log)
+        else:
+            wait_for(exchange_log, lambda row: row.get("event") == "exchange_resources" and all(row.get(key) == 0 for key in ("sessions", "relay_admissions", "reservations", "circuits", "registrations", "selector_owners", "auth_requests", "registry_requests")), 15)
+            run.stop(exchange_log)
+        finish_restart(run, client_log, [old_server, server_log], [old_exchange, exchange_log])
     else:
         terminal = wait_for(client_log, lambda row: row.get("event") == "terminal", 45)
         if terminal.get("code") != expected:

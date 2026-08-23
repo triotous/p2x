@@ -915,6 +915,7 @@ async fn main() -> io::Result<()> {
                                 && matches!(
                                     code,
                                     PublicErrorCode::RegistryStaleRevision
+                                        | PublicErrorCode::AuthSessionRequired
                                         | PublicErrorCode::PeerConnectionFailed
                                         | PublicErrorCode::PeerSetupTimeout
                                         | PublicErrorCode::ExchangeTimeout
