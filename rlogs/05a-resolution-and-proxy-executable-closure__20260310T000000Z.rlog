@@ -1,0 +1,24 @@
+session: 20260310T000000Z
+plan: plan/05a-resolution-and-proxy-executable-closure.md
+status: started
+baseline: 65c7236 (plan added), reviewed implementation baseline 33f32ad
+actions:
+- Read coding-rust instructions and Plan 05a; plan file will not be modified.
+- Inspected client resolver/connection/proxy ownership, exchange resolution, server ticket admission/proxy worker, protocol codecs, fuzz targets, and resolution runner.
+- Ran cargo test --workspace --all-targets --all-features: passed.
+decisions:
+- Work will be split by ordered plan sections into separate commits.
+- Keep changes narrow; use existing crates and test-hook convention.
+- Maintain this append-only log and include it with the related phase commit.
+blockers: none
+
+phase 6.2 protocol vectors and framed fuzz coverage:
+- Replaced descriptive resolve/proxy JSON with fixed body/frame hex vectors and lengths.
+- Added protocol tests for all committed variants, exact re-encoding, frame lengths, trailing bytes, and unknown discriminants.
+- Extended proxy fuzz target to call p2x-net async framed readers; added valid and malformed framed corpus seeds for resolve/proxy.
+- Removed temporary vector-generation example after deriving committed bytes.
+validation:
+- cargo fmt --all: passed.
+- cargo test -p p2x-protocol --lib: passed (27 tests).
+- cargo test -p p2x-net --all-targets --all-features: pending before commit.
+commit: phase 6.2 pending review

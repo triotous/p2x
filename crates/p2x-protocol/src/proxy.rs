@@ -278,6 +278,73 @@ impl ProxyOpenResponseV1 {
 mod tests {
     use super::*;
     #[test]
+    fn committed_vectors_decode_and_reencode_byte_identically() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/proxy-v1.json")).unwrap();
+        for vector in vectors["vectors"].as_array().unwrap() {
+            let body = vector["body_hex"].as_str().unwrap();
+            let bytes = (0..body.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&body[index..index + 2], 16).unwrap())
+                .collect::<Vec<_>>();
+            let decoded_open = OpenProxyStreamV1::decode(&bytes);
+            let decoded_response = ProxyOpenResponseV1::decode(&bytes);
+            if vector["name"] == "open" {
+                assert_eq!(
+                    decoded_open.as_ref().unwrap().canonical_bytes().unwrap(),
+                    bytes
+                );
+            } else {
+                assert_eq!(
+                    decoded_response
+                        .as_ref()
+                        .unwrap()
+                        .canonical_bytes()
+                        .unwrap(),
+                    bytes
+                );
+            }
+            let frame = vector["frame_hex"].as_str().unwrap();
+            let frame_bytes = (0..frame.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&frame[index..index + 2], 16).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                u32::from_be_bytes(frame_bytes[..4].try_into().unwrap()) as usize,
+                bytes.len()
+            );
+            assert_eq!(&frame_bytes[4..], bytes);
+            assert_eq!(vector["body_len"].as_u64().unwrap() as usize, bytes.len());
+            assert_eq!(
+                vector["frame_len"].as_u64().unwrap() as usize,
+                frame_bytes.len()
+            );
+        }
+    }
+
+    #[test]
+    fn vector_mutations_and_trailing_data_are_rejected() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/proxy-v1.json")).unwrap();
+        let body = vectors["vectors"][1]["body_hex"].as_str().unwrap();
+        let mut bytes = (0..body.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&body[index..index + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        bytes.push(0);
+        assert_eq!(
+            ProxyOpenResponseV1::decode(&bytes),
+            Err(ProxyProtocolError::Malformed)
+        );
+        let mut unknown = bytes[..bytes.len() - 1].to_vec();
+        unknown[1] = 9;
+        assert_eq!(
+            ProxyOpenResponseV1::decode(&unknown),
+            Err(ProxyProtocolError::Malformed)
+        );
+    }
+
+    #[test]
     fn open_and_all_responses_round_trip() {
         let open = OpenProxyStreamV1 {
             request_id: [1; 16],
