@@ -162,6 +162,9 @@ impl ConnectionManager {
     pub fn peer_count(&self) -> usize {
         self.peers.len()
     }
+    pub fn has_peer(&self, server: PeerId) -> bool {
+        self.peers.contains_key(&server)
+    }
     pub fn pending_count(&self) -> usize {
         self.pending
     }

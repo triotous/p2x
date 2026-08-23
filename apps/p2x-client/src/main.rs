@@ -750,7 +750,7 @@ async fn main() -> io::Result<()> {
                             }
                         }
                         if let Some(manager) = connection_manager.as_mut()
-                            && peer_id != expected_exchange
+                            && target_peer == Some(peer_id)
                             && let Err(error) = manager.on_connection_established(
                                 peer_id,
                                 connection_id,
@@ -1013,7 +1013,7 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => {
                         if let Some(manager) = connection_manager.as_mut()
-                            && peer_id != expected_exchange
+                            && manager.has_peer(peer_id)
                         {
                             manager.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?;
                         }
@@ -1125,7 +1125,7 @@ async fn main() -> io::Result<()> {
                         match event.result {
                             Ok(connection_id) => {
                                 if let Some(manager) = connection_manager.as_mut()
-                                    && event.remote_peer_id != expected_exchange
+                                    && manager.has_peer(event.remote_peer_id)
                                 {
                                     manager
                                         .on_dcutr_succeeded(
