@@ -498,7 +498,7 @@ async fn main() -> io::Result<()> {
                 if config.mode == RuntimeMode::Product {
                     match availability.tick(unix_now()) {
                         availability::AvailabilityAction::Refresh if !args.test_suppress_registry_refresh && !registration_requested && registry_operation.is_none() => {
-                            if let (Some(peer_id), Some(session_id), Some(revision), Some(services)) = (relay_peer_id, auth_state.current_session(unix_now()), registration_revision, service_config.as_ref()) {
+                            if let (Some(peer_id), Some(session_id), Some(revision), Some(services)) = (relay_peer_id, auth_state.current_session_id(unix_now()), registration_revision, service_config.as_ref()) {
                                 let operation = new_refresh(&mut request_ids, session_id, instance_id, revision, services.requested_lease_seconds, reservation.generation, services.service_set_hash)?;
                                 let outbound = send_registry(&mut swarm, peer_id, &operation);
                                 if pending_registry.begin(outbound) { registry_operation = Some(operation); registration_requested = true; }
@@ -510,7 +510,7 @@ async fn main() -> io::Result<()> {
                             emitter.emit(&LifecycleRecord::ServerReadiness { ready: false, generation: snapshot.generation, auth: snapshot.auth, reservation: snapshot.reservation, registration: snapshot.registration })?;
                             if args.test_suppress_registry_refresh
                                 && !late_refresh_sent
-                                && let (Some(peer_id), Some(session_id), Some(revision), Some(services)) = (relay_peer_id, auth_state.current_session(unix_now()), registration_revision, service_config.as_ref())
+                                && let (Some(peer_id), Some(session_id), Some(revision), Some(services)) = (relay_peer_id, auth_state.current_session_id(unix_now()), registration_revision, service_config.as_ref())
                             {
                                 late_refresh_sent = true;
                                 let operation = new_refresh(&mut request_ids, session_id, instance_id, revision, services.requested_lease_seconds, reservation.generation, services.service_set_hash)?;
@@ -581,7 +581,7 @@ async fn main() -> io::Result<()> {
                         if address.contains("p2p-circuit") && let (Some(peer_id), Some(connection_id)) = (relay_peer_id, relay_connection_id) {
                             reservation.apply(ReservationEvent::RelayAddressConfirmed { generation: reservation_generation, peer_id, connection_id, listener_id, address: address.parse().map_err(io::Error::other)? }).map_err(io::Error::other)?;
                             if config.mode == RuntimeMode::Product && reservation.is_ready() && !registration_requested && registry_operation.is_none()
-                                && let Some(session_id) = auth_state.current_session(unix_now())
+                                && let Some(session_id) = auth_state.current_session_id(unix_now())
                             {
                                 let operation = new_register(&mut request_ids, session_id, instance_id, service_config.as_ref().expect("product services"), reservation.generation)?;
                                 let outbound = send_registry(&mut swarm, peer_id, &operation);
@@ -733,9 +733,9 @@ async fn main() -> io::Result<()> {
                         }
                         let message = format!("{reason:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "listener.closed", message: &message })?;
                     }
-                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Authenticated { session_id, request_id, expires_at, .. } }, .. })) if pending_auth.complete(&outbound_id) => {
+                    SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Authenticated { session_id, request_id, tenant, role, scopes, quota_profile, authorization_revision, expires_at, .. } }, .. })) if pending_auth.complete(&outbound_id) => {
                         let next_ping_id = request_ids.allocate().map_err(io::Error::other)?;
-                        if let AuthAction::Ping { request_id: ping_id, session_id, nonce } = auth_state.authenticated(request_id, session_id, expires_at, next_ping_id, 1, unix_now()) {
+                        if let AuthAction::Ping { request_id: ping_id, session_id, nonce } = auth_state.authenticated_with_context(request_id, session_id, expires_at, tenant, role, scopes, quota_profile, authorization_revision, next_ping_id, 1, unix_now()) {
                             ping_request_id = ping_id;
                             let outbound = swarm.behaviour_mut().auth.send_request(&peer, AuthRequest::Ping { request_id: ping_id, session_id, nonce });
                             if !pending_auth.begin(outbound) { return Err(io::Error::other("auth outbound request limit exceeded")); }
@@ -747,7 +747,7 @@ async fn main() -> io::Result<()> {
                         if config.mode == RuntimeMode::Product
                             && args.test_register_without_reservation
                             && registry_operation.is_none()
-                            && let (Some(session_id), Some(services)) = (auth_state.current_session(unix_now()), service_config.as_ref())
+                            && let (Some(session_id), Some(services)) = (auth_state.current_session_id(unix_now()), service_config.as_ref())
                         {
                             let operation = new_register(&mut request_ids, session_id, instance_id, services, reservation.generation)?;
                             let outbound = send_registry(&mut swarm, peer, &operation);
@@ -769,7 +769,7 @@ async fn main() -> io::Result<()> {
                             && registration_revision.is_none()
                             && !registration_requested
                             && registry_operation.is_none()
-                            && let (Some(session_id), Some(services)) = (auth_state.current_session(unix_now()), service_config.as_ref())
+                            && let (Some(session_id), Some(services)) = (auth_state.current_session_id(unix_now()), service_config.as_ref())
                         {
                             let operation = new_register(&mut request_ids, session_id, instance_id, services, reservation.generation)?;
                             let outbound = send_registry(&mut swarm, peer, &operation);
@@ -805,7 +805,7 @@ async fn main() -> io::Result<()> {
                             if config.mode == RuntimeMode::Product {
                                 let _ = availability.reservation_ready(reservation.generation);
                             }
-                            if config.mode == RuntimeMode::Product && reservation.is_ready() && !registration_requested && registry_operation.is_none() && let Some(session_id) = auth_state.current_session(unix_now()) {
+                            if config.mode == RuntimeMode::Product && reservation.is_ready() && !registration_requested && registry_operation.is_none() && let Some(session_id) = auth_state.current_session_id(unix_now()) {
                                 let operation = new_register(&mut request_ids, session_id, instance_id, service_config.as_ref().expect("product services"), reservation.generation)?;
                                 let outbound = send_registry(&mut swarm, peer_id, &operation);
                                 if !pending_registry.begin(outbound) { return Err(io::Error::other("registry outbound request limit exceeded")); }
@@ -876,7 +876,7 @@ async fn main() -> io::Result<()> {
                                         let _ = availability.registration_lost();
                                         registration_expires_at = 0;
                                         registration_revision = None;
-                                        if let (Some(session_id), Some(services)) = (auth_state.current_session(now), service_config.as_ref()) {
+                                        if let (Some(session_id), Some(services)) = (auth_state.current_session_id(now), service_config.as_ref()) {
                                             operation = new_register(&mut request_ids, session_id, instance_id, services, reservation.generation)?;
                                             registry_retry_due_at = Some(registry_retry_at(&mut operation, unix_millis(), random_jitter_per_mille()?));
                                             registry_operation = Some(operation);
@@ -884,7 +884,7 @@ async fn main() -> io::Result<()> {
                                     }
                                     PublicErrorCode::AuthSessionRequired | PublicErrorCode::AuthSessionExpired => {
                                         registration_revision = None;
-                                        if let (Some(session_id), Some(services)) = (auth_state.current_session(now), service_config.as_ref())
+                                        if let (Some(session_id), Some(services)) = (auth_state.current_session_id(now), service_config.as_ref())
                                             && session_id != operation.session_id()
                                         {
                                             operation = new_register(&mut request_ids, session_id, instance_id, services, reservation.generation)?;
@@ -991,7 +991,7 @@ async fn main() -> io::Result<()> {
     if config.mode == RuntimeMode::Product
         && let (Some(peer_id), Some(session_id), Some(revision)) = (
             relay_peer_id,
-            auth_state.current_session(unix_now()),
+            auth_state.current_session_id(unix_now()),
             registration_revision,
         )
         && let Ok(operation) = new_withdraw(

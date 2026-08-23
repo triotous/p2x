@@ -5,6 +5,31 @@ pub const SETUP_BUDGET: Duration = Duration::from_secs(20);
 pub const DIRECT_PREFERENCE: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PathPolicy {
+    pub direct_preference: Duration,
+    pub setup_budget: Duration,
+}
+impl Default for PathPolicy {
+    fn default() -> Self {
+        Self {
+            direct_preference: DIRECT_PREFERENCE,
+            setup_budget: SETUP_BUDGET,
+        }
+    }
+}
+impl PathPolicy {
+    pub fn new(direct_preference: Duration, setup_budget: Duration) -> Option<Self> {
+        if setup_budget.is_zero() || direct_preference >= setup_budget {
+            return None;
+        }
+        Some(Self {
+            direct_preference,
+            setup_budget,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AttemptId(pub u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,20 +139,26 @@ pub struct PathAttempt {
     pub setup_deadline: Instant,
     pub state: PathState,
     relay_connection: Option<ConnectionId>,
+    direct_preference: Duration,
 }
 
 impl PathAttempt {
     pub fn new(now: Instant) -> Self {
-        Self::with_id(AttemptId(0), now)
+        Self::with_policy(AttemptId(0), now, PathPolicy::default())
     }
 
     pub fn with_id(id: AttemptId, now: Instant) -> Self {
+        Self::with_policy(id, now, PathPolicy::default())
+    }
+
+    pub fn with_policy(id: AttemptId, now: Instant, policy: PathPolicy) -> Self {
         Self {
             id,
             started_at: now,
-            setup_deadline: now + SETUP_BUDGET,
+            setup_deadline: now + policy.setup_budget,
             state: PathState::Absent,
             relay_connection: None,
+            direct_preference: policy.direct_preference,
         }
     }
 
@@ -265,7 +296,7 @@ impl PathAttempt {
     fn wait_for_direct(&mut self, relay_id: ConnectionId, now: Instant) {
         self.state = PathState::DirectWaiting {
             relay_id,
-            direct_deadline: (now + DIRECT_PREFERENCE).min(self.setup_deadline),
+            direct_deadline: (now + self.direct_preference).min(self.setup_deadline),
         };
     }
 

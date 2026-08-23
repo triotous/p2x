@@ -1,4 +1,4 @@
-use p2x_protocol::PublicErrorCode;
+use p2x_protocol::{PublicErrorCode, QuotaProfile, Role, Scope, Tenant};
 use std::{collections::HashSet, hash::Hash};
 
 pub const AUTH_TIMEOUT_SECONDS: i64 = 5;
@@ -139,6 +139,69 @@ impl RedialBackoff {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionLease {
+    session_id: [u8; 16],
+    tenant: Tenant,
+    role: Role,
+    scopes: u32,
+    quota_profile: QuotaProfile,
+    authorization_revision: u64,
+    established_at: i64,
+    expires_at: i64,
+}
+impl SessionLease {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_id: [u8; 16],
+        tenant: Tenant,
+        role: Role,
+        scopes: u32,
+        quota_profile: QuotaProfile,
+        authorization_revision: u64,
+        established_at: i64,
+        expires_at: i64,
+    ) -> Self {
+        Self {
+            session_id,
+            tenant,
+            role,
+            scopes,
+            quota_profile,
+            authorization_revision,
+            established_at,
+            expires_at,
+        }
+    }
+    pub const fn session_id(&self) -> [u8; 16] {
+        self.session_id
+    }
+    pub fn tenant(&self) -> &Tenant {
+        &self.tenant
+    }
+    pub const fn role(&self) -> Role {
+        self.role
+    }
+    pub const fn scopes(&self) -> u32 {
+        self.scopes
+    }
+    pub fn quota_profile(&self) -> &QuotaProfile {
+        &self.quota_profile
+    }
+    pub const fn authorization_revision(&self) -> u64 {
+        self.authorization_revision
+    }
+    pub const fn established_at(&self) -> i64 {
+        self.established_at
+    }
+    pub const fn expires_at(&self) -> i64 {
+        self.expires_at
+    }
+    pub const fn has_scope(&self, scope: Scope) -> bool {
+        self.scopes & scope.bit() != 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthPhase {
     Disconnected,
@@ -191,7 +254,7 @@ pub enum AuthAction {
     Terminal(PublicErrorCode),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthState {
     phase: AuthPhase,
     attempts: u32,
@@ -199,6 +262,8 @@ pub struct AuthState {
     pending_session_expires_at: i64,
     session_started_at: i64,
     pending_session_started_at: i64,
+    committed: Option<SessionLease>,
+    pending: Option<SessionLease>,
 }
 impl Default for AuthState {
     fn default() -> Self {
@@ -214,6 +279,8 @@ impl AuthState {
             pending_session_expires_at: 0,
             session_started_at: 0,
             pending_session_started_at: 0,
+            committed: None,
+            pending: None,
         }
     }
     pub const fn phase(&self) -> AuthPhase {
@@ -250,6 +317,35 @@ impl AuthState {
         nonce: u64,
         now: i64,
     ) -> AuthAction {
+        self.authenticated_with_context(
+            request_id,
+            session_id,
+            expires_at,
+            Tenant::new("unknown").expect("valid tenant"),
+            Role::Client,
+            Scope::OpenProxyStream.bit(),
+            QuotaProfile::new("standard").expect("valid quota"),
+            0,
+            ping_request_id,
+            nonce,
+            now,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn authenticated_with_context(
+        &mut self,
+        request_id: [u8; 16],
+        session_id: [u8; 16],
+        expires_at: i64,
+        tenant: Tenant,
+        role: Role,
+        scopes: u32,
+        quota_profile: QuotaProfile,
+        authorization_revision: u64,
+        ping_request_id: [u8; 16],
+        nonce: u64,
+        now: i64,
+    ) -> AuthAction {
         match self.phase {
             AuthPhase::Authenticating {
                 request_id: expected,
@@ -257,6 +353,16 @@ impl AuthState {
             } if expected == request_id => {
                 self.pending_session_expires_at = expires_at;
                 self.pending_session_started_at = now;
+                self.pending = Some(SessionLease::new(
+                    session_id,
+                    tenant,
+                    role,
+                    scopes,
+                    quota_profile,
+                    authorization_revision,
+                    now,
+                    expires_at,
+                ));
                 self.phase = AuthPhase::AwaitingPong {
                     request_id: ping_request_id,
                     session_id,
@@ -279,6 +385,16 @@ impl AuthState {
             } if expected == request_id => {
                 self.pending_session_expires_at = expires_at;
                 self.pending_session_started_at = now;
+                self.pending = Some(SessionLease::new(
+                    session_id,
+                    tenant,
+                    role,
+                    scopes,
+                    quota_profile,
+                    authorization_revision,
+                    now,
+                    expires_at,
+                ));
                 self.phase = AuthPhase::AwaitingPong {
                     request_id: ping_request_id,
                     session_id,
@@ -296,29 +412,21 @@ impl AuthState {
             _ => AuthAction::Ignore,
         }
     }
-    pub fn current_session(&self, now: i64) -> Option<[u8; 16]> {
+    pub fn current_session(&self, now: i64) -> Option<SessionLease> {
         match self.phase {
-            AuthPhase::Authenticated {
-                session_id,
-                expires_at,
-            }
-            | AuthPhase::Reauthenticating {
-                session_id,
-                expires_at,
-                ..
-            }
-            | AuthPhase::ReauthBackoff {
-                session_id,
-                expires_at,
-                ..
-            }
+            AuthPhase::Authenticated { expires_at, .. }
+            | AuthPhase::Reauthenticating { expires_at, .. }
+            | AuthPhase::ReauthBackoff { expires_at, .. }
             | AuthPhase::AwaitingPong {
-                prior_session_id: Some(session_id),
+                prior_session_id: Some(_),
                 prior_expires_at: expires_at,
                 ..
-            } if expires_at > now => Some(session_id),
+            } if expires_at > now => self.committed.clone(),
             _ => None,
         }
+    }
+    pub fn current_session_id(&self, now: i64) -> Option<[u8; 16]> {
+        self.current_session(now).map(|lease| lease.session_id())
     }
     pub fn renewal_due(&self, now: i64) -> bool {
         match self.phase {
@@ -365,6 +473,7 @@ impl AuthState {
                 let expires_at = self.pending_session_expires_at;
                 self.session_expires_at = expires_at;
                 self.session_started_at = self.pending_session_started_at;
+                self.committed = self.pending.take();
                 self.phase = AuthPhase::Authenticated {
                     session_id,
                     expires_at,
@@ -575,6 +684,29 @@ mod tests {
     const AUTH: [u8; 16] = [1; 16];
     const PING: [u8; 16] = [2; 16];
     const SESSION: [u8; 16] = [3; 16];
+    fn auth(
+        state: &mut AuthState,
+        request_id: [u8; 16],
+        session_id: [u8; 16],
+        expires_at: i64,
+        ping_request_id: [u8; 16],
+        nonce: u64,
+        now: i64,
+    ) -> AuthAction {
+        state.authenticated_with_context(
+            request_id,
+            session_id,
+            expires_at,
+            Tenant::new("tenant").unwrap(),
+            Role::Client,
+            Scope::OpenProxyStream.bit(),
+            QuotaProfile::new("standard").unwrap(),
+            1,
+            ping_request_id,
+            nonce,
+            now,
+        )
+    }
     #[test]
     fn correlation_and_readiness_require_pong() {
         let mut state = AuthState::new();
@@ -583,12 +715,12 @@ mod tests {
             AuthAction::Authenticate { request_id: AUTH }
         );
         assert_eq!(
-            state.authenticated([9; 16], SESSION, 100, PING, 7, 10),
+            auth(&mut state, [9; 16], SESSION, 100, PING, 7, 10),
             AuthAction::Ignore
         );
         assert!(matches!(state.phase(), AuthPhase::Authenticating { .. }));
         assert_eq!(
-            state.authenticated(AUTH, SESSION, 100, PING, 7, 10),
+            auth(&mut state, AUTH, SESSION, 100, PING, 7, 10),
             AuthAction::Ping {
                 request_id: PING,
                 session_id: SESSION,
@@ -668,7 +800,7 @@ mod tests {
     fn short_session_renews_at_midpoint_without_overwriting_prior_expiry() {
         let mut state = AuthState::new();
         state.connected(AUTH, 0);
-        state.authenticated(AUTH, SESSION, 100, PING, 7, 0);
+        auth(&mut state, AUTH, SESSION, 100, PING, 7, 0);
         assert_eq!(state.pong(PING, 7), AuthAction::Ready);
         assert!(!state.renewal_due(49));
         assert!(state.renewal_due(50));
@@ -678,17 +810,17 @@ mod tests {
                 request_id: [4; 16]
             }
         );
-        state.authenticated([4; 16], [5; 16], 200, [6; 16], 8, 50);
-        assert_eq!(state.current_session(99), Some(SESSION));
+        auth(&mut state, [4; 16], [5; 16], 200, [6; 16], 8, 50);
+        assert_eq!(state.current_session_id(99), Some(SESSION));
     }
 
     #[test]
     fn renewal_keeps_valid_session_until_replacement_ping() {
         let mut state = AuthState::new();
         state.connected(AUTH, 0);
-        state.authenticated(AUTH, SESSION, 100, PING, 7, 0);
+        auth(&mut state, AUTH, SESSION, 100, PING, 7, 0);
         assert_eq!(state.pong(PING, 7), AuthAction::Ready);
-        assert_eq!(state.current_session(99), Some(SESSION));
+        assert_eq!(state.current_session_id(99), Some(SESSION));
         assert!(!state.renewal_due(40));
         assert!(state.renewal_due(50));
         assert_eq!(
@@ -697,14 +829,14 @@ mod tests {
                 request_id: [4; 16]
             }
         );
-        assert_eq!(state.current_session(50), Some(SESSION));
+        assert_eq!(state.current_session_id(50), Some(SESSION));
     }
 
     #[test]
     fn replacement_ping_timeout_keeps_prior_session_until_real_expiry() {
         let mut state = AuthState::new();
         state.connected(AUTH, 0);
-        state.authenticated(AUTH, SESSION, 100, PING, 7, 0);
+        auth(&mut state, AUTH, SESSION, 100, PING, 7, 0);
         assert_eq!(state.pong(PING, 7), AuthAction::Ready);
         let renewal = [4; 16];
         assert_eq!(
@@ -713,10 +845,10 @@ mod tests {
                 request_id: renewal
             }
         );
-        state.authenticated(renewal, [5; 16], 200, [6; 16], 8, 50);
+        auth(&mut state, renewal, [5; 16], 200, [6; 16], 8, 50);
         assert_eq!(state.timeout(55), AuthAction::Retry);
-        assert_eq!(state.current_session(99), Some(SESSION));
-        assert_eq!(state.current_session(100), None);
+        assert_eq!(state.current_session_id(99), Some(SESSION));
+        assert_eq!(state.current_session_id(100), None);
     }
 
     #[test]

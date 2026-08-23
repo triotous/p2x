@@ -259,8 +259,15 @@ impl ConnectionTicketClaimsV1 {
         Ok(c)
     }
 }
-pub struct RawTicket(Vec<u8>);
+#[derive(Eq, PartialEq)]
+pub struct RawTicket(zeroize::Zeroizing<Vec<u8>>);
 impl RawTicket {
+    pub fn new(bytes: Vec<u8>) -> Result<Self, TicketError> {
+        if bytes.is_empty() || bytes.len() > MAX_TICKET_ENVELOPE {
+            return Err(TicketError::TooLarge);
+        }
+        Ok(Self(zeroize::Zeroizing::new(bytes)))
+    }
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -272,13 +279,18 @@ impl AsRef<[u8]> for RawTicket {
 }
 impl Clone for RawTicket {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(zeroize::Zeroizing::new(self.0.to_vec()))
     }
 }
 impl std::fmt::Debug for RawTicket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("RawTicket(REDACTED)")
     }
+}
+
+pub trait TicketSigningKey {
+    fn key_id(&self) -> [u8; 16];
+    fn sign_message(&self, message: &[u8]) -> Signature;
 }
 
 pub struct TicketSigner {
@@ -297,26 +309,37 @@ impl TicketSigner {
         self.key_id
     }
     pub fn sign(&self, c: &ConnectionTicketClaimsV1) -> Result<RawTicket, TicketError> {
-        let c = c.encode()?;
-        let mut m = b"p2x-ticket-v1\0".to_vec();
-        m.extend_from_slice(&(c.len() as u16).to_be_bytes());
-        m.extend_from_slice(&c);
-        let sig = self.key.sign(&m);
-        let mut o = b"P2XT".to_vec();
-        o.extend_from_slice(&[1, 16]);
-        o.extend_from_slice(&self.key_id);
-        o.extend_from_slice(&(c.len() as u16).to_be_bytes());
-        o.extend_from_slice(&c);
-        o.extend_from_slice(&sig.to_bytes());
-        if o.len() > MAX_TICKET_ENVELOPE {
-            Err(TicketError::TooLarge)
-        } else {
-            Ok(RawTicket(o))
-        }
+        sign_ticket(self, c)
     }
     pub fn public_key(&self) -> VerifyingKey {
         self.key.verifying_key()
     }
+}
+impl TicketSigningKey for TicketSigner {
+    fn key_id(&self) -> [u8; 16] {
+        self.key_id
+    }
+    fn sign_message(&self, message: &[u8]) -> Signature {
+        self.key.sign(message)
+    }
+}
+
+pub fn sign_ticket<K: TicketSigningKey>(
+    key: &K,
+    claims: &ConnectionTicketClaimsV1,
+) -> Result<RawTicket, TicketError> {
+    let encoded_claims = claims.encode()?;
+    let mut message = b"p2x-ticket-v1\0".to_vec();
+    message.extend_from_slice(&(encoded_claims.len() as u16).to_be_bytes());
+    message.extend_from_slice(&encoded_claims);
+    let signature = key.sign_message(&message);
+    let mut envelope = b"P2XT".to_vec();
+    envelope.extend_from_slice(&[1, 16]);
+    envelope.extend_from_slice(&key.key_id());
+    envelope.extend_from_slice(&(encoded_claims.len() as u16).to_be_bytes());
+    envelope.extend_from_slice(&encoded_claims);
+    envelope.extend_from_slice(&signature.to_bytes());
+    RawTicket::new(envelope)
 }
 pub fn decode_envelope(
     e: &[u8],

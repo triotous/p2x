@@ -35,6 +35,15 @@ impl std::fmt::Debug for TicketKey {
         f.write_str("TicketKey(REDACTED)")
     }
 }
+impl p2x_protocol::ticket::TicketSigningKey for TicketKey {
+    fn key_id(&self) -> [u8; 16] {
+        self.key_id
+    }
+
+    fn sign_message(&self, message: &[u8]) -> ed25519_dalek::Signature {
+        self.sign(message)
+    }
+}
 impl TicketKey {
     pub fn ensure_separate_from(&self, transport_public_key: &[u8]) -> Result<(), TicketKeyError> {
         if self.public().as_bytes() == transport_public_key {
@@ -252,6 +261,35 @@ mod tests {
         let key = TicketKey::from_seed([9; 32]);
         assert!(key.ensure_separate_from(key.public().as_bytes()).is_err());
         assert!(key.ensure_separate_from(&[0; 32]).is_ok());
+    }
+    #[test]
+    fn production_signer_has_the_same_envelope_bytes_as_the_test_signer() {
+        let production = TicketKey::from_seed([9; 32]);
+        let test = p2x_protocol::TicketSigner::from_seed([9; 32]);
+        let peer = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = libp2p::PeerId::from_public_key(&peer.public());
+        let claims = p2x_protocol::ticket::ConnectionTicketClaimsV1::new(
+            peer_id.to_bytes(),
+            "tenant".into(),
+            peer_id.to_bytes(),
+            peer_id.to_bytes(),
+            "orders".into(),
+            [3; 32],
+            1,
+            2,
+            4,
+            10,
+            20,
+            [5; 16],
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            p2x_protocol::ticket::sign_ticket(&production, &claims)
+                .unwrap()
+                .as_bytes(),
+            test.sign(&claims).unwrap().as_bytes()
+        );
     }
     #[test]
     fn key_id_is_stable_and_debug_redacts() {

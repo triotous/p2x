@@ -31,6 +31,13 @@ pub enum PublicErrorCode {
     LimitServices,
     LimitRegistryRequests,
     ExchangeDraining,
+    AuthTicketReplayed,
+    LimitResolveRequests,
+    LimitPeerConnections,
+    LimitProxyStreams,
+    PeerConnectionFailed,
+    PeerSetupTimeout,
+    PeerDraining,
 }
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[error("unknown public error code")]
@@ -65,6 +72,13 @@ impl PublicErrorCode {
         Self::LimitServices,
         Self::LimitRegistryRequests,
         Self::ExchangeDraining,
+        Self::AuthTicketReplayed,
+        Self::LimitResolveRequests,
+        Self::LimitPeerConnections,
+        Self::LimitProxyStreams,
+        Self::PeerConnectionFailed,
+        Self::PeerSetupTimeout,
+        Self::PeerDraining,
     ];
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -95,6 +109,13 @@ impl PublicErrorCode {
             Self::LimitServices => "limit.services",
             Self::LimitRegistryRequests => "limit.registry_requests",
             Self::ExchangeDraining => "exchange.draining",
+            Self::AuthTicketReplayed => "auth.ticket_replayed",
+            Self::LimitResolveRequests => "limit.resolve_requests",
+            Self::LimitPeerConnections => "limit.peer_connections",
+            Self::LimitProxyStreams => "limit.proxy_streams",
+            Self::PeerConnectionFailed => "peer.connection_failed",
+            Self::PeerSetupTimeout => "peer.setup_timeout",
+            Self::PeerDraining => "peer.draining",
         }
     }
     pub fn try_from_wire(value: &str) -> Result<Self, UnknownPublicErrorCode> {
@@ -133,6 +154,13 @@ impl PublicErrorCode {
             "limit.services" => Self::LimitServices,
             "limit.registry_requests" => Self::LimitRegistryRequests,
             "exchange.draining" => Self::ExchangeDraining,
+            "auth.ticket_replayed" => Self::AuthTicketReplayed,
+            "limit.resolve_requests" => Self::LimitResolveRequests,
+            "limit.peer_connections" => Self::LimitPeerConnections,
+            "limit.proxy_streams" => Self::LimitProxyStreams,
+            "peer.connection_failed" => Self::PeerConnectionFailed,
+            "peer.setup_timeout" => Self::PeerSetupTimeout,
+            "peer.draining" => Self::PeerDraining,
             _ => Self::ProtocolMalformed,
         }
     }
