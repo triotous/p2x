@@ -300,6 +300,40 @@ limits:
             {"P2X_TOKEN": token_value or (self.client2_token if identity_name == "client2" else self.client_token), "P2X_ENABLE_TEST_HOOKS": "1", **(env or {})},
         )
 
+    def start_exchange(self, name: str, exchange_args: list[str] | None = None) -> pathlib.Path:
+        return self.start(
+            name,
+            [
+                str(bin_dir / "p2x-exchange"),
+                "--identity-file", str(self.secret / "exchange.key"),
+                "--credential-file", str(self.credentials),
+                "--ticket-key-file", str(self.ticket_key),
+                "--tcp-listen", f"/ip4/127.0.0.1/tcp/{self.exchange_tcp}",
+                "--quic-listen", f"/ip4/127.0.0.1/udp/{self.exchange_quic}/quic-v1",
+                "--advertise", self.exchange_base + f"/p2p/{self.exchange_peer}",
+                "--case-id", case,
+                *(exchange_args or []),
+            ],
+            {"P2X_ENABLE_TEST_HOOKS": "1"} if exchange_args else None,
+        )
+
+    def start_server(self, name: str, exchange_address: str, server_args: list[str] | None = None) -> pathlib.Path:
+        return self.start(
+            name,
+            [
+                str(bin_dir / "p2x-server"),
+                "--identity-file", str(self.secret / "server.key"),
+                "--exchange", exchange_address,
+                "--exchange-peer-id", self.exchange_peer,
+                "--credential-env", "P2X_TOKEN",
+                "--ticket-verification-keys-file", str(self.verification_keys),
+                "--services-file", str(self.services),
+                *(server_args or []),
+                "--case-id", case,
+            ],
+            {"P2X_TOKEN": self.server_token, "P2X_ENABLE_TEST_HOOKS": "1"} if server_args else {"P2X_TOKEN": self.server_token},
+        )
+
     def stop(self, log: pathlib.Path, graceful: bool = True) -> None:
         for process, path, handle in self.processes:
             if path != log or process.poll() is not None:
@@ -377,6 +411,44 @@ def finish_limits(run: Run, primary_log: pathlib.Path, secondary_log: pathlib.Pa
             "n_plus_one_rejected": True,
             "primary_authorized": True,
             "resources_drained": True,
+            "privacy_scan_clean": True,
+        },
+    }
+    (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\\n")
+    print(json.dumps(summary, sort_keys=True), flush=True)
+
+def finish_restart(run: Run, client_log: pathlib.Path, server_logs: list[pathlib.Path], exchange_log: pathlib.Path) -> None:
+    client_rows = rows(client_log)
+    server_rows = [row for path in server_logs for row in rows(path)]
+    exchange_rows = rows(exchange_log)
+    terminal = assert_one_terminal(client_log)
+    if terminal.get("code") != "proxy.authorized":
+        raise CaseFailure(f"{case} recovery terminal was {terminal.get('code')}")
+    outcomes = [row for row in client_rows if row.get("event") == "resolution_outcome"]
+    if len(outcomes) < 2 or not all(row.get("resolved") and row.get("ticket_issued") for row in outcomes):
+        raise CaseFailure(f"{case} did not resolve before and after restart")
+    if len({row.get("response_fingerprint") for row in outcomes}) < 2:
+        raise CaseFailure(f"{case} reused the old ticket response")
+    if not any(row.get("event") == "operational_error" and row.get("code") == "proxy.recovering" for row in client_rows):
+        raise CaseFailure(f"{case} did not emit fresh-ticket recovery evidence")
+    if not any(row.get("event") == "proxy_authorization" and not row.get("authorized") and row.get("code") == "registry.stale_revision" for row in server_rows):
+        raise CaseFailure(f"{case} did not reject the old registration revision")
+    if not any(row.get("event") == "proxy_authorization" and row.get("authorized") for row in server_rows):
+        raise CaseFailure(f"{case} did not authorize against the replacement server")
+    revisions = [row.get("revision") for row in exchange_rows if row.get("event") == "registry_transition" and row.get("code") == "registry.registered"]
+    if len([revision for revision in revisions if revision is not None]) < 2:
+        raise CaseFailure(f"{case} did not observe replacement registration revision")
+    forbidden = [run.client_token, run.client2_token, run.server_token, "token_secret", "raw_ticket", "session_id"] + run.private
+    output = "\\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
+    if any(marker and marker in output for marker in forbidden):
+        raise CaseFailure("privacy scan found credentials, session data, ticket data, or selector values")
+    summary = {
+        "case": case,
+        "passed": True,
+        "observed_assertions": {
+            "old_revision_rejected": True,
+            "fresh_resolve_authorized": True,
+            "replacement_registration_observed": True,
             "privacy_scan_clean": True,
         },
     }
@@ -515,42 +587,14 @@ try:
         exchange_args += ["--resolve-limit-global", "1", "--resolve-limit-per-client", "1", "--test-hold-resolve-ms", "3000"]
     elif case == "proxy-limit":
         server_args += ["--test-hold-proxy-handshake-ms", "3000"]
-    exchange_log = run.start(
-        "exchange",
-        [
-            str(bin_dir / "p2x-exchange"),
-            "--identity-file", str(run.secret / "exchange.key"),
-            "--credential-file", str(run.credentials),
-            "--ticket-key-file", str(run.ticket_key),
-            "--tcp-listen", f"/ip4/127.0.0.1/tcp/{run.exchange_tcp}",
-            "--quic-listen", f"/ip4/127.0.0.1/udp/{run.exchange_quic}/quic-v1",
-            "--advertise", run.exchange_base + f"/p2p/{run.exchange_peer}",
-            "--case-id", case,
-            *exchange_args,
-        ],
-        {"P2X_ENABLE_TEST_HOOKS": "1"} if exchange_args else None,
-    )
+    exchange_log = run.start_exchange("exchange", exchange_args)
     listen = wait_for(
         exchange_log,
         lambda row: row.get("event") == "listener_ready"
         and ((transport == "quic" and "/quic-v1" in row.get("address", "")) or (transport == "tcp" and "/tcp/" in row.get("address", ""))),
     )
     run.exchange_address = listen["address"]
-    server_log = run.start(
-        "server",
-        [
-            str(bin_dir / "p2x-server"),
-            "--identity-file", str(run.secret / "server.key"),
-            "--exchange", run.exchange_address,
-            "--exchange-peer-id", run.exchange_peer,
-            "--credential-env", "P2X_TOKEN",
-            "--ticket-verification-keys-file", str(run.verification_keys),
-            "--services-file", str(run.services),
-            *server_args,
-            "--case-id", case,
-        ],
-        {"P2X_TOKEN": run.server_token, "P2X_ENABLE_TEST_HOOKS": "1"} if server_args else {"P2X_TOKEN": run.server_token},
-    )
+    server_log = run.start_server("server", run.exchange_address, server_args)
     wait_for(server_log, lambda row: row.get("event") == "server_readiness" and row.get("ready") is True, 45)
     wait_for(exchange_log, lambda row: row.get("event") == "registry_transition" and row.get("code") == "registry.registered", 15)
     if case in ("resolve-limit", "proxy-limit"):
