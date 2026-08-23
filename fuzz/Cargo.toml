@@ -50,3 +50,17 @@ path = "fuzz_targets/ticket_envelope_decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "resolve_frame_decode"
+path = "fuzz_targets/resolve_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_frame_decode"
+path = "fuzz_targets/proxy_frame_decode.rs"
+test = false
+doc = false
+bench = false

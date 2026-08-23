@@ -9,6 +9,29 @@ use std::{
 };
 
 pub const MAX_WAITERS_PER_SELECTOR: usize = 64;
+
+fn valid_relay_address(address: &[u8], exchange: Option<PeerId>, server: PeerId) -> bool {
+    let Ok(address) = std::str::from_utf8(address) else {
+        return false;
+    };
+    let Ok(address) = address.parse::<libp2p::Multiaddr>() else {
+        return false;
+    };
+    let parts = address.iter().collect::<Vec<_>>();
+    let circuit = parts
+        .iter()
+        .position(|part| matches!(part, libp2p::multiaddr::Protocol::P2pCircuit));
+    let peers = parts
+        .iter()
+        .filter_map(|part| match part {
+            libp2p::multiaddr::Protocol::P2p(peer) => Some(*peer),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    circuit.is_some()
+        && exchange.is_none_or(|exchange| peers.first() == Some(&exchange))
+        && peers.last() == Some(&server)
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedServiceMetadata {
     pub server_peer_id: PeerId,
@@ -42,12 +65,16 @@ struct Negative {
 }
 #[derive(Default)]
 pub struct ResolverState {
+    exchange_peer_id: Option<PeerId>,
     positive: HashMap<CacheKey, Positive>,
     negative: HashMap<CacheKey, Negative>,
     waiters: HashMap<CacheKey, VecDeque<u64>>,
     pending: HashMap<[u8; 16], CacheKey>,
 }
 impl ResolverState {
+    pub fn set_exchange_peer(&mut self, exchange_peer_id: PeerId) {
+        self.exchange_peer_id = Some(exchange_peer_id);
+    }
     pub fn begin(
         &mut self,
         request_id: [u8; 16],
@@ -134,6 +161,11 @@ impl ResolverState {
             } => {
                 let server_peer_id = PeerId::from_bytes(&server_peer_id)
                     .map_err(|_| p2x_protocol::PublicErrorCode::ProtocolMalformed)?;
+                if !relay_addresses.iter().all(|address| {
+                    valid_relay_address(address, self.exchange_peer_id, server_peer_id)
+                }) {
+                    return Err(p2x_protocol::PublicErrorCode::ProtocolMalformed);
+                }
                 if ticket_expires_at <= now || ticket_expires_at > registration_expires_at {
                     return Err(p2x_protocol::PublicErrorCode::RegistryStaleRevision);
                 }
@@ -186,6 +218,7 @@ impl ResolverState {
         self.negative.remove(&key);
     }
     pub fn clear(&mut self) {
+        self.exchange_peer_id = None;
         self.positive.clear();
         self.negative.clear();
         self.waiters.clear();
@@ -222,13 +255,20 @@ mod tests {
         let id = [1; 16];
         state.begin(id, [2; 16], selector.clone(), 1).unwrap();
         let peer = PeerId::random().to_bytes();
+        let exchange = PeerId::random();
+        state.set_exchange_peer(exchange);
+        let relay = format!(
+            "/ip4/127.0.0.1/tcp/1/p2p/{}/p2p-circuit/p2p/{}",
+            exchange,
+            PeerId::from_bytes(&peer).unwrap()
+        );
         let response = ResolveResponseV1::Resolved {
             request_id: id,
             server_peer_id: peer,
             upstream_id: p2x_protocol::UpstreamId::new("orders").unwrap(),
             selector_fingerprint: [3; 32],
             registration_revision: RegistrationRevision::new(1).unwrap(),
-            relay_addresses: vec![vec![1]],
+            relay_addresses: vec![relay.into_bytes()],
             compatible_capabilities: Capabilities::RELAY_V2,
             registration_expires_at: 20,
             ticket_expires_at: 19,

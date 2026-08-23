@@ -29,8 +29,11 @@ use p2x_net::{
     probe::{ProbeAck, ProbeHeader, ProbeMode, ProbePath, ProbeTerminal, SCHEMA_VERSION},
     probe_stream::behaviour::ProbeOutput,
     probe_worker::execute_probe_client_futures_with_timeout,
+    proxy_stream::behaviour::{ProxyOutput, ProxyRequestId},
 };
-use p2x_protocol::{AuthRequest, AuthResponse, PublicErrorCode, Role};
+use p2x_protocol::{
+    AuthRequest, AuthResponse, OpenProxyStreamV1, PublicErrorCode, ResolveRequestV1, Role,
+};
 use std::{
     collections::{HashSet, VecDeque},
     io,
@@ -173,6 +176,8 @@ struct Args {
     finite_auth_check: bool,
     #[arg(long)]
     finite_relay_ping: bool,
+    #[arg(long)]
+    finite_proxy_check: bool,
     #[arg(long, hide = true, default_value_t = 0)]
     test_hold_relay_seconds: u64,
     #[arg(long, hide = true, default_value_t = 1)]
@@ -255,13 +260,17 @@ fn drive_path_actions(
 async fn main() -> io::Result<()> {
     let started_at = std::time::Instant::now();
     let args = Args::parse();
-    if !args.unsafe_connectivity_lab && args.routes_file.is_none() {
+    if !args.unsafe_connectivity_lab
+        && args.routes_file.is_none()
+        && !args.finite_auth_check
+        && !args.finite_relay_ping
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "product mode requires --routes-file",
         ));
     }
-    let _routes = args
+    let routes = args
         .routes_file
         .as_deref()
         .map(config::ClientConfig::load)
@@ -355,7 +364,7 @@ async fn main() -> io::Result<()> {
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
     start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
     let server_address = args.server.clone();
-    let target_peer = args.server.as_ref().and_then(|address| {
+    let mut target_peer = args.server.as_ref().and_then(|address| {
         address.iter().fold(None, |last, part| match part {
             libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
             _ => last,
@@ -406,6 +415,8 @@ async fn main() -> io::Result<()> {
             )
         })?;
     let mut credential: Option<(p2x_protocol::CredentialId, p2x_protocol::TokenSecret)> = None;
+    let mut resolver_state = resolver::ResolverState::default();
+    resolver_state.set_exchange_peer(expected_exchange);
     let mut connections = ConnectionBook::new(expected_exchange);
     let mut exchange_addresses = AddressCursor::new();
     if let Some(index) = exchange_addresses.next(args.exchange.len()) {
@@ -437,8 +448,20 @@ async fn main() -> io::Result<()> {
     let mut test_relay_targets: VecDeque<Multiaddr> = VecDeque::new();
     let mut test_dialed_targets = HashSet::new();
     let mut readiness_generation = 0u64;
+    let mut pending_resolve: PendingRequest<libp2p::request_response::OutboundRequestId> =
+        PendingRequest::new();
+    let mut resolve_request: Option<ResolveRequestV1> = None;
+    let mut proxy_open: Option<OpenProxyStreamV1> = None;
+    let mut proxy_request_id: Option<[u8; 16]> = None;
+    let mut selected_proxy_connection: Option<libp2p::swarm::ConnectionId> = None;
+    let mut pending_proxy: Option<ProxyRequestId> = None;
     let mut maintenance = tokio::time::interval(std::time::Duration::from_millis(100));
+    struct ProxyResult {
+        request_id: [u8; 16],
+        result: Result<[u8; 16], PublicErrorCode>,
+    }
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerResult>(128);
+    let (proxy_result_tx, mut proxy_result_rx) = mpsc::channel::<ProxyResult>(16);
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
@@ -538,6 +561,14 @@ async fn main() -> io::Result<()> {
                     }
                 }
             }
+            Some(proxy_result) = proxy_result_rx.recv() => {
+                if proxy_request_id == Some(proxy_result.request_id) {
+                    match proxy_result.result {
+                        Ok(_) => { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "proxy.authorized"))?; return Ok(()); }
+                        Err(code) => { emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?; return Ok(()); }
+                    }
+                }
+            }
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
@@ -565,7 +596,16 @@ async fn main() -> io::Result<()> {
                                 emitter.emit(&LifecycleRecord::OperationalError { code: "connection.rejected", message: &message })?;
                                 continue;
                             }
-                            if args.finite_relay_ping {
+                            if args.finite_proxy_check
+                                && let Some(open) = proxy_open.as_ref().cloned()
+                            {
+                                let proxy = swarm.behaviour_mut().proxy_stream.as_mut().ok_or_else(|| io::Error::other("proxy is unavailable in product mode"))?;
+                                let request_id = proxy.open_on(peer_id, connection_id, open.clone()).map_err(io::Error::other)?;
+                                proxy_request_id = Some(open.request_id);
+                                selected_proxy_connection = Some(connection_id);
+                                pending_proxy = Some(request_id);
+                                emitter.emit(&LifecycleRecord::PathSelected { request_id: request_id.0, connection_id_hash: stable_hash(connection_id), selected_path: observed_path })?;
+                            } else if args.finite_relay_ping {
                                 if observed_path != ProbePath::Relay {
                                     emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", "relay.path_required"))?;
                                     return Ok(());
@@ -603,6 +643,15 @@ async fn main() -> io::Result<()> {
                             return Ok(());
                         }
                         emitter.emit(&LifecycleRecord::AuthReadiness { ready: true, generation: readiness_generation })?;
+                        if args.finite_proxy_check {
+                            let route = routes.as_ref().and_then(|config| config.routes.first()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proxy check requires a route"))?;
+                            let session_id = auth_state.current_session_id(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?;
+                            let request_id = request_ids.allocate().map_err(io::Error::other)?;
+                            let request = resolver_state.begin(request_id, session_id, route.selector.clone(), unix_now()).map_err(|code| io::Error::other(code.as_str()))?;
+                            let outbound = swarm.behaviour_mut().resolve.send_request(&expected_exchange, request.clone());
+                            if !pending_resolve.begin(outbound) { return Err(io::Error::other("resolve outbound request limit exceeded")); }
+                            resolve_request = Some(request);
+                        }
                         if args.finite_relay_ping && let Some(address) = server_address.clone() {
                             let explicit_targets = !args.test_relay_target.is_empty();
                             let targets = if explicit_targets { args.test_relay_target.clone() } else { vec![address; args.test_relay_circuit_count as usize] };
@@ -636,6 +685,37 @@ async fn main() -> io::Result<()> {
                         return Ok(());
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::OutboundFailure { request_id, error: libp2p::request_response::OutboundFailure::ConnectionClosed, .. })) if credential.is_some() => { pending_auth.complete(&request_id); }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Resolve(RequestResponseEvent::Message { peer: _, message: RequestResponseMessage::Response { request_id: outbound_id, response }, .. })) if pending_resolve.complete(&outbound_id) => {
+                        let request = resolve_request.take().ok_or_else(|| io::Error::other("resolve response without request"))?;
+                        let (request_id, session_id, selector) = match request { ResolveRequestV1::Resolve { request_id, session_id, selector, .. } => (request_id, session_id, selector) };
+                        match resolver_state.complete(response, session_id, &selector, unix_now()) {
+                            Ok(grant) if args.finite_proxy_check => {
+                                let peer = grant.metadata.server_peer_id;
+                                if !grant.metadata.compatible_capabilities.contains(p2x_protocol::Capabilities::RELAY_V2) { return Err(io::Error::other("resolve omitted relay capability")); }
+                                let address = grant.metadata.relay_addresses.first().ok_or_else(|| io::Error::other("resolve returned no relay address"))?;
+                                let address = std::str::from_utf8(address).map_err(|_| io::Error::other("resolve returned invalid relay address"))?.parse::<Multiaddr>().map_err(io::Error::other)?;
+                                target_peer = Some(peer);
+                                proxy_request_id = Some(request_id);
+                                proxy_open = Some(OpenProxyStreamV1 { request_id, ticket: grant.ticket, upstream_id: grant.metadata.upstream_id, registration_revision: grant.metadata.registration_revision, ingress_kind: p2x_protocol::IngressKind::FixedTcp });
+                                swarm.dial(address).map_err(io::Error::other)?;
+                            }
+                            Ok(_) => {}
+                            Err(code) => { emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?; return Ok(()); }
+                        }
+                    }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Proxy(ProxyOutput::OutboundOpened { request_id, peer_id, connection_id, stream })) if pending_proxy == Some(request_id) => {
+                        let open = proxy_open.take().ok_or_else(|| io::Error::other("proxy stream opened without grant"))?;
+                        let tx = proxy_result_tx.clone();
+                        tokio::spawn(async move {
+                            let result = proxy_open::authorize_empty_stream(stream, &open, std::time::Duration::from_secs(5)).await;
+                            let _ = tx.send(ProxyResult { request_id: open.request_id, result }).await;
+                        });
+                        let _ = (peer_id, connection_id, selected_proxy_connection, proxy_request_id);
+                    }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Proxy(ProxyOutput::OutboundFailed { request_id, code, .. })) if pending_proxy == Some(request_id) => {
+                        emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code))?;
+                        return Ok(());
+                    }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Ping(event)) if args.finite_relay_ping && target_peer == Some(event.peer) && event.result.is_ok() && started => {
                         if args.test_relay_circuit_count > 1 || !args.test_relay_target.is_empty() {
                             continue;

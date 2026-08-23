@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "request": "bounded canonical Resolve/1 binary values are covered by the protocol unit tests",
+  "response": "non-production ticket bytes only; production tickets are never committed"
+}

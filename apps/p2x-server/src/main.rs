@@ -202,7 +202,7 @@ fn new_register(
         session_id,
         instance_id,
         requested_lease_seconds: services.requested_lease_seconds,
-        capabilities: Capabilities::from_bits(7).expect("known capabilities"),
+        capabilities: Capabilities::from_bits(15).expect("known capabilities"),
         services: services.services.clone(),
     };
     Ok(RegistryOperation {
@@ -607,6 +607,9 @@ async fn main() -> io::Result<()> {
                     Err(code) => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: None, error: p2x_protocol::PublicError::new(code, false) },
                 };
                 let _ = candidate.decision.send(response);
+                if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
+                    proxy.inbound_release(candidate.peer_id);
+                }
             }
             Some(worker) = worker_rx.recv() => {
                 let released = worker_admission.release(worker.peer_id);
@@ -782,13 +785,12 @@ async fn main() -> io::Result<()> {
                         let message = format!("{reason:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "listener.closed", message: &message })?;
                     }
                     SwarmEvent::Behaviour(PeerEvent::Proxy(p2x_net::proxy_stream::behaviour::ProxyOutput::InboundOpened { peer_id, connection_id, stream })) => {
-                        if proxy_tx.capacity() == 0 {
-                            continue;
-                        }
                         let tx = proxy_tx.clone();
                         tokio::spawn(proxy_open::run_worker(peer_id, connection_id, stream, tx));
                     }
-                    SwarmEvent::Behaviour(PeerEvent::Proxy(p2x_net::proxy_stream::behaviour::ProxyOutput::InboundRejected { .. })) => {}
+                    SwarmEvent::Behaviour(PeerEvent::Proxy(p2x_net::proxy_stream::behaviour::ProxyOutput::InboundRejected { peer_id, .. })) => {
+                        if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() { proxy.inbound_release(peer_id); }
+                    }
                     SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Authenticated { session_id, request_id, tenant, role, scopes, quota_profile, authorization_revision, expires_at, .. } }, .. })) if pending_auth.complete(&outbound_id) => {
                         let next_ping_id = request_ids.allocate().map_err(io::Error::other)?;
                         if let AuthAction::Ping { request_id: ping_id, session_id, nonce } = auth_state.authenticated_with_context(request_id, session_id, expires_at, tenant, role, scopes, quota_profile, authorization_revision, next_ping_id, 1, unix_now()) {
@@ -1093,6 +1095,7 @@ async fn main() -> io::Result<()> {
         swarm.close_connection(connection_id);
     }
     availability.stopped();
+    ticket_admission.clear();
     worker_admission.close_and_discard();
     emitter.terminal(&TerminalResult::simple(
         &args.case_id,

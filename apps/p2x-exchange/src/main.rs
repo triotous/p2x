@@ -286,6 +286,7 @@ async fn main() -> io::Result<()> {
                 }
                 registry.sweep(now);
                 registry_admission.sweep(now);
+                if let Some(resolver) = resolver.as_mut() { resolver.sweep(now); }
                 relay_admission.sweep(std::time::Instant::now());
                 if relay_admission.is_poisoned() {
                     emitter.emit(&LifecycleRecord::OperationalError { code: "relay.admission_poisoned", message: "relay admission snapshot is unavailable" })?;
@@ -552,6 +553,9 @@ async fn main() -> io::Result<()> {
         }
     }
     registry.clear();
+    if let Some(resolver) = resolver.as_mut() {
+        resolver.clear();
+    }
     relay_admission.clear();
     sessions.clear();
     reserved_servers.clear();

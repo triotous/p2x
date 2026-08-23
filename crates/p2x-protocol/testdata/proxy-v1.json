@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "messages": ["OpenProxyStreamV1", "Authorized", "Accepted", "Rejected"],
+  "ticket": "non-production ticket bytes only"
+}
