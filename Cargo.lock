@@ -2109,7 +2109,9 @@ dependencies = [
  "p2x-config",
  "p2x-net",
  "p2x-protocol",
+ "serde",
  "serde_json",
+ "thiserror 2.0.20",
  "tokio",
  "tracing-subscriber",
 ]
