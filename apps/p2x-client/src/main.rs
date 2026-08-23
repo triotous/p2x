@@ -903,6 +903,9 @@ async fn main() -> io::Result<()> {
                                 continue;
                             }
                         }
+                        if let (Some(manager), Some(server)) = (connection_manager.as_mut(), proxy_server) {
+                            let _ = manager.release(server);
+                        }
                         emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code))?;
                         return Ok(());
                     }
