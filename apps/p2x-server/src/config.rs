@@ -46,6 +46,14 @@ pub struct ServiceConfig {
     pub service_set_hash: [u8; 32],
 }
 impl ServiceConfig {
+    #[allow(dead_code)]
+    pub fn service(&self, upstream_id: &UpstreamId) -> Option<&ServiceAdvertisementV1> {
+        self.services
+            .as_slice()
+            .iter()
+            .find(|service| service.upstream_id() == upstream_id)
+    }
+
     pub fn load(path: &Path) -> Result<Self, ServiceConfigError> {
         let file: File =
             p2x_config::yaml::load(path).map_err(|e| ServiceConfigError::Load(e.to_string()))?;

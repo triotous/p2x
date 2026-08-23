@@ -75,6 +75,11 @@ impl Availability {
     pub const fn generation(&self) -> u64 {
         self.generation
     }
+    pub fn registration_context(&self, now: i64) -> Option<(u64, i64)> {
+        (self.registration_expires_at > now && self.reservation && self.auth)
+            .then_some((self.generation, self.registration_expires_at))
+    }
+
     pub const fn readiness_generation(&self) -> u64 {
         self.readiness_generation
     }

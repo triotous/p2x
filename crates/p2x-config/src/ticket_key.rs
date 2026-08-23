@@ -146,7 +146,7 @@ pub struct VerificationKey {
     pub activates_at: i64,
     pub retires_at: Option<i64>,
 }
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct VerificationKeyRing {
     keys: Vec<VerificationKey>,
 }

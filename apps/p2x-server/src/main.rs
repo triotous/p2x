@@ -1,6 +1,9 @@
 #[allow(dead_code)]
 mod availability;
 mod config;
+#[allow(dead_code)]
+mod proxy_open;
+mod ticket_admission;
 
 use clap::Parser;
 use futures::StreamExt;
@@ -57,6 +60,8 @@ struct Args {
     exchange_peer_id: Option<String>,
     #[arg(long)]
     credential_env: Option<String>,
+    #[arg(long)]
+    ticket_verification_keys_file: Option<PathBuf>,
     #[arg(long)]
     services_file: Option<PathBuf>,
     #[arg(long)]
@@ -341,6 +346,24 @@ async fn main() -> io::Result<()> {
             )?,
         )
     };
+    let verification_ring = if args.unsafe_connectivity_lab {
+        None
+    } else {
+        Some(
+            p2x_config::ticket_key::VerificationKeyRing::load(
+                args.ticket_verification_keys_file
+                    .as_deref()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "product mode requires --ticket-verification-keys-file",
+                        )
+                    })?,
+            )
+            .map_err(io::Error::other)?,
+        )
+    };
+    let mut ticket_admission = ticket_admission::TicketAdmissionLedger::default();
     let service_config = if args.unsafe_connectivity_lab {
         None
     } else {
@@ -391,6 +414,7 @@ async fn main() -> io::Result<()> {
     let mut connection_paths = HashMap::new();
     let mut worker_admission = WorkerAdmission::default();
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerResult>(128);
+    let (proxy_tx, mut proxy_rx) = mpsc::channel::<proxy_open::Candidate>(256);
     let mut resource_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut first_probe_dropped = false;
     let mut request_ids = p2x_protocol::CorrelationIdGenerator::new(1);
@@ -559,6 +583,30 @@ async fn main() -> io::Result<()> {
                 }
                 let connections = connection_book.as_ref().map(ConnectionBook::len).unwrap_or(connection_paths.len());
                 emitter.emit(&LifecycleRecord::Resources { connections, pending_opens: swarm.behaviour().probe_stream.as_ref().map_or(0, |probe| probe.pending_count()), workers: worker_admission.admitted(), tasks: worker_admission.admitted() })?;
+            }
+            Some(candidate) = proxy_rx.recv() => {
+                let response = match candidate.open {
+                    Ok(open) => {
+                        let now = unix_now();
+                        let mut owner_fingerprint = [0; 32];
+                        owner_fingerprint[..8].copy_from_slice(&stable_hash(candidate.peer_id).to_be_bytes());
+                        match (verification_ring.as_ref(), auth_state.current_session(now), service_config.as_ref(), availability.registration_context(now)) {
+                            (Some(ring), Some(session), Some(services), Some((_, expires_at))) => {
+                                let service = services.service(&open.upstream_id);
+                                match service {
+                                    Some(service) => match ticket_admission.authorize_open(ring, relay_peer_id.unwrap_or(*swarm.local_peer_id()), candidate.peer_id, *swarm.local_peer_id(), session.tenant(), service, registration_revision, expires_at, session.authorization_revision(), &open, now, owner_fingerprint) {
+                                        ticket_admission::TicketAdmission::Authorized(_) => proxy_open::random_stream_id().map(|stream_id| p2x_protocol::ProxyOpenResponseV1::Authorized { request_id: open.request_id, stream_id }).unwrap_or_else(|code| p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: Some(open.request_id), error: p2x_protocol::PublicError::new(code, true) }),
+                                        ticket_admission::TicketAdmission::Rejected(code) => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: Some(open.request_id), error: p2x_protocol::PublicError::new(code, matches!(code, PublicErrorCode::RegistryStaleRevision | PublicErrorCode::LimitProxyStreams)) },
+                                    },
+                                    None => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: Some(open.request_id), error: p2x_protocol::PublicError::new(PublicErrorCode::RegistryStaleRevision, true) },
+                                }
+                            }
+                            _ => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: None, error: p2x_protocol::PublicError::new(PublicErrorCode::AuthSessionRequired, false) },
+                        }
+                    }
+                    Err(code) => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: None, error: p2x_protocol::PublicError::new(code, false) },
+                };
+                let _ = candidate.decision.send(response);
             }
             Some(worker) = worker_rx.recv() => {
                 let released = worker_admission.release(worker.peer_id);
@@ -733,6 +781,14 @@ async fn main() -> io::Result<()> {
                         }
                         let message = format!("{reason:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "listener.closed", message: &message })?;
                     }
+                    SwarmEvent::Behaviour(PeerEvent::Proxy(p2x_net::proxy_stream::behaviour::ProxyOutput::InboundOpened { peer_id, connection_id, stream })) => {
+                        if proxy_tx.capacity() == 0 {
+                            continue;
+                        }
+                        let tx = proxy_tx.clone();
+                        tokio::spawn(proxy_open::run_worker(peer_id, connection_id, stream, tx));
+                    }
+                    SwarmEvent::Behaviour(PeerEvent::Proxy(p2x_net::proxy_stream::behaviour::ProxyOutput::InboundRejected { .. })) => {}
                     SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Authenticated { session_id, request_id, tenant, role, scopes, quota_profile, authorization_revision, expires_at, .. } }, .. })) if pending_auth.complete(&outbound_id) => {
                         let next_ping_id = request_ids.allocate().map_err(io::Error::other)?;
                         if let AuthAction::Ping { request_id: ping_id, session_id, nonce } = auth_state.authenticated_with_context(request_id, session_id, expires_at, tenant, role, scopes, quota_profile, authorization_revision, next_ping_id, 1, unix_now()) {
