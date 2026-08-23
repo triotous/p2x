@@ -1,4 +1,5 @@
-use super::handler::{OpenProxy, ProxyEvent, ProxyHandler, ProxyRequestId};
+pub use super::handler::ProxyRequestId;
+use super::handler::{OpenProxy, ProxyEvent, ProxyHandler};
 use libp2p::{
     Multiaddr, PeerId,
     core::{Endpoint, transport::PortUse},
