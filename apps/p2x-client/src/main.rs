@@ -839,6 +839,45 @@ async fn main() -> io::Result<()> {
                                 emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", code.as_str()))?;
                                 return Ok(())
                             }
+                            if args.recover_after_failure
+                                && !recovery_attempted
+                                && matches!(
+                                    code,
+                                    PublicErrorCode::RegistryStaleRevision
+                                        | PublicErrorCode::PeerConnectionFailed
+                                        | PublicErrorCode::PeerSetupTimeout
+                                        | PublicErrorCode::ExchangeTimeout
+                                )
+                            {
+                                recovery_attempted = true;
+                                if let (Some(manager), Some(server)) = (connection_manager.as_mut(), proxy_server) {
+                                    let _ = manager.release(server);
+                                }
+                                proxy_open = None;
+                                proxy_attempt = None;
+                                proxy_server = None;
+                                pending_proxy = None;
+                                selected_proxy_connection = None;
+                                proxy_request_id = None;
+                                let route = routes.as_ref().and_then(|config| config.routes.first()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proxy check requires a route"))?;
+                                let session_id = auth_state.current_session_id(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?;
+                                let binding = auth_state.current_session(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?.principal_binding();
+                                let deadline = resolve_setup_deadline.ok_or_else(|| io::Error::other("proxy setup deadline missing"))?;
+                                if std::time::Instant::now() >= deadline {
+                                    emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", PublicErrorCode::PeerSetupTimeout.as_str()))?;
+                                    return Ok(());
+                                }
+                                resolver_state.invalidate(&binding, &route.selector);
+                                let request_id = request_ids.allocate().map_err(io::Error::other)?;
+                                let request = resolver_state.begin(request_id, binding, session_id, route.selector.clone(), unix_now()).map_err(|error| io::Error::other(error.as_str()))?.ok_or_else(|| io::Error::other("resolve request was paced"))?;
+                                let outbound = swarm.behaviour_mut().resolve.send_request(&expected_exchange, request.clone());
+                                if !pending_resolve.begin(outbound) { return Err(io::Error::other("resolve outbound request limit exceeded")); }
+                                resolve_request = Some(request);
+                                resolve_retried = false;
+                                resolve_sent_at = Some(std::time::Instant::now());
+                                emitter.emit(&LifecycleRecord::OperationalError { code: "proxy.recovering", message: "fresh ticket resolution" })?;
+                                continue;
+                            }
                             if let (Some(manager), Some(server)) = (connection_manager.as_mut(), proxy_server) {
                                 let _ = manager.release(server);
                             }

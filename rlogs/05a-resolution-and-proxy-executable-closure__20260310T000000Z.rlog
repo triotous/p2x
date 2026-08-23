@@ -133,3 +133,9 @@ final status:
 
 limit-hook attempt:
 - A temporary held-worker process-hook attempt was tested and reverted because the finite client owner still opens sequentially, so it could not prove exact N+1 saturation; the runner continues to fail resolve-limit/proxy-limit explicitly.
+
+phase 7.1 fresh-ticket recovery:
+- Client proxy authorization now supports one guarded recovery after stale revision, peer setup/connection, or exchange timeout failure.
+- Recovery invalidates the binding/selector metadata, discards the old proxy state, allocates a fresh Resolve request/ticket, and preserves the original setup deadline.
+validation: cargo fmt, workspace clippy, p2x-client tests passed.
+commit: pending phase review
