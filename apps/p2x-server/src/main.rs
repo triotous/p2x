@@ -863,7 +863,10 @@ async fn main() -> io::Result<()> {
                         ));
                     }
                     SwarmEvent::Behaviour(PeerEvent::Proxy(p2x_net::proxy_stream::behaviour::ProxyOutput::InboundRejected { peer_id, connection_id, stream, code })) => {
-                        drop(stream);
+                        if let Some(stream) = stream {
+                            let public_code = PublicErrorCode::parse(code);
+                            tokio::spawn(proxy_open::reject_stream(stream, public_code));
+                        }
                         emitter.emit(&LifecycleRecord::ProxyAuthorization {
                             peer_id: &peer_id.to_string(),
                             connection_id_hash: stable_hash(connection_id),

@@ -1,4 +1,4 @@
-use futures::io::{AsyncRead, AsyncReadExt};
+use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use libp2p::{PeerId, swarm::ConnectionId};
 use p2x_config::ticket_key::VerificationKeyRing;
 use p2x_net::proxy_codec;
@@ -105,6 +105,21 @@ pub async fn run_worker(
             connection_id,
         })
         .await;
+}
+
+pub async fn reject_stream<T: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: T,
+    code: PublicErrorCode,
+) {
+    let request_id = proxy_codec::read_open(&mut stream)
+        .await
+        .ok()
+        .map(|open| open.request_id);
+    let response = ProxyOpenResponseV1::Rejected {
+        request_id,
+        error: PublicError::new(code, true),
+    };
+    let _ = proxy_codec::write_response(&mut stream, &response).await;
 }
 
 pub fn random_stream_id() -> Result<[u8; 16], PublicErrorCode> {
