@@ -711,10 +711,19 @@ async fn main() -> io::Result<()> {
                                 let address = grant.metadata.relay_addresses.first().ok_or_else(|| io::Error::other("resolve returned no relay address"))?;
                                 let address = Multiaddr::try_from(address.clone()).map_err(io::Error::other)?;
                                 target_peer = Some(peer);
-                                if let Some(manager) = connection_manager.as_mut() { manager.admit(peer).map_err(|code| io::Error::other(code.as_str()))?; }
+                                if let Some(manager) = connection_manager.as_mut() {
+                                    let (_, actions) = manager.begin_path(peer, std::time::Instant::now()).map_err(|code| io::Error::other(code.as_str()))?;
+                                    if actions.iter().any(|action| matches!(action, PathAction::DialRelay)) {
+                                        swarm.dial(address.clone()).map_err(io::Error::other)?;
+                                    }
+                                } else {
+                                    swarm.dial(address.clone()).map_err(io::Error::other)?;
+                                }
                                 proxy_request_id = Some(request_id);
                                 proxy_open = Some(OpenProxyStreamV1 { request_id, ticket: grant.ticket, upstream_id: grant.metadata.upstream_id, registration_revision: grant.metadata.registration_revision, ingress_kind: p2x_protocol::IngressKind::FixedTcp });
-                                swarm.dial(address).map_err(io::Error::other)?;
+                                if connection_manager.is_none() {
+                                    swarm.dial(address).map_err(io::Error::other)?;
+                                }
                             }
                             Ok(_) => {}
                             Err(code) => { emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?; return Ok(()); }
