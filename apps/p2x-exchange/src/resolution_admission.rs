@@ -127,6 +127,10 @@ impl ResolveAdmissionLedger {
     pub fn inflight(&self) -> usize {
         self.owners.len()
     }
+
+    pub fn is_admitted(&self, owner: &ResolveOwner) -> bool {
+        self.owners.contains_key(owner)
+    }
     pub fn shutdown(&mut self) {
         self.owners.clear();
         self.clients.clear();
