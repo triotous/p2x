@@ -11,6 +11,7 @@ use p2x_exchange::{
     auth_sessions::AuthSessionLedger,
     authn::FixedTokenProvider,
     registry_admission::{RegistryAdmission, RegistryAdmissionLedger},
+    resolution::Resolver,
 };
 use p2x_net::{
     builder::{
@@ -199,6 +200,9 @@ async fn main() -> io::Result<()> {
             .map_err(io::Error::other)?;
     }
     let local_peer_id = libp2p::PeerId::from_public_key(&key.public());
+    let mut resolver = ticket_key
+        .as_ref()
+        .map(|key| Resolver::new(local_peer_id, key));
     validate_advertise(
         &args.advertise,
         local_peer_id,
@@ -335,6 +339,31 @@ async fn main() -> io::Result<()> {
                 }
                 SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Auth(RequestResponseEvent::InboundFailure { request_id, .. })) => {
                     admission.response_delivered(request_id, chrono_like_now());
+                }
+                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Resolve(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, request_id: _ }, connection_id, .. })) => {
+                    let response = if let Some(resolver) = resolver.as_mut() {
+                        let client_session = sessions.current(&peer.to_string(), chrono_like_now());
+                        resolver.resolve_and_authorize(
+                            peer,
+                            connection_id,
+                            &request,
+                            client_session.as_ref(),
+                            |server| sessions.current(&server.to_string(), chrono_like_now()),
+                            |server| reserved_servers.contains(server),
+                            &registry,
+                            chrono_like_now(),
+                        )
+                    } else {
+                        p2x_protocol::ResolveResponseV1::Rejected {
+                            request_id: Some(match request { p2x_protocol::ResolveRequestV1::Resolve { request_id, .. } => request_id }),
+                            error: PublicError::new(PublicErrorCode::ProtocolCapabilityMismatch, false),
+                        }
+                    };
+                    if swarm.behaviour_mut().resolve.send_response(channel, response).is_err()
+                        && let Some(resolver) = resolver.as_mut()
+                    {
+                        resolver.admission.close_connection(connection_id);
+                    }
                 }
                 SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Registry(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, request_id }, connection_id, .. })) => {
                     if let RegistryAdmission::Rejected(code) = registry_admission.begin(peer, request_id, connection_id, chrono_like_now()) {

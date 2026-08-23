@@ -15,6 +15,19 @@ const MAX_IDEMPOTENCY_GLOBAL: usize = 2048;
 const REVISION_ATTEMPTS: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedRegistration {
+    pub server_peer_id: PeerId,
+    pub tenant: Tenant,
+    pub upstream_id: p2x_protocol::UpstreamId,
+    pub selector_fingerprint: [u8; 32],
+    pub registration_revision: RegistrationRevision,
+    pub server_authorization_revision: u64,
+    pub server_capabilities: Capabilities,
+    pub relay_addresses: Vec<Vec<u8>>,
+    pub registration_expires_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegistrationRecord {
     pub peer_id: PeerId,
     pub instance_id: InstanceId,
@@ -187,7 +200,6 @@ impl Registry {
             || !(10..=60).contains(&lease)
             || !capabilities.contains(Capabilities::RELAY_V2)
             || !capabilities.direct_transport()
-            || capabilities.contains(Capabilities::DCUTR)
         {
             return Err(RegistryError::InvalidAdvertisement);
         }
@@ -454,7 +466,7 @@ impl Registry {
         &self,
         selector: &ScopedSelector,
         now: i64,
-    ) -> Result<&RegistrationRecord, RegistryError> {
+    ) -> Result<ResolvedRegistration, RegistryError> {
         let key = (
             selector.tenant().clone(),
             selector.selector().fingerprint(selector.tenant()),
@@ -470,13 +482,31 @@ impl Registry {
         if record.expires_at <= now {
             return Err(RegistryError::NotFound);
         }
-        if record.services.as_slice().iter().any(|service| {
-            service.selector() == selector.selector() && service.health() == Health::Ready
-        }) {
-            Ok(record)
-        } else {
-            Err(RegistryError::Offline)
+        let service = record
+            .services
+            .as_slice()
+            .iter()
+            .find(|service| service.selector() == selector.selector())
+            .ok_or(RegistryError::NotFound)?;
+        if service.health() != Health::Ready {
+            return Err(RegistryError::Offline);
         }
+        let relay_addresses = record
+            .relay_addresses
+            .iter()
+            .map(|address| address.as_bytes().to_vec())
+            .collect();
+        Ok(ResolvedRegistration {
+            server_peer_id: record.peer_id,
+            tenant: record.tenant.clone(),
+            upstream_id: service.upstream_id().clone(),
+            selector_fingerprint: service.selector().fingerprint(selector.tenant()),
+            registration_revision: record.registration_revision,
+            server_authorization_revision: record.authorization_revision,
+            server_capabilities: record.capabilities,
+            relay_addresses,
+            registration_expires_at: record.expires_at,
+        })
     }
     fn remove_indexes(&mut self, record: &RegistrationRecord) {
         for service in record.services.as_slice() {

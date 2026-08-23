@@ -4,3 +4,5 @@ pub mod auth_sessions;
 pub mod authn;
 pub mod registry;
 pub mod registry_admission;
+pub mod resolution;
+pub mod resolution_admission;

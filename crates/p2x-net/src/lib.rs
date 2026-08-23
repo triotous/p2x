@@ -8,6 +8,7 @@ pub mod probe;
 pub mod probe_stream;
 pub mod probe_worker;
 pub mod proxy_codec;
+pub mod proxy_stream;
 pub mod registry_codec;
 pub mod relay_admission;
 pub mod reservation;

@@ -1,3 +1,12 @@
+#[allow(dead_code)]
+mod config;
+#[allow(dead_code)]
+mod connection_manager;
+#[allow(dead_code)]
+mod proxy_open;
+#[allow(dead_code)]
+mod resolver;
+
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use libp2p::{
@@ -123,6 +132,8 @@ struct Args {
     #[arg(long, action = clap::ArgAction::Append)]
     exchange: Vec<Multiaddr>,
     #[arg(long)]
+    routes_file: Option<PathBuf>,
+    #[arg(long)]
     exchange_peer_id: Option<String>,
     #[arg(long)]
     credential_env: Option<String>,
@@ -244,6 +255,18 @@ fn drive_path_actions(
 async fn main() -> io::Result<()> {
     let started_at = std::time::Instant::now();
     let args = Args::parse();
+    if !args.unsafe_connectivity_lab && args.routes_file.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "product mode requires --routes-file",
+        ));
+    }
+    let _routes = args
+        .routes_file
+        .as_deref()
+        .map(config::ClientConfig::load)
+        .transpose()
+        .map_err(io::Error::other)?;
     if (args.test_hold_relay_seconds > 0
         || args.test_relay_circuit_count != 1
         || !args.test_relay_target.is_empty())
