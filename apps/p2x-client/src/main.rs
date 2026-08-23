@@ -546,7 +546,7 @@ async fn main() -> io::Result<()> {
     let mut maintenance = tokio::time::interval(std::time::Duration::from_millis(100));
     struct ProxyResult {
         request_id: [u8; 16],
-        result: Result<[u8; 16], PublicErrorCode>,
+        result: Result<([u8; 16], [u8; 16]), PublicErrorCode>,
     }
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerResult>(128);
     let (proxy_result_tx, mut proxy_result_rx) = mpsc::channel::<ProxyResult>(16);
@@ -697,7 +697,7 @@ async fn main() -> io::Result<()> {
             Some(proxy_result) = proxy_result_rx.recv() => {
                 if proxy_request_id == Some(proxy_result.request_id) {
                     match proxy_result.result {
-                        Ok(_) => {
+                        Ok((request_id, stream_id)) => {
                             if let (Some(manager), Some(server), Some(connection)) = (connection_manager.as_mut(), proxy_server, selected_proxy_connection) {
                                 let selected = if connections.is_direct(server, connection) {
                                     PathDecision::Direct(connection)
@@ -707,6 +707,15 @@ async fn main() -> io::Result<()> {
                                 manager.finish_path(server, Some(selected));
                                 manager.close_active(server);
                             }
+                            let peer = proxy_server.ok_or_else(|| io::Error::other("proxy authorization peer missing"))?;
+                            emitter.emit(&LifecycleRecord::ProxyAuthorization {
+                                peer_id: &peer.to_string(),
+                                connection_id_hash: selected_proxy_connection.map(stable_hash).unwrap_or_default(),
+                                request_id_hash: stable_hash(request_id),
+                                stream_id_hash: Some(stable_hash(stream_id)),
+                                authorized: true,
+                                code: None,
+                            })?;
                             emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "proxy.authorized"))?;
                             return Ok(())
                         }
