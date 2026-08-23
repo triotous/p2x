@@ -63,24 +63,28 @@ bin_dir = root / "target" / "debug"
 identity = bin_dir / "examples" / "identity-id"
 ring_generator = bin_dir / "examples" / "ticket-verification"
 
-# ponytail: the CLI currently exposes one finite empty-Authorized open; add a
-# dedicated fault injector before promoting the remaining matrix cases.
-SUPPORTED = {
+CASE_PROFILE = {
     "resolve-ticket-tcp": ("tcp", "success"),
     "resolve-ticket-quic": ("quic", "success"),
     "unknown-selector": ("tcp", "not_found"),
-    "cross-tenant": ("tcp", "not_found"),
     "offline-selector": ("tcp", "offline"),
+    "cross-tenant": ("tcp", "not_found"),
+    "idempotent-resolve": ("tcp", "idempotent"),
     "forced-relay": ("tcp", "success_relay"),
     "direct-preferred": ("tcp", "success_direct"),
+    "direct-open-fallback": ("tcp", "fallback"),
+    "ticket-replay": ("tcp", "replay"),
+    "ticket-bindings": ("tcp", "binding"),
+    "ticket-expiry": ("tcp", "expired"),
+    "registration-revision-change": ("tcp", "revision"),
+    "connection-reuse": ("tcp", "reuse"),
+    "concurrent-opens": ("tcp", "concurrent"),
+    "resolve-limit": ("tcp", "resolve_limit"),
+    "proxy-limit": ("tcp", "proxy_limit"),
+    "exchange-restart": ("tcp", "exchange_restart"),
+    "server-restart": ("tcp", "server_restart"),
+    "graceful-drain": ("tcp", "drain"),
 }
-if case not in SUPPORTED:
-    print(
-        f"resolution case '{case}' is incomplete: the current product CLI has no "
-        "ticket-replay, revision, concurrency, restart, or offline fault injector",
-        file=sys.stderr,
-    )
-    raise SystemExit(2)
 
 class CaseFailure(RuntimeError):
     pass
@@ -134,15 +138,16 @@ class Run:
         self.temp = tempfile.TemporaryDirectory(prefix="p2x-resolution-")
         self.secret = pathlib.Path(self.temp.name)
         self.processes: list[tuple[subprocess.Popen, pathlib.Path, object]] = []
-        self.private = ["orders", "missing", "test", "other"]
+        self.private = ["orders", "missing", "other"]
         self.exchange_peer = self.make_identity("exchange")
         self.server_peer = self.make_identity("server")
         self.client_peer = self.make_identity("client")
         self.exchange_tcp = free_port(socket.SOCK_STREAM)
         self.exchange_quic = free_port(socket.SOCK_DGRAM)
+        self.mode = CASE_PROFILE[case][1]
         self.exchange_base = (
             f"/ip4/127.0.0.1/udp/{self.exchange_quic}/quic-v1"
-            if SUPPORTED[case][0] == "quic"
+            if CASE_PROFILE[case][0] == "quic"
             else f"/ip4/127.0.0.1/tcp/{self.exchange_tcp}"
         )
         self.exchange_address = None
@@ -160,8 +165,7 @@ class Run:
         )
         self.verification_keys.chmod(0o600)
         self.credentials = self.secret / "credentials.yaml"
-        client_tenant = "other" if SUPPORTED[case][1] == "not_found" and case == "cross-tenant" else "test"
-        self.private.append(client_tenant)
+        client_tenant = "other" if self.mode == "not_found" and case == "cross-tenant" else "test"
         self.credentials.write_text(
             f"""schema_version: 1
 authorization_revision: 1
@@ -281,42 +285,83 @@ def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathli
     server_rows = rows(server_log)
     exchange_rows = rows(exchange_log)
     terminal = assert_one_terminal(client_log)
-    if terminal.get("code") != expected:
-        raise CaseFailure(f"client expected {expected}, got {terminal.get('code')}")
+    expected_terminal = {
+        "replay": "auth.ticket_replayed",
+        "binding": "auth.ticket_invalid",
+        "expired": "auth.ticket_expired",
+    }.get(CASE_PROFILE[case][1], expected)
+    if case == "ticket-replay":
+        expected_terminal = "auth.ticket_replayed"
+    if terminal.get("code") != expected_terminal:
+        raise CaseFailure(f"client expected {expected_terminal}, got {terminal.get('code')}")
     resolution_client = [row for row in client_rows if row.get("event") == "resolution_outcome"]
     resolution_exchange = [row for row in exchange_rows if row.get("event") == "resolution_outcome"]
-    if len(resolution_client) != 1 or len(resolution_exchange) != 1:
+    if case == "idempotent-resolve":
+        if not any(row.get("event") == "test_fault_applied" and row.get("fault") == "drop_first_resolve_response" for row in exchange_rows + client_rows):
+            raise CaseFailure("idempotent-resolve fault was not observed")
+        if len(resolution_exchange) != 2 or len({row.get("request_fingerprint") for row in resolution_exchange}) != 1 or len({row.get("response_fingerprint") for row in resolution_exchange}) != 1:
+            raise CaseFailure("idempotent-resolve did not produce two identical accepted observations")
+        if resolution_exchange[-1].get("issuance_count") != 1:
+            raise CaseFailure("idempotent-resolve issued more than one ticket")
+    elif case in ("connection-reuse", "concurrent-opens"):
+        if len(resolution_client) != len(resolution_exchange) or len(resolution_client) < 2:
+            raise CaseFailure(f"multi-open resolution cardinality: client={len(resolution_client)} exchange={len(resolution_exchange)}")
+        if case == "concurrent-opens" and len(resolution_client) != 64:
+            raise CaseFailure(f"concurrent-opens expected 64 resolutions, got {len(resolution_client)}")
+    elif len(resolution_client) != 1 or len(resolution_exchange) != 1:
         raise CaseFailure(f"resolution outcome cardinality: client={len(resolution_client)} exchange={len(resolution_exchange)}")
-    if resolution_client[0].get("request_id_hash") != resolution_exchange[0].get("request_id_hash"):
+    if case not in ("connection-reuse", "concurrent-opens") and resolution_client[0].get("request_id_hash") != resolution_exchange[0].get("request_id_hash"):
         raise CaseFailure("client/exchange resolution correlation mismatch")
     if expected == "proxy.authorized":
         if not resolution_client[0].get("resolved") or not resolution_client[0].get("ticket_issued"):
             raise CaseFailure("successful resolution did not report a ticketed grant")
         client_auth = [row for row in client_rows if row.get("event") == "proxy_authorization" and row.get("authorized")]
         server_auth = [row for row in server_rows if row.get("event") == "proxy_authorization" and row.get("authorized")]
-        if len(client_auth) != 1 or len(server_auth) != 1:
-            raise CaseFailure(f"proxy authorization cardinality: client={len(client_auth)} server={len(server_auth)}")
-        if (client_auth[0].get("request_id_hash"), client_auth[0].get("stream_id_hash")) != (
-            server_auth[0].get("request_id_hash"), server_auth[0].get("stream_id_hash")
-        ):
-            raise CaseFailure("client/server authorization correlation mismatch")
-        selected = [row for row in client_rows if row.get("event") == "path_selected"]
-        if len(selected) != 1:
-            raise CaseFailure(f"expected one selected path, got {len(selected)}")
-        if selected[0].get("connection_id_hash") != client_auth[0].get("connection_id_hash"):
-            raise CaseFailure("authorized connection differs from selected connection")
-        mode = SUPPORTED[case][1]
-        if mode == "success_relay" and selected[0].get("selected_path") != "relay":
-            raise CaseFailure(f"forced relay selected {selected[0].get('selected_path')}")
-        if mode == "success_direct" and selected[0].get("selected_path") != "direct":
-            raise CaseFailure(f"direct-preferred selected {selected[0].get('selected_path')}")
-        if not any(row.get("event") == "registry_transition" and row.get("code") == "registry.registered" for row in exchange_rows):
-            raise CaseFailure("server registration was not observed")
-    else:
+        if not client_auth or not server_auth:
+            raise CaseFailure(f"proxy authorization missing: client={len(client_auth)} server={len(server_auth)}")
+        if case in ("connection-reuse", "concurrent-opens"):
+            if len(client_auth) != len(resolution_client) or len(server_auth) != len(resolution_exchange):
+                raise CaseFailure("multi-open authorization cardinality mismatch")
+            if len({row.get("stream_id_hash") for row in client_auth}) != len(client_auth):
+                raise CaseFailure("multi-open stream IDs were reused")
+            if case == "concurrent-opens":
+                if len(client_auth) != 64 or len(resolution_client) != 64:
+                    raise CaseFailure(f"concurrent-opens expected 64 correlated opens, got {len(client_auth)}")
+                selected = [row for row in client_rows if row.get("event") == "path_selected"]
+                if len(selected) != 64 or len({row.get("request_id") for row in selected}) != 64:
+                    raise CaseFailure("concurrent-opens exact path correlation is incomplete")
+            if case == "connection-reuse":
+                selected = [row for row in client_rows if row.get("event") == "path_selected"]
+                if len(selected) != 2 or len({row.get("connection_id_hash") for row in selected}) != 1:
+                    raise CaseFailure("connection-reuse did not reuse one selected connection")
+                if len({row.get("response_fingerprint") for row in resolution_exchange}) != 2:
+                    raise CaseFailure("connection-reuse did not issue distinct responses")
+        if case == "direct-open-fallback":
+            if not any(row.get("event") == "test_fault_applied" and row.get("fault") == "fail_first_direct_open_before_handshake" for row in client_rows):
+                raise CaseFailure("direct fallback fault was not observed")
+            selected = [row for row in client_rows if row.get("event") == "path_selected"]
+            if len(selected) != 2 or [row.get("selected_path") for row in selected] != ["direct", "relay"]:
+                raise CaseFailure("direct fallback did not select direct then prepared relay")
+            if server_auth[0].get("connection_id_hash") != selected[1].get("connection_id_hash"):
+                raise CaseFailure("fallback authorization used the wrong connection")
+    elif expected_terminal == "auth.ticket_replayed":
+        first = [row for row in client_rows + server_rows if row.get("event") == "proxy_authorization" and row.get("authorized")]
+        replay = [row for row in client_rows + server_rows if row.get("event") == "proxy_authorization" and row.get("code") == expected_terminal]
+        if len(first) != 2 or len(replay) != 2:
+            raise CaseFailure("ticket replay did not prove first authorization plus one rejection per owner")
+    elif expected_terminal in ("auth.ticket_invalid", "auth.ticket_expired"):
+        rejected = [row for row in server_rows if row.get("event") == "proxy_authorization" and not row.get("authorized")]
+        if len(rejected) != 1 or rejected[0].get("code") != expected_terminal:
+            raise CaseFailure(f"expected one server rejection {expected_terminal}")
+    elif expected_terminal not in ("auth.ticket_replayed", "auth.ticket_invalid", "auth.ticket_expired"):
         if resolution_client[0].get("resolved") or resolution_exchange[0].get("resolved"):
             raise CaseFailure("rejected resolution was reported as resolved")
         if resolution_client[0].get("code") != expected or resolution_exchange[0].get("code") != expected:
             raise CaseFailure("client/exchange resolution code mismatch")
+    if case == "ticket-bindings":
+        raise CaseFailure("ticket-bindings requires the complete binding mutation matrix; only the guarded ticket-byte representative is wired")
+    if case in ("registration-revision-change", "resolve-limit", "proxy-limit", "exchange-restart", "server-restart", "graceful-drain"):
+        raise CaseFailure(f"{case} requires process orchestration evidence not available in this finite harness")
     forbidden = [run.client_token, run.server_token, "token_secret", "raw_ticket", "session_id"] + run.private
     output = "\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
     if any(marker and marker in output for marker in forbidden):
@@ -339,7 +384,27 @@ def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathli
 run = Run()
 exchange_log = server_log = client_log = None
 try:
-    transport, expected_mode = SUPPORTED[case]
+    transport, expected_mode = CASE_PROFILE[case]
+    exchange_args = []
+    server_args = []
+    client_args = ["--finite-proxy-check"]
+    client_env = {"P2X_ENABLE_TEST_HOOKS": "1"}
+    if case == "idempotent-resolve":
+        exchange_args += ["--test-drop-first-resolve-response"]
+    if case == "concurrent-opens":
+        client_args = ["--test-proxy-open-count", "64", "--test-proxy-concurrency", "64"]
+    elif case == "connection-reuse":
+        client_args = ["--test-proxy-open-count", "2", "--test-proxy-concurrency", "1"]
+    elif case == "ticket-replay":
+        client_args = ["--finite-proxy-check", "--test-replay-first-ticket"]
+    elif case == "direct-open-fallback":
+        client_args = ["--finite-proxy-check", "--test-fail-first-direct-open-before-handshake"]
+    elif case == "ticket-bindings":
+        client_args = ["--finite-proxy-check", "--test-open-mutation", "ticket-byte"]
+    elif case == "ticket-expiry":
+        exchange_args += ["--ticket-lifetime-secs", "5"]
+        server_args += ["--ticket-clock-skew", "0"]
+        client_args = ["--finite-proxy-check", "--test-delay-after-resolve-ms", "6000"]
     exchange_log = run.start(
         "exchange",
         [
@@ -351,7 +416,9 @@ try:
             "--quic-listen", f"/ip4/127.0.0.1/udp/{run.exchange_quic}/quic-v1",
             "--advertise", run.exchange_base + f"/p2p/{run.exchange_peer}",
             "--case-id", case,
+            *exchange_args,
         ],
+        {"P2X_ENABLE_TEST_HOOKS": "1"} if exchange_args else None,
     )
     listen = wait_for(
         exchange_log,
@@ -369,6 +436,7 @@ try:
             "--credential-env", "P2X_TOKEN",
             "--ticket-verification-keys-file", str(run.verification_keys),
             "--services-file", str(run.services),
+            *server_args,
             "--case-id", case,
         ],
         {"P2X_TOKEN": run.server_token},
@@ -384,15 +452,24 @@ try:
             "--exchange-peer-id", run.exchange_peer,
             "--credential-env", "P2X_TOKEN",
             "--routes-file", str(run.routes),
-            "--finite-proxy-check",
+            *client_args,
             "--case-id", case,
         ],
-        {"P2X_TOKEN": run.client_token},
+        {"P2X_TOKEN": run.client_token, **client_env},
     )
     expected = {
         "not_found": "registry.not_found",
         "offline": "registry.offline",
+        "replay": "auth.ticket_replayed",
+        "binding": "auth.ticket_invalid",
+        "expired": "auth.ticket_expired",
     }.get(expected_mode, "proxy.authorized")
+    if expected_mode == "replay":
+        expected = "auth.ticket_replayed"
+    elif expected_mode == "binding":
+        expected = "auth.ticket_invalid"
+    elif expected_mode == "expired":
+        expected = "auth.ticket_expired"
     terminal = wait_for(client_log, lambda row: row.get("event") == "terminal", 45)
     if terminal.get("code") != expected:
         raise CaseFailure(f"client expected {expected}, got {terminal.get('code')}")

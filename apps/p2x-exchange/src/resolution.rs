@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 const MIN_TICKET_LIFETIME: i64 = 5;
 const DEFAULT_TICKET_LIFETIME: i64 = 30;
-const MAX_IDEMPOTENCY_PER_CLIENT: usize = 8;
+const MAX_IDEMPOTENCY_PER_CLIENT: usize = 128;
 const MAX_IDEMPOTENCY_GLOBAL: usize = 2_048;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

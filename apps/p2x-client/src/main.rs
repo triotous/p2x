@@ -36,8 +36,7 @@ use p2x_net::{
     proxy_stream::behaviour::{ProxyOutput, ProxyRequestId},
 };
 use p2x_protocol::{
-    AuthRequest, AuthResponse, OpenProxyStreamV1, PublicErrorCode, ResolveRequestV1,
-    ResolveResponseV1, Role,
+    AuthRequest, AuthResponse, OpenProxyStreamV1, PublicErrorCode, ResolveRequestV1, Role,
 };
 use std::{
     collections::{HashSet, VecDeque},
@@ -207,8 +206,6 @@ struct Args {
     finite_proxy_check: bool,
     #[arg(long, hide = true, default_value_t = 0)]
     test_hold_relay_seconds: u64,
-    #[arg(long, hide = true)]
-    test_drop_first_resolve_response: bool,
     #[arg(long, hide = true, default_value_t = 1)]
     test_relay_circuit_count: u32,
     #[arg(long, hide = true, action = clap::ArgAction::Append)]
@@ -378,8 +375,7 @@ async fn main() -> io::Result<()> {
         || args.test_replay_first_ticket
         || !matches!(args.test_open_mutation, OpenMutation::None)
         || args.test_fail_first_direct_open_before_handshake
-        || args.test_hold_proxy_handshake_ms.is_some()
-        || args.test_drop_first_resolve_response;
+        || args.test_hold_proxy_handshake_ms.is_some();
     if route_test_hook_used && std::env::var("P2X_ENABLE_TEST_HOOKS").ok().as_deref() != Some("1") {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -582,7 +578,7 @@ async fn main() -> io::Result<()> {
         PendingRequest::new();
     let mut resolve_request: Option<ResolveRequestV1> = None;
     let mut resolve_retried = false;
-    let mut dropped_resolve_response = false;
+    let mut resolve_sent_at: Option<std::time::Instant> = None;
     let mut resolve_setup_deadline: Option<std::time::Instant> = None;
     let mut proxy_open: Option<OpenProxyStreamV1> = None;
     let mut last_proxy_open: Option<OpenProxyStreamV1> = None;
@@ -634,6 +630,21 @@ async fn main() -> io::Result<()> {
                     emitter.emit(&LifecycleRecord::OperationalError { code: "connection.outgoing", message: &message })?;
                 }
                 let now = std::time::Instant::now();
+                if !resolve_retried
+                    && resolve_sent_at.is_some_and(|sent| now.duration_since(sent) >= std::time::Duration::from_secs(5))
+                    && resolve_setup_deadline.is_some_and(|deadline| now < deadline)
+                    && let Some(request) = resolve_request.as_ref().cloned()
+                {
+                    pending_resolve.clear();
+                    let retry = swarm
+                        .behaviour_mut()
+                        .resolve
+                        .send_request(&expected_exchange, request);
+                    if pending_resolve.begin(retry) {
+                        resolve_retried = true;
+                        resolve_sent_at = Some(now);
+                    }
+                }
                 connections.sweep(now);
                 if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
                     proxy.expire(now);
@@ -812,6 +823,7 @@ async fn main() -> io::Result<()> {
                             resolve_request = Some(request);
                             resolve_setup_deadline = connection_manager.as_ref().map(|manager| manager.setup_deadline(std::time::Instant::now()));
                             resolve_retried = false;
+                            resolve_sent_at = Some(std::time::Instant::now());
                             continue
                         }
                         Err(code) => {
@@ -897,6 +909,15 @@ async fn main() -> io::Result<()> {
                                 let actions = kind.map_or_else(Vec::new, |kind| current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind }));
                                 let proxy = swarm.behaviour_mut().proxy_stream.as_mut().ok_or_else(|| io::Error::other("proxy is unavailable in product mode"))?;
                                 let mut terminal = None;
+                                if args.test_fail_first_direct_open_before_handshake
+                                    && !test_direct_failure_applied
+                                    && observed_path == ProbePath::Direct
+                                    && actions.iter().any(|action| matches!(action, PathAction::OpenExact { .. }))
+                                {
+                                    test_direct_failure_applied = true;
+                                    proxy.fail_next_open_before_handshake();
+                                    emitter.emit(&LifecycleRecord::TestFaultApplied { fault: "fail_first_direct_open_before_handshake" })?;
+                                }
                                 drive_proxy_path_actions(proxy, current, peer_id, &open, deadline, &emitter, actions, &mut pending_proxy, &mut selected_proxy_connection, &mut terminal)?;
                                 if terminal.is_some() {
                                     return Err(io::Error::other("proxy path setup failed"));
@@ -951,6 +972,7 @@ async fn main() -> io::Result<()> {
                             if !pending_resolve.begin(outbound) { return Err(io::Error::other("resolve outbound request limit exceeded")); }
                             resolve_setup_deadline = connection_manager.as_ref().map(|manager| manager.setup_deadline(std::time::Instant::now()));
                             resolve_retried = false;
+                            resolve_sent_at = Some(std::time::Instant::now());
                             resolve_request = Some(request);
                         }
                         if args.finite_relay_ping && let Some(address) = server_address.clone() {
@@ -988,6 +1010,7 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::OutboundFailure { request_id, error: libp2p::request_response::OutboundFailure::ConnectionClosed, .. })) if credential.is_some() => { pending_auth.complete(&request_id); }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Resolve(RequestResponseEvent::OutboundFailure { request_id: outbound_id, error: libp2p::request_response::OutboundFailure::Timeout, .. })) if pending_resolve.complete(&outbound_id) => {
                         let now = std::time::Instant::now();
+                        resolve_sent_at = None;
                         if !resolve_retried
                             && resolve_setup_deadline.is_some_and(|deadline| now < deadline)
                             && let Some(request) = resolve_request.as_ref().cloned()
@@ -1013,27 +1036,11 @@ async fn main() -> io::Result<()> {
                         return Ok(());
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Resolve(RequestResponseEvent::Message { peer: _, message: RequestResponseMessage::Response { request_id: outbound_id, response }, .. })) if pending_resolve.complete(&outbound_id) => {
-                        if args.test_drop_first_resolve_response
-                            && !dropped_resolve_response
-                            && matches!(&response, ResolveResponseV1::Resolved { .. })
-                            && let Some(request) = resolve_request.as_ref().cloned()
-                        {
-                            let retry = swarm
-                                .behaviour_mut()
-                                .resolve
-                                .send_request(&expected_exchange, request);
-                            if pending_resolve.begin(retry) {
-                                dropped_resolve_response = true;
-                                emitter.emit(&LifecycleRecord::TestFaultApplied {
-                                    fault: "drop_first_resolve_response",
-                                })?;
-                                continue;
-                            }
-                        }
                         let request = resolve_request.take().ok_or_else(|| io::Error::other("resolve response without request"))?;
                         let (request_id, session_id, selector) = match request { ResolveRequestV1::Resolve { request_id, session_id, selector, .. } => (request_id, session_id, selector) };
                         let binding = auth_state.current_session(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?.principal_binding();
                         let resolution_request_id_hash = stable_hash(request_id);
+                        resolve_sent_at = None;
                         let response_fingerprint = response
                             .canonical_bytes()
                             .map(stable_hash)
@@ -1072,7 +1079,12 @@ async fn main() -> io::Result<()> {
                                 if let Some(delay) = args.test_delay_after_resolve_ms {
                                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                                 }
-                                last_proxy_open = Some(open.clone());
+                                if args.test_replay_first_ticket {
+                                    last_proxy_open = Some(open.clone());
+                                }
+                                if !args.test_replay_first_ticket {
+                                    last_proxy_open = Some(open.clone());
+                                }
                                 proxy_open = Some(open);
                                 if let Some(manager) = connection_manager.as_mut() {
                                     let started = std::time::Instant::now();
@@ -1089,15 +1101,14 @@ async fn main() -> io::Result<()> {
                                     proxy_attempt = Some(path);
                                     let mut terminal = None;
                                     let proxy = swarm.behaviour_mut().proxy_stream.as_mut().ok_or_else(|| io::Error::other("proxy is unavailable in product mode"))?;
+                                    let current = proxy_attempt.as_mut().expect("proxy attempt was stored");
                                     if args.test_fail_first_direct_open_before_handshake
                                         && !test_direct_failure_applied
-                                        && matches!(proxy_attempt.as_ref().map(|attempt| attempt.state), Some(p2x_net::PathState::Committed { decision: PathDecision::Direct(_), .. }))
                                     {
                                         test_direct_failure_applied = true;
                                         proxy.fail_next_open_before_handshake();
                                         emitter.emit(&LifecycleRecord::TestFaultApplied { fault: "fail_first_direct_open_before_handshake" })?;
                                     }
-                                    let current = proxy_attempt.as_mut().expect("proxy attempt was stored");
                                     let should_dial = actions.iter().any(|action| matches!(action, PathAction::DialRelay));
                                     drive_proxy_path_actions(proxy, current, peer, proxy_open.as_ref().expect("proxy open was stored"), proxy_setup_deadline.expect("proxy deadline was stored"), &emitter, actions, &mut pending_proxy, &mut selected_proxy_connection, &mut terminal)?;
                                     if terminal.is_some() {

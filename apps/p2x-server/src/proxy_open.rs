@@ -38,12 +38,14 @@ async fn read_open_and_require_half_close<T: AsyncRead + Unpin>(
     Ok(open)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_worker(
     peer_id: PeerId,
     connection_id: ConnectionId,
     mut stream: libp2p::swarm::Stream,
     verification_ring: Option<VerificationKeyRing>,
     now: i64,
+    clock_skew: i64,
     candidates: mpsc::Sender<Candidate>,
     releases: mpsc::Sender<Release>,
 ) {
@@ -60,7 +62,7 @@ pub async fn run_worker(
     let validation = match (&verification_ring, open.as_ref()) {
         (Some(ring), Ok(open)) => super::ticket_admission::TicketAdmissionLedger::new(
             super::ticket_admission::MAX_REPLAY_ENTRIES,
-            30,
+            clock_skew,
         )
         .expect("worker verification limits are valid")
         .verify_candidate(ring, open.ticket.as_bytes(), now),

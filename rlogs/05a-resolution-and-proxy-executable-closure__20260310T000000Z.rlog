@@ -81,4 +81,16 @@ validation:
 - resolve-ticket-tcp live case: passed.
 - resolve-ticket-quic live case: passed earlier after owner changes.
 - canonical runner still has 13 status-2 cases; runner refactor is next.
+commit: phase 6.7 committed as c5017ca
+
+phase 6.7/runner evidence closure:
+- Replaced the resolution runner's seven-case SUPPORTED early exit with explicit profiles for all 20 declared names.
+- Added real runner coverage for idempotent Resolve, direct pre-handshake fallback, replay rejection, ticket-byte binding rejection, expiry rejection, sequential reuse, and 64 concurrent opens; these cases assert event cardinality, fingerprints, stream uniqueness, and selected-path order.
+- Added explicit missing-evidence failures for binding matrix completion, revision mutation, resolve/proxy limits, exchange/server restart, and graceful-drain instead of silently certifying generic authorization.
+- Fixed the runner privacy marker list to avoid treating public case labels as secrets while retaining token/raw-ticket/session/private-selector scans.
+validation:
+- cargo fmt/check/clippy/test workspace: passed after final changes.
+- Executable resolution cases passed: existing TCP/QUIC seven, idempotent-resolve, direct-open-fallback, ticket-replay, ticket-expiry, and concurrent-opens/connection-reuse.
+- ticket-bindings deliberately fails with missing complete matrix evidence.
+- six process cases deliberately fail with missing orchestration evidence; no false green status is emitted.
 commit: phase 6.7 pending review
