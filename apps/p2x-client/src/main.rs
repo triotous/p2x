@@ -749,12 +749,24 @@ async fn main() -> io::Result<()> {
                                 if !pending_auth.begin(outbound) { return Err(io::Error::other("auth outbound request limit exceeded")); }
                             }
                         }
+                        if let Some(manager) = connection_manager.as_mut()
+                            && peer_id != expected_exchange
+                            && let Err(error) = manager.on_connection_established(
+                                peer_id,
+                                connection_id,
+                                &endpoint,
+                                std::time::Instant::now(),
+                            )
+                        {
+                            swarm.close_connection(connection_id);
+                            let message = error.to_string();
+                            emitter.emit(&LifecycleRecord::OperationalError {
+                                code: "connection.rejected",
+                                message: &message,
+                            })?;
+                            continue;
+                        }
                         if target_peer == Some(peer_id) {
-                            if let Some(manager) = connection_manager.as_mut()
-                                && proxy_server == Some(peer_id)
-                            {
-                                manager.on_connection_established(peer_id, connection_id, &endpoint, std::time::Instant::now()).map_err(io::Error::other)?;
-                            }
                             if let Err(error) = connections.on_connection_established(peer_id, connection_id, &endpoint, std::time::Instant::now()) {
                                 swarm.close_connection(connection_id);
                                 let message = error.to_string();
@@ -894,6 +906,7 @@ async fn main() -> io::Result<()> {
                         let request = resolve_request.take().ok_or_else(|| io::Error::other("resolve response without request"))?;
                         let (request_id, session_id, selector) = match request { ResolveRequestV1::Resolve { request_id, session_id, selector, .. } => (request_id, session_id, selector) };
                         let binding = auth_state.current_session(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?.principal_binding();
+                        let resolution_request_id_hash = stable_hash(request_id);
                         match resolver_state.complete(response, &binding, session_id, &selector, unix_now()) {
                             Ok(grant) if args.finite_proxy_check => {
                                 let peer = grant.metadata.server_peer_id;
@@ -934,7 +947,17 @@ async fn main() -> io::Result<()> {
                                 }
                             }
                             Ok(_) => {}
-                            Err(code) => { emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?; return Ok(()); }
+                            Err(code) => {
+                                emitter.emit(&LifecycleRecord::ResolutionOutcome {
+                                    peer_id: &expected_exchange.to_string(),
+                                    request_id_hash: resolution_request_id_hash,
+                                    resolved: false,
+                                    ticket_issued: false,
+                                    code: Some(code.as_str()),
+                                })?;
+                                emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                                return Ok(());
+                            }
                         }
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Proxy(ProxyOutput::OutboundOpened { request_id, peer_id, connection_id, stream })) if pending_proxy == Some(request_id) => {
@@ -980,7 +1003,7 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => {
                         if let Some(manager) = connection_manager.as_mut()
-                            && proxy_server == Some(peer_id)
+                            && peer_id != expected_exchange
                         {
                             manager.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?;
                         }
@@ -1091,13 +1114,20 @@ async fn main() -> io::Result<()> {
                         }
                         match event.result {
                             Ok(connection_id) => {
-                                if proxy_capabilities
-                                    .is_some_and(|capabilities| capabilities.contains(p2x_protocol::Capabilities::DCUTR))
-                                    && let Some(manager) = connection_manager.as_mut()
-                                    && proxy_server == Some(event.remote_peer_id)
+                                if let Some(manager) = connection_manager.as_mut()
+                                    && event.remote_peer_id != expected_exchange
                                 {
-                                    manager.on_dcutr_succeeded(event.remote_peer_id, connection_id, std::time::Instant::now()).map_err(io::Error::other)?;
-                                    if let (Some(current), Some(open), Some(deadline)) = (proxy_attempt.as_mut(), proxy_open.as_ref().cloned(), proxy_setup_deadline) {
+                                    manager
+                                        .on_dcutr_succeeded(
+                                            event.remote_peer_id,
+                                            connection_id,
+                                            std::time::Instant::now(),
+                                        )
+                                        .map_err(io::Error::other)?;
+                                    if proxy_capabilities
+                                    .is_some_and(|capabilities| capabilities.contains(p2x_protocol::Capabilities::DCUTR))
+                                    && proxy_server == Some(event.remote_peer_id)
+                                    && let (Some(current), Some(open), Some(deadline)) = (proxy_attempt.as_mut(), proxy_open.as_ref().cloned(), proxy_setup_deadline) {
                                         let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::DirectReady(connection_id) });
                                         let proxy = swarm.behaviour_mut().proxy_stream.as_mut().ok_or_else(|| io::Error::other("proxy is unavailable in product mode"))?;
                                         let mut terminal = None;

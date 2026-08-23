@@ -103,9 +103,15 @@ impl ServiceConfig {
                     "duplicate service identifier or selector".into(),
                 ));
             }
-            if entry.enabled {
-                services.push(ServiceAdvertisementV1::new(id, selector, Health::Ready));
-            }
+            services.push(ServiceAdvertisementV1::new(
+                id,
+                selector,
+                if entry.enabled {
+                    Health::Ready
+                } else {
+                    Health::Unavailable
+                },
+            ));
         }
         let services =
             ServiceSet::new(services).map_err(|e| ServiceConfigError::Invalid(e.to_string()))?;
@@ -134,6 +140,16 @@ mod tests {
         assert!(ServiceConfig::load(&path).is_err());
         let _ = std::fs::remove_file(path);
     }
+    #[test]
+    fn disabled_services_are_retained_as_unavailable() {
+        let path =
+            std::env::temp_dir().join(format!("p2x-services-offline-{}", std::process::id()));
+        std::fs::write(&path, "schema_version: 1\nregistration: {}\nservices:\n- upstream_id: orders\n  selector:\n    protocol: http\n    metadata: {service: orders}\n  enabled: false\n").unwrap();
+        let config = ServiceConfig::load(&path).unwrap();
+        assert_eq!(config.services.as_slice()[0].health(), Health::Unavailable);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn strict_service_config_requires_enabled_service() {
         let path = std::env::temp_dir().join(format!("p2x-services-{}", std::process::id()));

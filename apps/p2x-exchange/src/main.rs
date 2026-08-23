@@ -373,6 +373,25 @@ async fn main() -> io::Result<()> {
                             error: PublicError::new(PublicErrorCode::ProtocolCapabilityMismatch, false),
                         }
                     };
+                    let (resolved, request_id_hash, ticket_issued, code) = match &response {
+                        p2x_protocol::ResolveResponseV1::Resolved { request_id, .. } => {
+                            (true, stable_hash(request_id), true, None)
+                        }
+                        p2x_protocol::ResolveResponseV1::Rejected { request_id, error } => (
+                            false,
+                            request_id.map(stable_hash).unwrap_or_default(),
+                            false,
+                            Some(error.code.as_str()),
+                        ),
+                    };
+                    let peer_name = peer.to_string();
+                    emitter.emit(&LifecycleRecord::ResolutionOutcome {
+                        peer_id: &peer_name,
+                        request_id_hash,
+                        resolved,
+                        ticket_issued,
+                        code,
+                    })?;
                     if swarm.behaviour_mut().resolve.send_response(channel, response).is_err()
                         && let Some(resolver) = resolver.as_mut()
                     {
@@ -470,6 +489,9 @@ async fn main() -> io::Result<()> {
                     }
                     registry_admission.close_connection(connection_id);
                     admission.close_connection(connection_id);
+                    if let Some(resolver) = resolver.as_mut() {
+                        resolver.admission.close_connection(connection_id);
+                    }
                     let reason = format!("{cause:?}");
                     emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Closed, path: None, reason: Some(&reason) })?;
                 }

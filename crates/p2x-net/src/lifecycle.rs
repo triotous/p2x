@@ -66,6 +66,13 @@ pub enum LifecycleRecord<'a> {
         authorized: bool,
         code: Option<&'a str>,
     },
+    ResolutionOutcome {
+        peer_id: &'a str,
+        request_id_hash: u64,
+        resolved: bool,
+        ticket_issued: bool,
+        code: Option<&'a str>,
+    },
     Resources {
         connections: usize,
         pending_opens: usize,

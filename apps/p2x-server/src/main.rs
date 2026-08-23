@@ -588,7 +588,9 @@ async fn main() -> io::Result<()> {
                     }
                 }
                 let connections = connection_book.as_ref().map(ConnectionBook::len).unwrap_or(connection_paths.len());
-                emitter.emit(&LifecycleRecord::Resources { connections, pending_opens: swarm.behaviour().probe_stream.as_ref().map_or(0, |probe| probe.pending_count()), workers: worker_admission.admitted() + proxy_workers, tasks: worker_admission.admitted() + proxy_workers })?;
+                let pending_opens = swarm.behaviour().probe_stream.as_ref().map_or(0, |probe| probe.pending_count())
+                    + swarm.behaviour().proxy_stream.as_ref().map_or(0, |proxy| proxy.pending_count());
+                emitter.emit(&LifecycleRecord::Resources { connections, pending_opens, workers: worker_admission.admitted() + proxy_workers, tasks: worker_admission.admitted() + proxy_workers })?;
             }
             Some(release) = proxy_release_rx.recv() => {
                 if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() { proxy.inbound_release_on(release.peer_id, release.connection_id); }
@@ -1067,10 +1069,44 @@ async fn main() -> io::Result<()> {
             }
         }
     }
-    if !config.is_connectivity_lab() {
-        if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
-            proxy.set_draining(true);
+    if !config.is_connectivity_lab()
+        && let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut()
+    {
+        proxy.set_draining(true);
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while (worker_admission.admitted() > 0 || proxy_workers > 0)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            Some(worker) = worker_rx.recv() => {
+                let _ = worker_admission.release(worker.peer_id);
+                if let Some(probe) = swarm.behaviour_mut().probe_stream.as_mut() {
+                    probe.inbound_release(worker.peer_id);
+                }
+            }
+            Some(candidate) = proxy_rx.recv() => {
+                let request_id = candidate.open.as_ref().ok().map(|open| open.request_id);
+                let _ = candidate.decision.send(
+                    p2x_protocol::ProxyOpenResponseV1::Rejected {
+                        request_id,
+                        error: p2x_protocol::PublicError::new(
+                            PublicErrorCode::PeerDraining,
+                            true,
+                        ),
+                    },
+                );
+            }
+            Some(release) = proxy_release_rx.recv() => {
+                if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
+                    proxy.inbound_release_on(release.peer_id, release.connection_id);
+                }
+                proxy_workers = proxy_workers.saturating_sub(1);
+            }
         }
+    }
+    if !config.is_connectivity_lab() {
         let _ = availability.begin_shutdown();
         let snapshot = availability.readiness(unix_now());
         emitter.emit(&LifecycleRecord::ServerReadiness {
