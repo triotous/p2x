@@ -172,13 +172,17 @@ impl OpenProxyStreamV1 {
         if position != bytes.len() {
             return Err(malformed());
         }
-        Ok(Self {
+        let open = Self {
             request_id,
             ticket,
             upstream_id,
             registration_revision,
             ingress_kind,
-        })
+        };
+        if open.canonical_bytes().map_err(|_| malformed())? != bytes {
+            return Err(malformed());
+        }
+        Ok(open)
     }
 }
 impl ProxyOpenResponseV1 {
@@ -261,6 +265,9 @@ impl ProxyOpenResponseV1 {
             _ => return Err(malformed()),
         };
         if position != bytes.len() {
+            return Err(malformed());
+        }
+        if response.canonical_bytes().map_err(|_| malformed())? != bytes {
             return Err(malformed());
         }
         Ok(response)

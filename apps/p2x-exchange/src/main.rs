@@ -101,6 +101,8 @@ struct Args {
     credential_file: Option<PathBuf>,
     #[arg(long)]
     ticket_key_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(i64).range(5..=60))]
+    ticket_lifetime_secs: i64,
     #[arg(long)]
     artifact: Option<PathBuf>,
     #[arg(long, default_value = "lifecycle")]
@@ -202,7 +204,11 @@ async fn main() -> io::Result<()> {
     let local_peer_id = libp2p::PeerId::from_public_key(&key.public());
     let mut resolver = ticket_key
         .as_ref()
-        .map(|key| Resolver::new(local_peer_id, key));
+        .map(|key| {
+            Resolver::with_lifetime(local_peer_id, key, args.ticket_lifetime_secs)
+                .map_err(|code| io::Error::new(io::ErrorKind::InvalidInput, code.as_str()))
+        })
+        .transpose()?;
     validate_advertise(
         &args.advertise,
         local_peer_id,

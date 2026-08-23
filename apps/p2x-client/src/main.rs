@@ -539,6 +539,7 @@ async fn main() -> io::Result<()> {
     let mut proxy_request_id: Option<[u8; 16]> = None;
     let mut selected_proxy_connection: Option<libp2p::swarm::ConnectionId> = None;
     let mut proxy_setup_deadline: Option<std::time::Instant> = None;
+    let mut proxy_capabilities: Option<p2x_protocol::Capabilities> = None;
     let mut proxy_attempt: Option<PathAttempt> = None;
     let mut proxy_server: Option<libp2p::PeerId> = None;
     let mut pending_proxy: Option<ProxyRequestId> = None;
@@ -571,6 +572,9 @@ async fn main() -> io::Result<()> {
                 }
                 let now = std::time::Instant::now();
                 connections.sweep(now);
+                if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
+                    proxy.expire(now);
+                }
                 if let (Some(peer_id), Some(attempt)) = (target_peer, attempt.as_mut()) {
                     let actions = attempt.apply(PathEvent { attempt_id: attempt.id, now, kind: PathEventKind::DirectDeadlineElapsed });
                     drive_path_actions(probe_mut(&mut swarm)?, attempt, peer_id, &emitter, actions, &mut launched)?;
@@ -889,12 +893,20 @@ async fn main() -> io::Result<()> {
                                 let address = Multiaddr::try_from(address.clone()).map_err(io::Error::other)?;
                                 target_peer = Some(peer);
                                 proxy_server = Some(peer);
+                                proxy_capabilities = Some(grant.metadata.compatible_capabilities);
                                 proxy_request_id = Some(request_id);
                                 proxy_open = Some(OpenProxyStreamV1 { request_id, ticket: grant.ticket, upstream_id: grant.metadata.upstream_id, registration_revision: grant.metadata.registration_revision, ingress_kind: p2x_protocol::IngressKind::FixedTcp });
                                 if let Some(manager) = connection_manager.as_mut() {
                                     let started = std::time::Instant::now();
                                     let setup_deadline = resolve_setup_deadline.unwrap_or_else(|| manager.setup_deadline(started));
-                                    let (path, actions) = manager.begin_path_at_deadline(peer, started, setup_deadline).map_err(|code| io::Error::other(code.as_str()))?;
+                                    let (path, actions) = manager
+                                        .begin_path_at_deadline_with_capabilities(
+                                            peer,
+                                            started,
+                                            setup_deadline,
+                                            grant.metadata.compatible_capabilities,
+                                        )
+                                        .map_err(|code| io::Error::other(code.as_str()))?;
                                     proxy_setup_deadline = Some(path.setup_deadline);
                                     proxy_attempt = Some(path);
                                     let mut terminal = None;
@@ -1070,7 +1082,9 @@ async fn main() -> io::Result<()> {
                         }
                         match event.result {
                             Ok(connection_id) => {
-                                if let Some(manager) = connection_manager.as_mut()
+                                if proxy_capabilities
+                                    .is_some_and(|capabilities| capabilities.contains(p2x_protocol::Capabilities::DCUTR))
+                                    && let Some(manager) = connection_manager.as_mut()
                                     && proxy_server == Some(event.remote_peer_id)
                                 {
                                     manager.on_dcutr_succeeded(event.remote_peer_id, connection_id, std::time::Instant::now()).map_err(io::Error::other)?;

@@ -62,6 +62,8 @@ struct Args {
     credential_env: Option<String>,
     #[arg(long)]
     ticket_verification_keys_file: Option<PathBuf>,
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(0..=30))]
+    ticket_clock_skew: u64,
     #[arg(long)]
     services_file: Option<PathBuf>,
     #[arg(long)]
@@ -363,7 +365,11 @@ async fn main() -> io::Result<()> {
             .map_err(io::Error::other)?,
         )
     };
-    let mut ticket_admission = ticket_admission::TicketAdmissionLedger::default();
+    let mut ticket_admission = ticket_admission::TicketAdmissionLedger::new(
+        ticket_admission::MAX_REPLAY_ENTRIES,
+        args.ticket_clock_skew as i64,
+    )
+    .map_err(|code| io::Error::new(io::ErrorKind::InvalidInput, code.as_str()))?;
     let service_config = if args.unsafe_connectivity_lab {
         None
     } else {
@@ -414,6 +420,7 @@ async fn main() -> io::Result<()> {
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerResult>(128);
     let (proxy_tx, mut proxy_rx) = mpsc::channel::<proxy_open::Candidate>(256);
     let (proxy_release_tx, mut proxy_release_rx) = mpsc::channel::<proxy_open::Release>(256);
+    let mut proxy_workers = 0usize;
     let mut resource_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut first_probe_dropped = false;
     let mut request_ids = p2x_protocol::CorrelationIdGenerator::new(1);
@@ -581,10 +588,11 @@ async fn main() -> io::Result<()> {
                     }
                 }
                 let connections = connection_book.as_ref().map(ConnectionBook::len).unwrap_or(connection_paths.len());
-                emitter.emit(&LifecycleRecord::Resources { connections, pending_opens: swarm.behaviour().probe_stream.as_ref().map_or(0, |probe| probe.pending_count()), workers: worker_admission.admitted(), tasks: worker_admission.admitted() })?;
+                emitter.emit(&LifecycleRecord::Resources { connections, pending_opens: swarm.behaviour().probe_stream.as_ref().map_or(0, |probe| probe.pending_count()), workers: worker_admission.admitted() + proxy_workers, tasks: worker_admission.admitted() + proxy_workers })?;
             }
             Some(release) = proxy_release_rx.recv() => {
                 if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() { proxy.inbound_release_on(release.peer_id, release.connection_id); }
+                proxy_workers = proxy_workers.saturating_sub(1);
             }
             Some(candidate) = proxy_rx.recv() => {
                 let response = match candidate.open {
@@ -784,6 +792,7 @@ async fn main() -> io::Result<()> {
                         let message = format!("{reason:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "listener.closed", message: &message })?;
                     }
                     SwarmEvent::Behaviour(PeerEvent::Proxy(p2x_net::proxy_stream::behaviour::ProxyOutput::InboundOpened { peer_id, connection_id, stream })) => {
+                        proxy_workers += 1;
                         let tx = proxy_tx.clone();
                         tokio::spawn(proxy_open::run_worker(peer_id, connection_id, stream, tx, proxy_release_tx.clone()));
                     }
@@ -1086,11 +1095,39 @@ async fn main() -> io::Result<()> {
             }
         })
         .await;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while worker_admission.admitted() > 0 && tokio::time::Instant::now() < deadline {
-            let _ = tokio::time::timeout_at(deadline, worker_rx.recv()).await;
-        }
         availability.withdrawn();
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while (worker_admission.admitted() > 0 || proxy_workers > 0)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            Some(worker) = worker_rx.recv() => {
+                let _ = worker_admission.release(worker.peer_id);
+                if let Some(probe) = swarm.behaviour_mut().probe_stream.as_mut() {
+                    probe.inbound_release(worker.peer_id);
+                }
+            }
+            Some(candidate) = proxy_rx.recv() => {
+                let request_id = candidate.open.as_ref().ok().map(|open| open.request_id);
+                let _ = candidate.decision.send(
+                    p2x_protocol::ProxyOpenResponseV1::Rejected {
+                        request_id,
+                        error: p2x_protocol::PublicError::new(
+                            PublicErrorCode::PeerDraining,
+                            true,
+                        ),
+                    },
+                );
+            }
+            Some(release) = proxy_release_rx.recv() => {
+                if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
+                    proxy.inbound_release_on(release.peer_id, release.connection_id);
+                }
+                proxy_workers = proxy_workers.saturating_sub(1);
+            }
+        }
     }
     if let Some(listener_id) = circuit_listener_id {
         swarm.remove_listener(listener_id);

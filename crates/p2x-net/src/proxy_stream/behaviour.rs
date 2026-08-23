@@ -181,6 +181,9 @@ impl ProxyStreamBehaviour {
         peer_id: PeerId,
         connection_id: ConnectionId,
     ) -> Result<(), &'static str> {
+        if !self.inbound_enabled {
+            return Err("proxy.inbound_disabled");
+        }
         self.admit_inbound(peer_id, Some(connection_id))
     }
     fn admit_inbound(

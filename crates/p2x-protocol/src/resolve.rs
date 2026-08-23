@@ -229,6 +229,9 @@ impl ResolveRequestV1 {
         if position != bytes.len() {
             return Err(malformed());
         }
+        if request.canonical_bytes().map_err(|_| malformed())? != bytes {
+            return Err(malformed());
+        }
         Ok(request)
     }
 }
@@ -364,6 +367,9 @@ impl ResolveResponseV1 {
             _ => return Err(malformed()),
         };
         if position != bytes.len() {
+            return Err(malformed());
+        }
+        if response.canonical_bytes().map_err(|_| malformed())? != bytes {
             return Err(malformed());
         }
         Ok(response)
