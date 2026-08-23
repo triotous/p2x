@@ -21,10 +21,13 @@ if [[ "$case_name" == all ]]; then
   cd "$root"
   cargo build -q --workspace --bins
   cargo build -q -p p2x-config --example identity-id --example ticket-verification
+  failed=0
   for case in "${cases[@]}"; do
-    P2X_RESOLUTION_BUILT=1 "$0" --case "$case"
+    if ! P2X_RESOLUTION_BUILT=1 "$0" --case "$case"; then
+      failed=1
+    fi
   done
-  exit 0
+  exit "$failed"
 fi
 valid=false
 for case in "${cases[@]}"; do

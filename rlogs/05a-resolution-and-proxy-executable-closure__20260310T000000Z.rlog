@@ -112,3 +112,8 @@ validation:
 - Explicit resolution blockers remain nonzero: ticket-bindings process matrix, registration-revision-change, resolve-limit, proxy-limit, exchange-restart, server-restart, graceful-drain.
 - Deployment/platform phase remains owner-executed and incomplete: namespace/two-host/firewall/NAT/packet/platform/soak/package checks.
 commit: phase 6.8 pending review
+
+final runner correction:
+- Changed `tests/resolution/local.sh --case all` to execute all 20 declared cases, collect failures, and return nonzero if any case fails instead of stopping at the first failure.
+- Full aggregate run executed all 20: 13 evidence-backed cases passed; ticket-bindings process matrix plus registration-revision-change, resolve-limit, proxy-limit, exchange-restart, server-restart, and graceful-drain failed with explicit missing-evidence messages.
+status: local Plan 05a Definition of Done not reached; Plan 06 must not begin.
