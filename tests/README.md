@@ -7,12 +7,13 @@ This directory contains the canonical verification entry points for the complete
 | Plan 02 | Native connectivity, Linux namespaces, and two-host C14 | [`connectivity/README.md`](connectivity/README.md) |
 | Plan 03 | Live auth, platform security, fuzzing, packet inspection, and connectivity regression | [`auth/README.md`](auth/README.md) |
 | Plan 04 | Authenticated registry, relay admission, server availability, and restart recovery | [`registry/README.md`](registry/README.md) |
+| Plan 05 | Exact resolution, one-use tickets, proxy authorization, and bounded client connections | [`resolution/README.md`](resolution/README.md) |
 
 An unavailable required environment is incomplete verification, not a pass. Runners return exit code 2 for missing prerequisites and a non-zero code for failed assertions.
 
 Generated test output belongs below `target/` and is ignored by Git. Preserve raw failing artifacts outside version control while debugging; commit only deliberately reviewed and scrubbed evidence. Never commit reusable identities, tokens, private keys, raw tickets, private upstream addresses, public-network details that policy treats as sensitive, or unreviewed packet captures.
 
-`tests/registry/local.sh --case <name>` is the single registry harness entry point; it prepares a run-scoped artifact directory, returns 2 for invalid CLI usage, and exits nonzero when a prerequisite or observed assertion fails.
+`tests/registry/local.sh --case <name>` is the single registry harness entry point; it prepares a run-scoped artifact directory, returns 2 for invalid CLI usage, and exits nonzero when a prerequisite or observed assertion fails. `tests/resolution/local.sh --case <name>` is the single Plan 05 entry point; it prepares run-scoped identities, credentials, ticket/signing files, routes, artifacts, and privacy cleanup. Its direct/relay cases are incomplete unless client and server `Authorized` evidence correlates the same request/stream; it does not treat Ping or a case label as proxy evidence.
 
 `Dockerfile.test` packages the complete non-interactive test toolchain. Its
 default entry point runs all container-safe automated suites; the privileged

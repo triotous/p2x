@@ -22,4 +22,4 @@ Ticket claims and envelopes use canonical binary encoding and Ed25519 signatures
 
 ## Current phase boundary
 
-Phase 2 adds authenticated relay admission and server-to-exchange registry registration. Atomic resolve-and-authorize ticket issuance, replay consumption, proxy streams, dynamic configuration reload, and production identity CLI onboarding remain later-phase work. The lab seed option is not a production identity loader.
+Phase 2 adds authenticated relay admission and server-to-exchange registry registration. Phase 3 adds atomic exact-selector resolution, exchange-signed one-use tickets, server verification-ring validation, replay consumption, and the empty Authorized proxy-open gate. Dynamic configuration reload, production identity CLI onboarding, and application data tunneling remain later-phase work. The lab seed option is not a production identity loader.
