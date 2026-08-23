@@ -45,6 +45,7 @@ pub struct Resolver<'a> {
     ticket_lifetime: i64,
     pub admission: ResolveAdmissionLedger,
     idempotency: HashMap<(PeerId, [u8; 16]), CachedResponse>,
+    draining: bool,
     issued: u64,
 }
 impl<'a> Resolver<'a> {
@@ -66,6 +67,7 @@ impl<'a> Resolver<'a> {
             ticket_lifetime,
             admission: ResolveAdmissionLedger::default(),
             idempotency: HashMap::new(),
+            draining: false,
             issued: 0,
         })
     }
@@ -78,6 +80,7 @@ impl<'a> Resolver<'a> {
         peer_id: PeerId,
         connection_id: ConnectionId,
         request: &ResolveRequestV1,
+        admission_request_id: impl ToString,
         client_session: Option<&AuthSession>,
         server_session: impl FnOnce(&PeerId) -> Option<AuthSession>,
         reserved: impl FnOnce(&PeerId) -> bool,
@@ -92,14 +95,13 @@ impl<'a> Resolver<'a> {
                 client_capabilities,
             } => (*request_id, *session_id, selector, *client_capabilities),
         };
+        if self.draining {
+            return rejected(Some(request_id), PublicErrorCode::ExchangeDraining, true);
+        }
         let owner = ResolveOwner {
             peer_id,
             connection_id,
-            request_id: request_id
-                .to_vec()
-                .iter()
-                .map(|v| format!("{v:02x}"))
-                .collect(),
+            request_id: admission_request_id.to_string(),
         };
         if self.admission.begin(owner.clone(), now) != ResolveAdmission::Accepted {
             return rejected(
@@ -108,7 +110,7 @@ impl<'a> Resolver<'a> {
                 true,
             );
         }
-        let result = self.resolve_inner(
+        let response = self.resolve_inner(
             peer_id,
             request_id,
             session_id,
@@ -121,7 +123,7 @@ impl<'a> Resolver<'a> {
             now,
         );
         self.admission.release(&owner);
-        result
+        response
     }
     #[allow(clippy::too_many_arguments)]
     fn resolve_inner(
@@ -190,6 +192,14 @@ impl<'a> Resolver<'a> {
                 false,
             );
         }
+        self.sweep(now);
+        if !self.cache_available(peer_id) {
+            return rejected(
+                Some(request_id),
+                PublicErrorCode::LimitResolveRequests,
+                true,
+            );
+        }
         let mut ticket_id = [0; 16];
         if getrandom::fill(&mut ticket_id).is_err() {
             return rejected(Some(request_id), PublicErrorCode::ExchangeOverloaded, true);
@@ -244,6 +254,16 @@ impl<'a> Resolver<'a> {
         );
         response
     }
+    fn cache_available(&self, peer: PeerId) -> bool {
+        self.idempotency.len() < MAX_IDEMPOTENCY_GLOBAL
+            && self
+                .idempotency
+                .keys()
+                .filter(|(owner, _)| *owner == peer)
+                .count()
+                < MAX_IDEMPOTENCY_PER_CLIENT
+    }
+
     fn cache(
         &mut self,
         peer: PeerId,
@@ -282,6 +302,10 @@ impl<'a> Resolver<'a> {
             },
         );
     }
+    pub fn set_draining(&mut self, draining: bool) {
+        self.draining = draining;
+    }
+
     pub fn sweep(&mut self, now: i64) {
         self.idempotency
             .retain(|_, cached| cached.expires_at.saturating_add(5) > now);
@@ -369,6 +393,7 @@ mod tests {
             peer,
             ConnectionId::new_unchecked(1),
             &request,
+            "1",
             Some(&session(peer, Role::Client, 0)),
             |_| None,
             |_| false,

@@ -341,13 +341,20 @@ async fn main() -> io::Result<()> {
                 SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Auth(RequestResponseEvent::InboundFailure { request_id, .. })) => {
                     admission.response_delivered(request_id, chrono_like_now());
                 }
-                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Resolve(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, request_id: _ }, connection_id, .. })) => {
+                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Resolve(RequestResponseEvent::ResponseSent { peer, connection_id, request_id })) => {
+                    if let Some(resolver) = resolver.as_mut() { resolver.admission.release_request(peer, connection_id, request_id); }
+                }
+                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Resolve(RequestResponseEvent::InboundFailure { peer, connection_id, request_id, .. })) => {
+                    if let Some(resolver) = resolver.as_mut() { resolver.admission.release_request(peer, connection_id, request_id); }
+                }
+                SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Resolve(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, request_id }, connection_id, .. })) => {
                     let response = if let Some(resolver) = resolver.as_mut() {
                         let client_session = sessions.current(&peer.to_string(), chrono_like_now());
                         resolver.resolve_and_authorize(
                             peer,
                             connection_id,
                             &request,
+                            request_id.to_string(),
                             client_session.as_ref(),
                             |server| sessions.current(&server.to_string(), chrono_like_now()),
                             |server| reserved_servers.contains(server),
@@ -468,8 +475,15 @@ async fn main() -> io::Result<()> {
     }
     relay_admission.set_draining(true);
     registry.set_draining(true);
+    if let Some(resolver) = resolver.as_mut() {
+        resolver.set_draining(true);
+    }
     let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while (registry_admission.inflight() > 0 || admission.inflight() > 0)
+    while (registry_admission.inflight() > 0
+        || admission.inflight() > 0
+        || resolver
+            .as_ref()
+            .is_some_and(|resolver| resolver.admission.inflight() > 0))
         && tokio::time::Instant::now() < drain_deadline
     {
         let Ok(event) = tokio::time::timeout_at(drain_deadline, swarm.select_next_some()).await
@@ -506,6 +520,30 @@ async fn main() -> io::Result<()> {
             SwarmEvent::ConnectionClosed { connection_id, .. } => {
                 registry_admission.close_connection(connection_id);
                 admission.close_connection(connection_id);
+                if let Some(resolver) = resolver.as_mut() {
+                    resolver.admission.close_connection(connection_id);
+                }
+            }
+            SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Resolve(
+                RequestResponseEvent::Message {
+                    message:
+                        RequestResponseMessage::Request {
+                            request, channel, ..
+                        },
+                    ..
+                },
+            )) => {
+                let request_id = match request {
+                    p2x_protocol::ResolveRequestV1::Resolve { request_id, .. } => request_id,
+                };
+                let response = p2x_protocol::ResolveResponseV1::Rejected {
+                    request_id: Some(request_id),
+                    error: PublicError::new(PublicErrorCode::ExchangeDraining, true),
+                };
+                let _ = swarm
+                    .behaviour_mut()
+                    .resolve
+                    .send_response(channel, response);
             }
             SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Registry(
                 RequestResponseEvent::Message {

@@ -88,6 +88,19 @@ impl ResolveAdmissionLedger {
             }
         }
     }
+    pub fn release_request(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        request_id: impl ToString,
+    ) {
+        self.release(&ResolveOwner {
+            peer_id,
+            connection_id,
+            request_id: request_id.to_string(),
+        });
+    }
+
     pub fn close_connection(&mut self, connection_id: ConnectionId) {
         let owners = self
             .owners

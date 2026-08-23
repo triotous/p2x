@@ -16,6 +16,7 @@ futures = "0.3"
 libp2p = { version = "=0.56.0", default-features = false, features = ["dcutr", "dns", "ed25519", "identify", "macros", "noise", "ping", "quic", "relay", "request-response", "tcp", "tokio", "yamux"] }
 libc = "0.2"
 libp2p-identity = { version = "0.2.14", features = ["ed25519"] }
+multiaddr = "0.18.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

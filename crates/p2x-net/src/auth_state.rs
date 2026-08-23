@@ -611,6 +611,7 @@ impl AuthState {
         self.tick_with_jitter(request_id, now, 0)
     }
     pub fn disconnected(&mut self) -> AuthAction {
+        self.pending = None;
         if matches!(
             self.phase,
             AuthPhase::Authenticated { .. }
