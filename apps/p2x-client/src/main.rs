@@ -606,11 +606,9 @@ async fn main() -> io::Result<()> {
                                 pending_proxy = Some(request_id);
                                 emitter.emit(&LifecycleRecord::PathSelected { request_id: request_id.0, connection_id_hash: stable_hash(connection_id), selected_path: observed_path })?;
                             } else if args.finite_relay_ping {
-                                if observed_path != ProbePath::Relay {
-                                    emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", "relay.path_required"))?;
-                                    return Ok(());
+                                if observed_path == ProbePath::Relay {
+                                    started = true;
                                 }
-                                started = true;
                             } else if forced_path_matches(args.path, observed_path)
                                 && (!started || matches!(args.path, Path::Both))
                                 && launched < args.count
@@ -716,7 +714,7 @@ async fn main() -> io::Result<()> {
                         emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code))?;
                         return Ok(());
                     }
-                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Ping(event)) if args.finite_relay_ping && target_peer == Some(event.peer) && event.result.is_ok() && started => {
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Ping(event)) if args.finite_relay_ping && target_peer == Some(event.peer) && event.result.is_ok() && started && connections.get(event.peer, event.connection).is_some_and(|record| matches!(record.path, PathKind::Relay { .. })) => {
                         if args.test_relay_circuit_count > 1 || !args.test_relay_target.is_empty() {
                             continue;
                         }
