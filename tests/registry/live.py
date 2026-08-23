@@ -53,8 +53,9 @@ class Harness:
         self.address = (f"/ip4/127.0.0.1/udp/{self.quic}/quic-v1" if transport == "quic" else f"/ip4/127.0.0.1/tcp/{self.tcp}") + f"/p2p/{self.exchange_peer}"
         self.ticket = self.secret / "ticket.key"
         self.ticket.write_bytes(b"\x01" + secrets.token_bytes(32)); self.ticket.chmod(0o600)
+        subprocess.run([str(BIN / "examples" / "ticket-verification"), str(self.ticket), str(self.verification_keys)], check=True)
+        self.verification_keys.chmod(0o600)
         self.verification_keys = self.secret / "verification-keys.yaml"
-        self.verification_keys.write_text("schema_version: 1\nkeys: []\n"); self.verification_keys.chmod(0o600)
         self.credentials = self.secret / "credentials.yaml"
 
     def identity(self, name):

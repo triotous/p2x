@@ -12,5 +12,5 @@ done
 
 cd "$root"
 cargo build -q --workspace --bins
-cargo build -q -p p2x-config --example identity-id
+cargo build -q -p p2x-config --example identity-id --example ticket-verification
 exec python3 tests/registry/live.py --case "$case_name"

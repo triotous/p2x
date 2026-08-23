@@ -22,3 +22,7 @@ zeroize.workspace = true
 [[example]]
 name = "identity-id"
 path = "examples/identity-id.rs"
+
+[[example]]
+name = "ticket-verification"
+path = "examples/ticket-verification.rs"

@@ -31,7 +31,7 @@ fi
 
 cd "$root"
 cargo build -q --workspace --bins
-cargo build -q -p p2x-config --example identity-id
+cargo build -q -p p2x-config --example identity-id --example ticket-verification
 run_id="${P2X_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 out="${P2X_ARTIFACT_DIR:-target/p2x-auth}/$run_id"
 mkdir -p "$out"
@@ -59,11 +59,11 @@ client_key="$secret_dir/client.key"
 server_key="$secret_dir/server.key"
 ticket_key="$secret_dir/ticket.key"
 verification_keys="$secret_dir/verification-keys.yaml"
-printf 'schema_version: 1\nkeys: []\n' > "$verification_keys"
-chmod 600 "$verification_keys"
 printf '\001' > "$ticket_key"
 head -c 32 /dev/urandom >> "$ticket_key"
 chmod 600 "$ticket_key"
+"$root/target/debug/examples/ticket-verification" "$ticket_key" "$verification_keys"
+chmod 600 "$verification_keys"
 identity_bin="$root/target/debug/examples/identity-id"
 exchange_peer=$($identity_bin "$exchange_key" --generate)
 client_peer=$($identity_bin "$client_key" --generate)
