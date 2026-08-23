@@ -1992,6 +1992,7 @@ dependencies = [
  "base64",
  "ed25519-dalek",
  "libp2p-identity",
+ "multiaddr",
  "serde",
  "sha2",
  "subtle",

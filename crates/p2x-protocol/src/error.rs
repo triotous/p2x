@@ -141,6 +141,7 @@ impl PublicErrorCode {
             "limit.auth_requests" => Self::LimitAuthRequests,
             "limit.auth_sessions" => Self::LimitAuthSessions,
             "protocol.frame_too_large" => Self::ProtocolFrameTooLarge,
+            "protocol.malformed" => Self::ProtocolMalformed,
             "protocol.unsupported_version" => Self::ProtocolUnsupportedVersion,
             "protocol.capability_mismatch" => Self::ProtocolCapabilityMismatch,
             "registry.invalid_advertisement" => Self::RegistryInvalidAdvertisement,

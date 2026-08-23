@@ -58,6 +58,9 @@ exchange_key="$secret_dir/exchange.key"
 client_key="$secret_dir/client.key"
 server_key="$secret_dir/server.key"
 ticket_key="$secret_dir/ticket.key"
+verification_keys="$secret_dir/verification-keys.yaml"
+printf 'schema_version: 1\nkeys: []\n' > "$verification_keys"
+chmod 600 "$verification_keys"
 printf '\001' > "$ticket_key"
 head -c 32 /dev/urandom >> "$ticket_key"
 chmod 600 "$ticket_key"
@@ -236,7 +239,7 @@ component_config_args=()
 [[ "$component" == server ]] && component_config_args+=(--services-file "$services_file")
 P2X_TOKEN="$token" "$root/target/debug/p2x-$component" \
   --identity-file "$key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" \
-  --credential-env P2X_TOKEN "${auth_mode_args[@]}" "${component_config_args[@]}" \
+  --credential-env P2X_TOKEN "${auth_mode_args[@]}" "${component_config_args[@]}" $([[ "$component" == server ]] && printf '%s ' --ticket-verification-keys-file "$verification_keys") \
   ${auth_fault_args:-} --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
   --case-id "$case_name" >"$log" 2>&1 &
 component_pid=$!
@@ -258,7 +261,7 @@ if [[ "$case_name" == exchange-restart ]]; then
   companion_pid=""
   P2X_TOKEN="$server_token" "$root/target/debug/p2x-server" \
     --identity-file "$server_key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" \
-    --credential-env P2X_TOKEN --services-file "$services_file" --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
+    --credential-env P2X_TOKEN --ticket-verification-keys-file "$verification_keys" --services-file "$services_file" --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
     --case-id "$case_name" >"$out/server.ndjson" 2>&1 &
   companion_pid=$!
   pids+=("$companion_pid")

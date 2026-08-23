@@ -53,6 +53,8 @@ class Harness:
         self.address = (f"/ip4/127.0.0.1/udp/{self.quic}/quic-v1" if transport == "quic" else f"/ip4/127.0.0.1/tcp/{self.tcp}") + f"/p2p/{self.exchange_peer}"
         self.ticket = self.secret / "ticket.key"
         self.ticket.write_bytes(b"\x01" + secrets.token_bytes(32)); self.ticket.chmod(0o600)
+        self.verification_keys = self.secret / "verification-keys.yaml"
+        self.verification_keys.write_text("schema_version: 1\nkeys: []\n"); self.verification_keys.chmod(0o600)
         self.credentials = self.secret / "credentials.yaml"
 
     def identity(self, name):
@@ -92,7 +94,7 @@ class Harness:
         self.wait(name, lambda row: row.get("event") == "listener_ready"); return proc
 
     def server(self, name, token, services, hooks=(), key_name=None):
-        argv = [str(BIN/"p2x-server"), "--identity-file", str(self.secret/f"{key_name or name}.key"), "--exchange", self.address, "--exchange-peer-id", self.exchange_peer, "--credential-env", "P2X_TOKEN", "--services-file", str(services), "--case-id", self.case, *hooks]
+        argv = [str(BIN/"p2x-server"), "--identity-file", str(self.secret/f"{key_name or name}.key"), "--exchange", self.address, "--exchange-peer-id", self.exchange_peer, "--credential-env", "P2X_TOKEN", "--ticket-verification-keys-file", str(self.verification_keys), "--services-file", str(services), "--case-id", self.case, *hooks]
         return self.spawn(name, argv, {"P2X_TOKEN": token, "P2X_ENABLE_TEST_HOOKS": "1"})
 
     def client(self, name, token, server_peer, key_name=None, hold=0, circuits=1, targets=()):

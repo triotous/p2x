@@ -2176,6 +2176,7 @@ dependencies = [
  "base64",
  "ed25519-dalek",
  "libp2p-identity",
+ "multiaddr",
  "serde",
  "serde_json",
  "sha2",

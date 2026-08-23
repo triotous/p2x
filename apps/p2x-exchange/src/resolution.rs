@@ -110,7 +110,7 @@ impl<'a> Resolver<'a> {
                 true,
             );
         }
-        let response = self.resolve_inner(
+        self.resolve_inner(
             peer_id,
             request_id,
             session_id,
@@ -121,9 +121,7 @@ impl<'a> Resolver<'a> {
             reserved,
             registry,
             now,
-        );
-        self.admission.release(&owner);
-        response
+        )
     }
     #[allow(clippy::too_many_arguments)]
     fn resolve_inner(

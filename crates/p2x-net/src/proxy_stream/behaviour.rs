@@ -57,6 +57,7 @@ pub struct ProxyStreamBehaviour {
     terminals: VecDeque<ProxyRequestId>,
     inbound_events: VecDeque<ProxyOutput>,
     inbound_workers: HashMap<PeerId, usize>,
+    inbound_connections: HashMap<(PeerId, ConnectionId), usize>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
@@ -137,15 +138,49 @@ impl ProxyStreamBehaviour {
         Ok(request_id)
     }
     pub fn inbound_admit(&mut self, peer_id: PeerId) -> Result<(), &'static str> {
+        self.admit_inbound(peer_id, None)
+    }
+    pub fn inbound_admit_on(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+    ) -> Result<(), &'static str> {
+        self.admit_inbound(peer_id, Some(connection_id))
+    }
+    fn admit_inbound(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: Option<ConnectionId>,
+    ) -> Result<(), &'static str> {
         let total: usize = self.inbound_workers.values().sum();
         let count = self.inbound_workers.entry(peer_id).or_default();
         if total >= MAX_INBOUND_WORKERS || *count >= MAX_INBOUND_WORKERS_PER_PEER {
             return Err("limit.proxy_streams");
         }
         *count += 1;
+        if let Some(connection_id) = connection_id {
+            *self
+                .inbound_connections
+                .entry((peer_id, connection_id))
+                .or_default() += 1;
+        }
         Ok(())
     }
     pub fn inbound_release(&mut self, peer_id: PeerId) {
+        self.release_inbound(peer_id, None);
+    }
+    pub fn inbound_release_on(&mut self, peer_id: PeerId, connection_id: ConnectionId) {
+        self.release_inbound(peer_id, Some(connection_id));
+    }
+    fn release_inbound(&mut self, peer_id: PeerId, connection_id: Option<ConnectionId>) {
+        if let Some(connection_id) = connection_id
+            && let Some(count) = self.inbound_connections.get_mut(&(peer_id, connection_id))
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.inbound_connections.remove(&(peer_id, connection_id));
+            }
+        }
         if let Some(count) = self.inbound_workers.get_mut(&peer_id) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -246,6 +281,14 @@ impl NetworkBehaviour for ProxyStreamBehaviour {
     fn on_swarm_event(&mut self, event: FromSwarm) {
         if let FromSwarm::ConnectionClosed(closed) = event {
             self.known.remove(&(closed.peer_id, closed.connection_id));
+            let inbound = self
+                .inbound_connections
+                .get(&(closed.peer_id, closed.connection_id))
+                .copied()
+                .unwrap_or(0);
+            for _ in 0..inbound {
+                self.inbound_release_on(closed.peer_id, closed.connection_id);
+            }
             let requests = self
                 .pending
                 .iter()
@@ -324,7 +367,12 @@ impl NetworkBehaviour for ProxyStreamBehaviour {
                 }
             }
             ProxyEvent::InboundOpened { stream } => {
-                if self.inbound_events.len() < MAX_PENDING && self.inbound_admit(peer).is_ok() {
+                if !self.inbound_enabled {
+                    return;
+                }
+                if self.inbound_events.len() < MAX_PENDING
+                    && self.inbound_admit_on(peer, id).is_ok()
+                {
                     self.inbound_events.push_back(ProxyOutput::InboundOpened {
                         peer_id: peer,
                         connection_id: id,

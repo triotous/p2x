@@ -314,6 +314,9 @@ impl ResolveResponseV1 {
                     }
                     relay_addresses.push(take(bytes, &mut position, length)?.to_vec());
                 }
+                if !valid_addresses(&relay_addresses) {
+                    return Err(malformed());
+                }
                 let compatible_capabilities = capabilities(u32v(bytes, &mut position)?)?;
                 let registration_expires_at = i64v(bytes, &mut position)?;
                 let ticket_expires_at = i64v(bytes, &mut position)?;
@@ -378,16 +381,18 @@ fn valid_addresses(addresses: &[Vec<u8>]) -> bool {
             else {
                 return false;
             };
-            let peers = parts
+            let peer_positions = parts
                 .iter()
-                .filter_map(|part| match part {
-                    multiaddr::Protocol::P2p(peer) => Some(*peer),
+                .enumerate()
+                .filter_map(|(index, part)| match part {
+                    multiaddr::Protocol::P2p(peer) => Some((index, *peer)),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
             circuit > 0
-                && peers.len() >= 2
-                && matches!(parts.last(), Some(multiaddr::Protocol::P2p(_)))
+                && peer_positions.len() == 2
+                && peer_positions[0].0 + 1 == circuit
+                && peer_positions[1].0 + 1 == parts.len()
         })
 }
 

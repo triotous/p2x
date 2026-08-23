@@ -499,6 +499,28 @@ async fn main() -> io::Result<()> {
             )) => {
                 admission.response_delivered(request_id, chrono_like_now());
             }
+            SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Resolve(
+                RequestResponseEvent::ResponseSent {
+                    peer,
+                    connection_id,
+                    request_id,
+                    ..
+                },
+            ))
+            | SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Resolve(
+                RequestResponseEvent::InboundFailure {
+                    peer,
+                    connection_id,
+                    request_id,
+                    ..
+                },
+            )) => {
+                if let Some(resolver) = resolver.as_mut() {
+                    resolver
+                        .admission
+                        .release_request(peer, connection_id, request_id);
+                }
+            }
             SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Registry(
                 RequestResponseEvent::ResponseSent {
                     peer,

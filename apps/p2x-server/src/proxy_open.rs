@@ -4,6 +4,12 @@ use p2x_protocol::{OpenProxyStreamV1, ProxyOpenResponseV1, PublicError, PublicEr
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
+#[derive(Clone, Copy, Debug)]
+pub struct Release {
+    pub peer_id: PeerId,
+    pub connection_id: ConnectionId,
+}
+
 pub struct Candidate {
     pub peer_id: PeerId,
     pub connection_id: ConnectionId,
@@ -16,6 +22,7 @@ pub async fn run_worker(
     connection_id: ConnectionId,
     mut stream: libp2p::swarm::Stream,
     candidates: mpsc::Sender<Candidate>,
+    releases: mpsc::Sender<Release>,
 ) {
     let (decision, response) = oneshot::channel();
     let open = tokio::time::timeout(Duration::from_secs(5), proxy_codec::read_open(&mut stream))
@@ -34,6 +41,12 @@ pub async fn run_worker(
         .await
         .is_err()
     {
+        let _ = releases
+            .send(Release {
+                peer_id,
+                connection_id,
+            })
+            .await;
         return;
     }
     let response = response
@@ -43,6 +56,12 @@ pub async fn run_worker(
             error: PublicError::new(PublicErrorCode::ExchangeOverloaded, true),
         });
     let _ = proxy_codec::write_response(&mut stream, &response).await;
+    let _ = releases
+        .send(Release {
+            peer_id,
+            connection_id,
+        })
+        .await;
 }
 
 pub fn random_stream_id() -> Result<[u8; 16], PublicErrorCode> {
