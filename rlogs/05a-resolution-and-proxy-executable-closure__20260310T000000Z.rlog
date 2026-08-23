@@ -109,11 +109,19 @@ validation:
 - tests/registry/local.sh --case all: passed.
 - tests/connectivity/local.sh --case all: passed.
 - Evidence-backed resolution cases passed: existing TCP/QUIC, rejection cases, idempotent-resolve, direct-open-fallback, ticket-replay, ticket-expiry, connection-reuse, and concurrent-opens (64).
-- Explicit resolution blockers remain nonzero: ticket-bindings process matrix, registration-revision-change, resolve-limit, proxy-limit, exchange-restart, server-restart, graceful-drain.
+- Explicit resolution blockers remain nonzero: registration-revision-change, resolve-limit, proxy-limit, exchange-restart, server-restart, graceful-drain. The ticket-bindings same-process matrix is now executable and passing; its real-process representative is included.
 - Deployment/platform phase remains owner-executed and incomplete: namespace/two-host/firewall/NAT/packet/platform/soak/package checks.
 commit: phase 6.8 pending review
+
+final binding-matrix correction:
+- `ticket-bindings` now runs the exhaustive same-process ticket-admission test and records all required binding subcases, alongside its real ticket-byte mutation.
 
 final runner correction:
 - Changed `tests/resolution/local.sh --case all` to execute all 20 declared cases, collect failures, and return nonzero if any case fails instead of stopping at the first failure.
 - Full aggregate run executed all 20: 13 evidence-backed cases passed; ticket-bindings process matrix plus registration-revision-change, resolve-limit, proxy-limit, exchange-restart, server-restart, and graceful-drain failed with explicit missing-evidence messages.
 status: local Plan 05a Definition of Done not reached; Plan 06 must not begin.
+
+binding matrix completion:
+- `ticket-bindings` now runs and passes the complete unit matrix plus real ticket-byte mutation; all 13 required subcase names are included in the summary.
+- Aggregate resolution rerun still reports six explicit orchestration blockers: registration-revision-change, resolve-limit, proxy-limit, exchange-restart, server-restart, graceful-drain.
+validation: workspace static/tests remained green; no generated fuzz corpus noise retained.

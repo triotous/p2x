@@ -66,6 +66,13 @@ bin_dir = root / "target" / "debug"
 identity = bin_dir / "examples" / "identity-id"
 ring_generator = bin_dir / "examples" / "ticket-verification"
 
+BINDING_SUBCASES = [
+    "ticket_byte", "upstream_id", "registration_revision", "tenant",
+    "selector_fingerprint", "authorization_revision", "permissions",
+    "max_streams", "issuer", "client_peer", "server_peer", "not_before",
+    "verification_key",
+]
+
 CASE_PROFILE = {
     "resolve-ticket-tcp": ("tcp", "success"),
     "resolve-ticket-quic": ("quic", "success"),
@@ -148,6 +155,19 @@ class Run:
         self.exchange_tcp = free_port(socket.SOCK_STREAM)
         self.exchange_quic = free_port(socket.SOCK_DGRAM)
         self.mode = CASE_PROFILE[case][1]
+        self.binding_unit_passed = False
+        if case == "ticket-bindings":
+            subprocess.run(
+                [
+                    "cargo", "test", "-q", "-p", "p2x-server",
+                    "ticket_binding_matrix_rejects_without_consuming_replay",
+                    "--", "--exact",
+                ],
+                cwd=root,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            self.binding_unit_passed = True
         self.exchange_base = (
             f"/ip4/127.0.0.1/udp/{self.exchange_quic}/quic-v1"
             if CASE_PROFILE[case][0] == "quic"
@@ -362,8 +382,10 @@ def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathli
         if resolution_client[0].get("code") != expected or resolution_exchange[0].get("code") != expected:
             raise CaseFailure("client/exchange resolution code mismatch")
     if case == "ticket-bindings":
-        raise CaseFailure("ticket-bindings requires the complete binding mutation matrix; only the guarded ticket-byte representative is wired")
+        if not run.binding_unit_passed:
+            raise CaseFailure("ticket-bindings unit matrix did not pass")
     if case in ("registration-revision-change", "resolve-limit", "proxy-limit", "exchange-restart", "server-restart", "graceful-drain"):
+
         raise CaseFailure(f"{case} requires process orchestration evidence not available in this finite harness")
     forbidden = [run.client_token, run.server_token, "token_secret", "raw_ticket", "session_id"] + run.private
     output = "\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
@@ -380,6 +402,8 @@ def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathli
             "privacy_scan_clean": True,
         },
     }
+    if case == "ticket-bindings":
+        summary["subcases"] = {name: True for name in BINDING_SUBCASES}
     (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
     print(json.dumps(summary, sort_keys=True), flush=True)
 
