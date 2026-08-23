@@ -1159,38 +1159,6 @@ async fn main() -> io::Result<()> {
         .await;
         availability.withdrawn();
     }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while (worker_admission.admitted() > 0 || proxy_workers > 0)
-        && tokio::time::Instant::now() < deadline
-    {
-        tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => break,
-            Some(worker) = worker_rx.recv() => {
-                let _ = worker_admission.release(worker.peer_id);
-                if let Some(probe) = swarm.behaviour_mut().probe_stream.as_mut() {
-                    probe.inbound_release(worker.peer_id);
-                }
-            }
-            Some(candidate) = proxy_rx.recv() => {
-                let request_id = candidate.open.as_ref().ok().map(|open| open.request_id);
-                let _ = candidate.decision.send(
-                    p2x_protocol::ProxyOpenResponseV1::Rejected {
-                        request_id,
-                        error: p2x_protocol::PublicError::new(
-                            PublicErrorCode::PeerDraining,
-                            true,
-                        ),
-                    },
-                );
-            }
-            Some(release) = proxy_release_rx.recv() => {
-                if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
-                    proxy.inbound_release_on(release.peer_id, release.connection_id);
-                }
-                proxy_workers = proxy_workers.saturating_sub(1);
-            }
-        }
-    }
     if let Some(listener_id) = circuit_listener_id {
         swarm.remove_listener(listener_id);
     }

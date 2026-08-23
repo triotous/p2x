@@ -18,8 +18,11 @@ cases=(
   concurrent-opens resolve-limit proxy-limit exchange-restart server-restart graceful-drain
 )
 if [[ "$case_name" == all ]]; then
+  cd "$root"
+  cargo build -q --workspace --bins
+  cargo build -q -p p2x-config --example identity-id --example ticket-verification
   for case in "${cases[@]}"; do
-    "$0" --case "$case"
+    P2X_RESOLUTION_BUILT=1 "$0" --case "$case"
   done
   exit 0
 fi
@@ -280,7 +283,15 @@ def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathli
     terminal = assert_one_terminal(client_log)
     if terminal.get("code") != expected:
         raise CaseFailure(f"client expected {expected}, got {terminal.get('code')}")
+    resolution_client = [row for row in client_rows if row.get("event") == "resolution_outcome"]
+    resolution_exchange = [row for row in exchange_rows if row.get("event") == "resolution_outcome"]
+    if len(resolution_client) != 1 or len(resolution_exchange) != 1:
+        raise CaseFailure(f"resolution outcome cardinality: client={len(resolution_client)} exchange={len(resolution_exchange)}")
+    if resolution_client[0].get("request_id_hash") != resolution_exchange[0].get("request_id_hash"):
+        raise CaseFailure("client/exchange resolution correlation mismatch")
     if expected == "proxy.authorized":
+        if not resolution_client[0].get("resolved") or not resolution_client[0].get("ticket_issued"):
+            raise CaseFailure("successful resolution did not report a ticketed grant")
         client_auth = [row for row in client_rows if row.get("event") == "proxy_authorization" and row.get("authorized")]
         server_auth = [row for row in server_rows if row.get("event") == "proxy_authorization" and row.get("authorized")]
         if len(client_auth) != 1 or len(server_auth) != 1:
@@ -301,6 +312,11 @@ def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathli
             raise CaseFailure(f"direct-preferred selected {selected[0].get('selected_path')}")
         if not any(row.get("event") == "registry_transition" and row.get("code") == "registry.registered" for row in exchange_rows):
             raise CaseFailure("server registration was not observed")
+    else:
+        if resolution_client[0].get("resolved") or resolution_exchange[0].get("resolved"):
+            raise CaseFailure("rejected resolution was reported as resolved")
+        if resolution_client[0].get("code") != expected or resolution_exchange[0].get("code") != expected:
+            raise CaseFailure("client/exchange resolution code mismatch")
     forbidden = [run.client_token, run.server_token, "token_secret", "raw_ticket", "session_id"] + run.private
     output = "\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
     if any(marker and marker in output for marker in forbidden):
@@ -310,6 +326,7 @@ def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathli
         "passed": True,
         "observed_assertions": {
             "client_terminal": expected,
+            "client_exchange_resolution_correlated": True,
             "server_authorization_correlated": expected == "proxy.authorized",
             "exact_selected_connection": expected == "proxy.authorized",
             "privacy_scan_clean": True,
