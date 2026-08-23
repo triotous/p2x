@@ -370,7 +370,7 @@ async fn main() -> io::Result<()> {
                     if swarm.behaviour_mut().resolve.send_response(channel, response).is_err()
                         && let Some(resolver) = resolver.as_mut()
                     {
-                        resolver.admission.close_connection(connection_id);
+                        resolver.admission.release_request(peer, connection_id, request_id);
                     }
                 }
                 SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Registry(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, request_id }, connection_id, .. })) => {
