@@ -126,5 +126,10 @@ binding matrix completion:
 - Aggregate resolution rerun still reports six explicit orchestration blockers: registration-revision-change, resolve-limit, proxy-limit, exchange-restart, server-restart, graceful-drain.
 validation: workspace static/tests remained green; no generated fuzz corpus noise retained.
 
+final status:
+- Branch is clean after the recorded phase commits.
+- Plan 05a local gate is intentionally not complete: six declared process cases still require implementation/orchestration evidence.
+- Plan 06 is blocked until those six cases pass; deployment/platform checks are also deferred to their owner-executed phase.
+
 limit-hook attempt:
 - A temporary held-worker process-hook attempt was tested and reverted because the finite client owner still opens sequentially, so it could not prove exact N+1 saturation; the runner continues to fail resolve-limit/proxy-limit explicitly.
