@@ -97,6 +97,7 @@ case "$case_name" in
 esac
 credentials_file="$secret_dir/credentials.yaml"
 services_file="$secret_dir/services.yaml"
+routes_file="$secret_dir/routes.yaml"
 cat > "$services_file" <<'EOF'
 schema_version: 1
 registration:
@@ -108,6 +109,21 @@ services:
       protocol: http
       metadata: {service: orders}
     enabled: true
+EOF
+cat > "$routes_file" <<'EOF'
+schema_version: 1
+network:
+  direct_preference_ms: 1500
+  connection_setup_timeout_ms: 20000
+targets:
+  - route_id: orders
+    selector:
+      protocol: http
+      metadata: {service: orders}
+limits:
+  max_peer_states: 64
+  max_pending_setups: 128
+  max_pending_per_server: 64
 EOF
 cat > "$credentials_file" <<EOF
 schema_version: 1
@@ -240,6 +256,7 @@ component_config_args=()
 P2X_TOKEN="$token" "$root/target/debug/p2x-$component" \
   --identity-file "$key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" \
   --credential-env P2X_TOKEN "${auth_mode_args[@]}" "${component_config_args[@]}" $([[ "$component" == server ]] && printf '%s ' --ticket-verification-keys-file "$verification_keys") \
+  $([[ "$component" == client && "$case_name" == exchange-restart ]] && printf '%s ' --routes-file "$routes_file") \
   ${auth_fault_args:-} --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 \
   --case-id "$case_name" >"$log" 2>&1 &
 component_pid=$!
@@ -248,7 +265,9 @@ companion=""
 if [[ "$case_name" == valid-client || "$case_name" == valid-server ]]; then
   if [[ "$component" == client ]]; then companion=server; companion_token="$server_token"; companion_key="$server_key"; else companion=client; companion_token="$client_token"; companion_key="$client_key"; fi
   companion_config_args=()
-  [[ "$companion" == server ]] && companion_config_args+=(--services-file "$services_file")
+  if [[ "$companion" == server ]]; then
+    companion_config_args+=(--services-file "$services_file" --ticket-verification-keys-file "$verification_keys")
+  fi
   P2X_TOKEN="$companion_token" "$root/target/debug/p2x-$companion" \
     --identity-file "$companion_key" --exchange "$exchange_addr" --exchange-peer-id "$exchange_peer" \
     --credential-env P2X_TOKEN --finite-auth-check "${companion_config_args[@]}" \
@@ -328,12 +347,12 @@ for line in open(sys.argv[1]):
 PY
 ); [[ -n "$rotation_addr" ]] && break; sleep .05; done
   [[ -n "$rotation_addr" ]] || { echo "rotation exchange did not become ready" >&2; exit 1; }
-  P2X_TOKEN="$rotation_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$rotation_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --finite-auth-check --case-id rotation-second --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/rotation-second.ndjson" 2>&1 &
+  P2X_TOKEN="$rotation_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$rotation_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --finite-auth-check --case-id rotation-second --routes-file "$services_file" --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/rotation-second.ndjson" 2>&1 &
   pids+=("$!")
   for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$out/rotation-second.ndjson" && break; sleep .05; done
   grep -q '"code":"auth.pong"' "$out/rotation-second.ndjson" || { echo "rotated credential did not authenticate" >&2; exit 1; }
   if [[ "$case_name" == rotation-revoke-old ]]; then
-    P2X_TOKEN="$client_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$rotation_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --finite-auth-check --case-id old-token --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/old-token.ndjson" 2>&1 &
+    P2X_TOKEN="$client_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$rotation_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --finite-auth-check --case-id old-token --routes-file "$services_file" --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/old-token.ndjson" 2>&1 &
     pids+=("$!")
     for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$out/old-token.ndjson" && break; sleep .05; done
     grep -q '"code":"auth.invalid_credential"' "$out/old-token.ndjson" || { echo "old credential still authenticated" >&2; exit 1; }
