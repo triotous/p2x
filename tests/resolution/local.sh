@@ -284,7 +284,7 @@ limits:
         self.processes.append((process, log, handle))
         return log
 
-    def start_client(self, name: str, exchange_address: str, client_args: list[str], token_value: str | None = None, identity_name: str = "client") -> pathlib.Path:
+    def start_client(self, name: str, exchange_address: str, client_args: list[str], token_value: str | None = None, identity_name: str = "client", env: dict[str, str] | None = None) -> pathlib.Path:
         return self.start(
             name,
             [
@@ -297,7 +297,7 @@ limits:
                 *client_args,
                 "--case-id", f"{case}-{name}",
             ],
-            {"P2X_TOKEN": token_value or (self.client2_token if identity_name == "client2" else self.client_token), "P2X_ENABLE_TEST_HOOKS": "1"},
+            {"P2X_TOKEN": token_value or (self.client2_token if identity_name == "client2" else self.client_token), "P2X_ENABLE_TEST_HOOKS": "1", **(env or {})},
         )
 
     def stop(self, log: pathlib.Path, graceful: bool = True) -> None:
@@ -336,6 +336,52 @@ def assert_one_terminal(log: pathlib.Path) -> dict:
         raise CaseFailure(f"{log.name}: expected one terminal, got {len(terminal)}")
     return terminal[0]
 
+
+def finish_limits(run: Run, primary_log: pathlib.Path, secondary_log: pathlib.Path, server_log: pathlib.Path, exchange_log: pathlib.Path) -> None:
+    primary_terminal = assert_one_terminal(primary_log)
+    secondary_terminal = assert_one_terminal(secondary_log)
+    expected_secondary = "limit.resolve_requests" if case == "resolve-limit" else "limit.proxy_streams"
+    if primary_terminal.get("code") != "proxy.authorized" or secondary_terminal.get("code") != expected_secondary:
+        raise CaseFailure(
+            f"limit terminals were unexpected: primary={primary_terminal.get('code')} secondary={secondary_terminal.get('code')}"
+        )
+    exchange_rows = rows(exchange_log)
+    server_rows = rows(server_log)
+    if case == "resolve-limit":
+        outcomes = [row for row in exchange_rows if row.get("event") == "resolution_outcome"]
+        if not any(row.get("resolved") and row.get("ticket_issued") for row in outcomes):
+            raise CaseFailure("resolve-limit did not admit the boundary request")
+        if not any(
+            row.get("code") == "limit.resolve_requests"
+            and not row.get("resolved")
+            and not row.get("ticket_issued")
+            for row in outcomes
+        ):
+            raise CaseFailure("resolve-limit did not reject N+1 without ticket state")
+        if not any(row.get("event") == "test_fault_applied" and row.get("fault") == "hold_resolve_response" for row in exchange_rows):
+            raise CaseFailure("resolve-limit hold fault was not observed")
+    else:
+        if not any(row.get("event") == "proxy_authorization" and row.get("code") == "limit.proxy_streams" for row in server_rows):
+            raise CaseFailure("proxy-limit did not produce server admission rejection evidence")
+        if not any(row.get("event") == "resources" and row.get("workers", 0) >= 1 for row in server_rows):
+            raise CaseFailure("proxy-limit did not expose a live held worker")
+    forbidden = [run.client_token, run.client2_token, run.server_token, "token_secret", "raw_ticket", "session_id"] + run.private
+    output = "\\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
+    if any(marker and marker in output for marker in forbidden):
+        raise CaseFailure("privacy scan found credentials, session data, ticket data, or selector values")
+    summary = {
+        "case": case,
+        "passed": True,
+        "observed_assertions": {
+            "boundary_admitted": True,
+            "n_plus_one_rejected": True,
+            "primary_authorized": True,
+            "resources_drained": True,
+            "privacy_scan_clean": True,
+        },
+    }
+    (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\\n")
+    print(json.dumps(summary, sort_keys=True), flush=True)
 
 def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathlib.Path, exchange_log: pathlib.Path) -> None:
     client_rows = rows(client_log)
@@ -418,8 +464,7 @@ def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathli
     if case == "ticket-bindings":
         if not run.binding_unit_passed:
             raise CaseFailure("ticket-bindings unit matrix did not pass")
-    if case in ("registration-revision-change", "resolve-limit", "proxy-limit", "exchange-restart", "server-restart", "graceful-drain"):
-
+    if case in ("registration-revision-change", "exchange-restart", "server-restart", "graceful-drain"):
         raise CaseFailure(f"{case} requires process orchestration evidence not available in this finite harness")
     forbidden = [run.client_token, run.server_token, "token_secret", "raw_ticket", "session_id"] + run.private
     output = "\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
@@ -466,6 +511,10 @@ try:
         exchange_args += ["--ticket-lifetime-secs", "5"]
         server_args += ["--ticket-clock-skew", "0"]
         client_args = ["--finite-proxy-check", "--test-delay-after-resolve-ms", "6000"]
+    elif case == "resolve-limit":
+        exchange_args += ["--resolve-limit-global", "1", "--resolve-limit-per-client", "1", "--test-hold-resolve-ms", "3000"]
+    elif case == "proxy-limit":
+        server_args += ["--test-hold-proxy-handshake-ms", "3000"]
     exchange_log = run.start(
         "exchange",
         [
@@ -500,24 +549,21 @@ try:
             *server_args,
             "--case-id", case,
         ],
-        {"P2X_TOKEN": run.server_token},
+        {"P2X_TOKEN": run.server_token, "P2X_ENABLE_TEST_HOOKS": "1"} if server_args else {"P2X_TOKEN": run.server_token},
     )
     wait_for(server_log, lambda row: row.get("event") == "server_readiness" and row.get("ready") is True, 45)
     wait_for(exchange_log, lambda row: row.get("event") == "registry_transition" and row.get("code") == "registry.registered", 15)
-    client_log = run.start(
-        "client",
-        [
-            str(bin_dir / "p2x-client"),
-            "--identity-file", str(run.secret / "client.key"),
-            "--exchange", run.exchange_address,
-            "--exchange-peer-id", run.exchange_peer,
-            "--credential-env", "P2X_TOKEN",
-            "--routes-file", str(run.routes),
-            *client_args,
-            "--case-id", case,
-        ],
-        {"P2X_TOKEN": run.client_token, **client_env},
-    )
+    if case in ("resolve-limit", "proxy-limit"):
+        client_log = run.start_client("client", run.exchange_address, client_args, env=client_env)
+        if case == "proxy-limit":
+            wait_for(server_log, lambda row: row.get("event") == "resources" and row.get("workers", 0) >= 1, 45)
+        secondary_args = ["--finite-proxy-check"]
+        if case == "resolve-limit":
+            secondary_args += ["--test-delay-after-resolve-ms", "1000"]
+        secondary_log = run.start_client("client2", run.exchange_address, secondary_args, identity_name="client2")
+    else:
+        client_log = run.start_client("client", run.exchange_address, client_args, env=client_env)
+        secondary_log = None
     expected = {
         "not_found": "registry.not_found",
         "offline": "registry.offline",
@@ -531,16 +577,26 @@ try:
         expected = "auth.ticket_invalid"
     elif expected_mode == "expired":
         expected = "auth.ticket_expired"
-    terminal = wait_for(client_log, lambda row: row.get("event") == "terminal", 45)
-    if terminal.get("code") != expected:
-        raise CaseFailure(f"client expected {expected}, got {terminal.get('code')}")
-    if expected == "proxy.authorized":
-        wait_for(server_log, lambda row: row.get("event") == "proxy_authorization" and row.get("authorized") is True, 15)
-    run.stop(client_log)
-    run.stop(server_log)
-    wait_for(exchange_log, lambda row: row.get("event") == "exchange_resources" and all(row.get(key) == 0 for key in ("sessions", "relay_admissions", "reservations", "circuits", "registrations", "selector_owners", "auth_requests", "registry_requests")), 15)
-    run.stop(exchange_log)
-    finish(run, expected, client_log, server_log, exchange_log)
+    if secondary_log is not None:
+        wait_for(secondary_log, lambda row: row.get("event") == "terminal", 45)
+        wait_for(client_log, lambda row: row.get("event") == "terminal", 45)
+        run.stop(client_log)
+        run.stop(secondary_log)
+        run.stop(server_log)
+        wait_for(exchange_log, lambda row: row.get("event") == "exchange_resources" and all(row.get(key) == 0 for key in ("sessions", "relay_admissions", "reservations", "circuits", "registrations", "selector_owners", "auth_requests", "registry_requests")), 15)
+        run.stop(exchange_log)
+        finish_limits(run, client_log, secondary_log, server_log, exchange_log)
+    else:
+        terminal = wait_for(client_log, lambda row: row.get("event") == "terminal", 45)
+        if terminal.get("code") != expected:
+            raise CaseFailure(f"client expected {expected}, got {terminal.get('code')}")
+        if expected == "proxy.authorized":
+            wait_for(server_log, lambda row: row.get("event") == "proxy_authorization" and row.get("authorized") is True, 15)
+        run.stop(client_log)
+        run.stop(server_log)
+        wait_for(exchange_log, lambda row: row.get("event") == "exchange_resources" and all(row.get(key) == 0 for key in ("sessions", "relay_admissions", "reservations", "circuits", "registrations", "selector_owners", "auth_requests", "registry_requests")), 15)
+        run.stop(exchange_log)
+        finish(run, expected, client_log, server_log, exchange_log)
 except (CaseFailure, subprocess.CalledProcessError) as error:
     print(f"resolution case '{case}' failed: {error}", file=sys.stderr)
     raise SystemExit(1)

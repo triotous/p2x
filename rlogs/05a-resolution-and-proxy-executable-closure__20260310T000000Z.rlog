@@ -138,4 +138,13 @@ phase 7.1 fresh-ticket recovery:
 - Client proxy authorization now supports one guarded recovery after stale revision, peer setup/connection, or exchange timeout failure.
 - Recovery invalidates the binding/selector metadata, discards the old proxy state, allocates a fresh Resolve request/ticket, and preserves the original setup deadline.
 validation: cargo fmt, workspace clippy, p2x-client tests passed.
+commit: ac7aaf9
+
+phase 7.2 limits process orchestration:
+- Added a second authenticated client identity to the resolution harness.
+- Exchange response holding now retains each response channel without blocking auth/registry processing; server proxy worker holding is guarded, bounded, and cancellable.
+- Proxy inbound admission rejection now retains the stream long enough to send a bounded `Rejected(limit.proxy_streams)` response and emits rejection evidence.
+- `resolve-limit` passed with held N=1 and a real second client receiving `limit.resolve_requests`; no extra ticket state was allocated.
+- `proxy-limit` passed with a held N=1 worker and a real second client receiving `limit.proxy_streams`; server emitted live worker and rejection evidence.
+validation: both limit cases passed; shell syntax, workspace fmt/clippy/tests passed.
 commit: pending phase review
