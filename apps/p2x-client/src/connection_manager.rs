@@ -1,5 +1,5 @@
-use libp2p::PeerId;
-use p2x_net::{ConnectionBook, ConnectionId, PathPolicy};
+use libp2p::{PeerId, core::ConnectedPoint};
+use p2x_net::{ConnectionBook, ConnectionId, PathAttempt, PathDecision, PathEvent, PathPolicy};
 use p2x_protocol::PublicErrorCode;
 use std::{
     collections::HashMap,
@@ -17,14 +17,13 @@ pub struct SetupLimits {
     pub max_pending_setups: usize,
     pub max_pending_per_server: usize,
 }
-#[derive(Debug)]
 struct PeerState {
+    book: ConnectionBook,
     pending: usize,
     active: usize,
     last_used: u64,
     draining: bool,
 }
-#[derive(Debug)]
 pub struct ConnectionManager {
     exchange_peer_id: PeerId,
     policy: PathPolicy,
@@ -62,6 +61,7 @@ impl ConnectionManager {
         self.peers.insert(
             server,
             PeerState {
+                book: ConnectionBook::new(self.exchange_peer_id),
                 pending: 1,
                 active: 0,
                 last_used: self.sequence,
@@ -80,13 +80,67 @@ impl ConnectionManager {
     pub fn mark_active(&mut self, server: PeerId) {
         if let Some(state) = self.peers.get_mut(&server) {
             state.active += 1;
+            self.sequence = self.sequence.saturating_add(1);
             state.last_used = self.sequence;
         }
+    }
+
+    pub fn on_connection_established(
+        &mut self,
+        server: PeerId,
+        connection_id: ConnectionId,
+        endpoint: &ConnectedPoint,
+        now: Instant,
+    ) -> Result<(), p2x_net::connection_book::ConnectionBookError> {
+        self.peers
+            .get_mut(&server)
+            .ok_or(p2x_net::connection_book::ConnectionBookError::Capacity)?
+            .book
+            .on_connection_established(server, connection_id, endpoint, now)
+    }
+
+    pub fn on_connection_closed(
+        &mut self,
+        server: PeerId,
+        connection_id: ConnectionId,
+    ) -> Result<(), p2x_net::connection_book::ConnectionBookError> {
+        self.peers
+            .get_mut(&server)
+            .ok_or(p2x_net::connection_book::ConnectionBookError::Capacity)?
+            .book
+            .on_connection_closed(server, connection_id)
+    }
+
+    pub fn on_dcutr_succeeded(
+        &mut self,
+        server: PeerId,
+        connection_id: ConnectionId,
+        now: Instant,
+    ) -> Result<(), p2x_net::connection_book::ConnectionBookError> {
+        self.peers
+            .get_mut(&server)
+            .ok_or(p2x_net::connection_book::ConnectionBookError::Capacity)?
+            .book
+            .on_dcutr_succeeded(server, connection_id, now)
     }
     pub fn close_active(&mut self, server: PeerId) {
         if let Some(state) = self.peers.get_mut(&server) {
             state.active = state.active.saturating_sub(1);
         }
+    }
+
+    pub fn direct(&self, server: PeerId) -> Option<ConnectionId> {
+        self.peers
+            .get(&server)
+            .and_then(|state| state.book.direct(server))
+            .map(|record| record.connection_id)
+    }
+
+    pub fn relay(&self, server: PeerId) -> Option<ConnectionId> {
+        self.peers
+            .get(&server)
+            .and_then(|state| state.book.relay(server))
+            .map(|record| record.connection_id)
     }
     pub fn set_draining(&mut self, server: PeerId, value: bool) {
         if let Some(state) = self.peers.get_mut(&server) {
@@ -105,6 +159,41 @@ impl ConnectionManager {
     pub fn pending_count(&self) -> usize {
         self.pending
     }
+
+    pub fn begin_path(
+        &mut self,
+        server: PeerId,
+        now: Instant,
+    ) -> Result<(PathAttempt, Vec<p2x_net::PathAction>), PublicErrorCode> {
+        self.admit(server)?;
+        self.sequence = self.sequence.saturating_add(1);
+        let (direct, relay) = self
+            .peers
+            .get(&server)
+            .map(|state| {
+                (
+                    state.book.direct(server).map(|record| record.connection_id),
+                    state.book.relay(server).map(|record| record.connection_id),
+                )
+            })
+            .unwrap_or((None, None));
+        let mut attempt =
+            PathAttempt::with_policy(p2x_net::AttemptId(self.sequence), now, self.policy);
+        let actions = attempt.apply(PathEvent {
+            attempt_id: attempt.id,
+            now,
+            kind: p2x_net::PathEventKind::Begin { relay, direct },
+        });
+        Ok((attempt, actions))
+    }
+
+    pub fn finish_path(&mut self, server: PeerId, selected: Option<PathDecision>) {
+        self.release(server);
+        if selected.is_some() {
+            self.mark_active(server);
+        }
+    }
+
     fn evict(&mut self) -> Result<(), PublicErrorCode> {
         let victim = self
             .peers
@@ -149,6 +238,59 @@ mod tests {
         manager.release(first);
         manager.admit(second).unwrap();
         manager.release(second);
+        assert_eq!(manager.pending_count(), 0);
+    }
+
+    #[test]
+    fn manager_path_uses_confirmed_direct_before_relay() {
+        let exchange = PeerId::random();
+        let server = PeerId::random();
+        let mut manager = ConnectionManager::new(
+            exchange,
+            PathPolicy::default(),
+            SetupLimits {
+                max_peer_states: 2,
+                max_pending_setups: 2,
+                max_pending_per_server: 2,
+            },
+        );
+        manager.admit(server).unwrap();
+        let now = Instant::now();
+        let relay = ConnectionId::new_unchecked(1);
+        let direct = ConnectionId::new_unchecked(2);
+        let relay_address = format!("/ip4/127.0.0.1/tcp/1/p2p/{exchange}/p2p-circuit/p2p/{server}")
+            .parse()
+            .unwrap();
+        let direct_address = format!("/ip4/127.0.0.1/tcp/2/p2p/{server}")
+            .parse()
+            .unwrap();
+        let endpoint = |address| libp2p::core::ConnectedPoint::Dialer {
+            address,
+            role_override: libp2p::core::Endpoint::Dialer,
+            port_use: libp2p::core::transport::PortUse::New,
+        };
+        manager
+            .on_connection_established(server, relay, &endpoint(relay_address), now)
+            .unwrap();
+        manager
+            .on_connection_established(server, direct, &endpoint(direct_address), now)
+            .unwrap();
+        manager.on_dcutr_succeeded(server, direct, now).unwrap();
+        let (attempt, actions) = manager.begin_path(server, now).unwrap();
+        assert_eq!(
+            attempt.state,
+            p2x_net::PathState::Committed {
+                decision: PathDecision::Direct(direct),
+                relay_id: Some(relay),
+                relay_fallback_used: false
+            }
+        );
+        assert_eq!(
+            actions,
+            vec![p2x_net::PathAction::OpenExact { connection: direct }]
+        );
+        manager.finish_path(server, Some(PathDecision::Direct(direct)));
+        manager.finish_path(server, None);
         assert_eq!(manager.pending_count(), 0);
     }
 }
