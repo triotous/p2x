@@ -119,6 +119,9 @@ impl ProxyStreamBehaviour {
         open: OpenProxyStreamV1,
         now: Instant,
     ) -> Result<ProxyRequestId, &'static str> {
+        if !self.outbound_enabled {
+            return Err("proxy.outbound_disabled");
+        }
         if !self.known.contains(&(peer_id, connection_id)) {
             return Err("connection_unknown");
         }
@@ -156,6 +159,9 @@ impl ProxyStreamBehaviour {
         Ok(request_id)
     }
     pub fn inbound_admit(&mut self, peer_id: PeerId) -> Result<(), &'static str> {
+        if !self.inbound_enabled {
+            return Err("proxy.inbound_disabled");
+        }
         self.admit_inbound(peer_id, None)
     }
     pub fn inbound_admit_on(
@@ -449,10 +455,34 @@ impl NetworkBehaviour for ProxyStreamBehaviour {
 mod tests {
     use super::*;
     #[test]
+    fn surface_restricts_direction() {
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(1);
+        let open = OpenProxyStreamV1 {
+            request_id: [1; 16],
+            ticket: p2x_protocol::RawTicket::new(vec![7; 16]).unwrap(),
+            upstream_id: p2x_protocol::UpstreamId::new("orders").unwrap(),
+            registration_revision: p2x_protocol::RegistrationRevision::new(1).unwrap(),
+            ingress_kind: p2x_protocol::IngressKind::FixedTcp,
+        };
+        let mut client = ProxyStreamBehaviour::product();
+        client.known.insert((peer, connection));
+        assert!(client.open_on(peer, connection, open.clone()).is_ok());
+        assert_eq!(client.inbound_admit(peer), Err("proxy.inbound_disabled"));
+        let mut server = ProxyStreamBehaviour::server();
+        server.known.insert((peer, connection));
+        assert_eq!(
+            server.open_on(peer, connection, open),
+            Err("proxy.outbound_disabled")
+        );
+        assert!(server.inbound_admit(peer).is_ok());
+    }
+
+    #[test]
     fn exact_open_is_bounded_and_terminal_once() {
         let peer = PeerId::random();
         let connection = ConnectionId::new_unchecked(1);
-        let mut behaviour = ProxyStreamBehaviour::default();
+        let mut behaviour = ProxyStreamBehaviour::product();
         behaviour.known.insert((peer, connection));
         let open = OpenProxyStreamV1 {
             request_id: [1; 16],
