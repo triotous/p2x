@@ -222,6 +222,8 @@ fn drive_path_actions(
                 let now = std::time::Instant::now();
                 match behaviour.open_on(peer_id, connection) {
                     Ok(request_id) => {
+                        let path_request_id =
+                            p2x_net::probe_stream::handler::RequestId(request_id.0);
                         *launched += 1;
                         emitter.emit(&LifecycleRecord::PathSelected {
                             request_id: request_id.0,
@@ -238,7 +240,7 @@ fn drive_path_actions(
                             attempt_id: attempt.id,
                             now,
                             kind: PathEventKind::ExactOpenQueued {
-                                request_id,
+                                request_id: path_request_id,
                                 connection,
                             },
                         }));
@@ -470,6 +472,7 @@ async fn main() -> io::Result<()> {
     let mut proxy_open: Option<OpenProxyStreamV1> = None;
     let mut proxy_request_id: Option<[u8; 16]> = None;
     let mut selected_proxy_connection: Option<libp2p::swarm::ConnectionId> = None;
+    let mut proxy_setup_deadline: Option<std::time::Instant> = None;
     let mut pending_proxy: Option<ProxyRequestId> = None;
     let mut maintenance = tokio::time::interval(std::time::Duration::from_millis(100));
     struct ProxyResult {
@@ -616,7 +619,11 @@ async fn main() -> io::Result<()> {
                                 && let Some(open) = proxy_open.as_ref().cloned()
                             {
                                 let proxy = swarm.behaviour_mut().proxy_stream.as_mut().ok_or_else(|| io::Error::other("proxy is unavailable in product mode"))?;
-                                let request_id = proxy.open_on(peer_id, connection_id, open.clone()).map_err(io::Error::other)?;
+                                let request_id = if let Some(deadline) = proxy_setup_deadline {
+                                    proxy.open_on_at_deadline(peer_id, connection_id, open.clone(), std::time::Instant::now(), deadline).map_err(io::Error::other)?
+                                } else {
+                                    proxy.open_on(peer_id, connection_id, open.clone()).map_err(io::Error::other)?
+                                };
                                 proxy_request_id = Some(open.request_id);
                                 selected_proxy_connection = Some(connection_id);
                                 pending_proxy = Some(request_id);
@@ -712,7 +719,9 @@ async fn main() -> io::Result<()> {
                                 let address = Multiaddr::try_from(address.clone()).map_err(io::Error::other)?;
                                 target_peer = Some(peer);
                                 if let Some(manager) = connection_manager.as_mut() {
-                                    let (_, actions) = manager.begin_path(peer, std::time::Instant::now()).map_err(|code| io::Error::other(code.as_str()))?;
+                                    let started = std::time::Instant::now();
+                                    let (path, actions) = manager.begin_path(peer, started).map_err(|code| io::Error::other(code.as_str()))?;
+                                    proxy_setup_deadline = Some(path.setup_deadline);
                                     if actions.iter().any(|action| matches!(action, PathAction::DialRelay)) {
                                         swarm.dial(address.clone()).map_err(io::Error::other)?;
                                     }
@@ -788,7 +797,7 @@ async fn main() -> io::Result<()> {
                         ProbeOutput::OutboundOpened { stream, request_id, peer_id, connection_id } => {
                             let mut stream = stream;
                             if let Some(current) = attempt.as_mut() {
-                                let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ExactOpenSucceeded { request_id, connection: connection_id } });
+                                let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ExactOpenSucceeded { request_id: p2x_net::probe_stream::handler::RequestId(request_id.0), connection: connection_id } });
                                 drive_path_actions(probe_mut(&mut swarm)?, current, peer_id, &emitter, actions, &mut launched)?;
                                 let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::PayloadAccepted });
                                 drive_path_actions(probe_mut(&mut swarm)?, current, peer_id, &emitter, actions, &mut launched)?;
@@ -815,7 +824,7 @@ async fn main() -> io::Result<()> {
                         }
                         ProbeOutput::OutboundFailed { request_id, peer_id, connection_id, code } => {
                             if let Some(current) = attempt.as_mut() {
-                                let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ExactOpenFailed { request_id, connection: connection_id } });
+                                let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ExactOpenFailed { request_id: p2x_net::probe_stream::handler::RequestId(request_id.0), connection: connection_id } });
                                 drive_path_actions(probe_mut(&mut swarm)?, current, peer_id, &emitter, actions, &mut launched)?;
                             }
                             if args.recover_after_failure && !recovery_attempted {

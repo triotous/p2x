@@ -194,6 +194,10 @@ impl ConnectionManager {
         }
     }
 
+    pub fn setup_deadline(&self, started: Instant) -> Instant {
+        started + self.policy.setup_budget
+    }
+
     fn evict(&mut self) -> Result<(), PublicErrorCode> {
         let victim = self
             .peers

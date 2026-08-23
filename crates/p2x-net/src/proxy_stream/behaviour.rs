@@ -98,6 +98,20 @@ impl ProxyStreamBehaviour {
     ) -> Result<ProxyRequestId, &'static str> {
         self.open_on_at(peer_id, connection_id, open, Instant::now())
     }
+
+    pub fn open_on_at_deadline(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        open: OpenProxyStreamV1,
+        now: Instant,
+        deadline: Instant,
+    ) -> Result<ProxyRequestId, &'static str> {
+        if deadline <= now {
+            return Err("peer.setup_timeout");
+        }
+        self.open_on_at(peer_id, connection_id, open, now)
+    }
     pub fn open_on_at(
         &mut self,
         peer_id: PeerId,
@@ -195,6 +209,10 @@ impl ProxyStreamBehaviour {
     }
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    pub fn has_connection(&self, peer_id: PeerId, connection_id: ConnectionId) -> bool {
+        self.known.contains(&(peer_id, connection_id))
     }
     pub fn expire(&mut self, now: Instant) {
         let requests = self

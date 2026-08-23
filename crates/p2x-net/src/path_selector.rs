@@ -409,6 +409,7 @@ impl PathAttempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe_stream::handler::RequestId;
 
     fn id(value: usize) -> ConnectionId {
         ConnectionId::new_unchecked(value)
