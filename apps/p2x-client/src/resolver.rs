@@ -10,6 +10,8 @@ use std::{
 };
 
 pub const MAX_WAITERS_PER_SELECTOR: usize = 64;
+const MAX_PENDING_REQUESTS: usize = 128;
+const MAX_CACHE_ENTRIES: usize = 2_048;
 
 fn valid_relay_address(address: &[u8], exchange: Option<PeerId>, server: PeerId) -> bool {
     let Ok(address) = libp2p::Multiaddr::try_from(address.to_vec()) else {
@@ -52,6 +54,11 @@ struct CacheKey {
     selector: UnscopedSelector,
 }
 #[derive(Clone, Debug)]
+struct PendingRequest {
+    key: CacheKey,
+    session_id: [u8; 16],
+}
+#[derive(Clone, Debug)]
 struct Positive {
     metadata: ResolvedServiceMetadata,
     expires_at: i64,
@@ -67,12 +74,26 @@ pub struct ResolverState {
     positive: HashMap<CacheKey, Positive>,
     negative: HashMap<CacheKey, Negative>,
     waiters: HashMap<CacheKey, VecDeque<[u8; 16]>>,
-    pending: HashMap<[u8; 16], CacheKey>,
+    pending: HashMap<[u8; 16], PendingRequest>,
     queued_requests: HashMap<[u8; 16], ResolveRequestV1>,
+    principal_binding: Option<PrincipalBinding>,
 }
 impl ResolverState {
     pub fn set_exchange_peer(&mut self, exchange_peer_id: PeerId) {
         self.exchange_peer_id = Some(exchange_peer_id);
+    }
+
+    /// Replacing the principal binding invalidates all metadata, negatives, and ticket waiters.
+    pub fn set_principal_binding(&mut self, binding: PrincipalBinding) {
+        if self.principal_binding.as_ref() == Some(&binding) {
+            return;
+        }
+        self.positive.clear();
+        self.negative.clear();
+        self.waiters.clear();
+        self.pending.clear();
+        self.queued_requests.clear();
+        self.principal_binding = Some(binding);
     }
     pub fn begin(
         &mut self,
@@ -83,6 +104,13 @@ impl ResolverState {
         now: i64,
     ) -> Result<Option<ResolveRequestV1>, p2x_protocol::PublicErrorCode> {
         self.sweep(now);
+        self.set_principal_binding(binding.clone());
+        if self.pending.len() + self.queued_requests.len() >= MAX_PENDING_REQUESTS
+            || self.pending.contains_key(&request_id)
+            || self.queued_requests.contains_key(&request_id)
+        {
+            return Err(p2x_protocol::PublicErrorCode::LimitResolveRequests);
+        }
         let key = CacheKey {
             binding,
             selector: selector.clone(),
@@ -100,13 +128,15 @@ impl ResolverState {
         };
         self.queued_requests.insert(request_id, request.clone());
         if queue.len() == 1 {
-            self.pending.insert(request_id, key);
+            self.pending
+                .insert(request_id, PendingRequest { key, session_id });
             Ok(Some(request))
         } else {
             Ok(None)
         }
     }
 
+    /// Promotes the next FIFO waiter for a selector to the wire request owner.
     pub fn next_request(&mut self) -> Option<ResolveRequestV1> {
         let (key, request_id) = self
             .waiters
@@ -116,7 +146,11 @@ impl ResolverState {
             return None;
         }
         let request = self.queued_requests.remove(&request_id)?;
-        self.pending.insert(request_id, key);
+        let session_id = match &request {
+            ResolveRequestV1::Resolve { session_id, .. } => *session_id,
+        };
+        self.pending
+            .insert(request_id, PendingRequest { key, session_id });
         Some(request)
     }
 
@@ -135,6 +169,7 @@ impl ResolverState {
             .map(|entry| entry.metadata.clone())
     }
 
+    /// Returns only the short-lived not-found/offline result, never a ticket.
     pub fn negative(
         &self,
         binding: &PrincipalBinding,
@@ -166,17 +201,26 @@ impl ResolverState {
                 request_id: None, ..
             } => return Err(p2x_protocol::PublicErrorCode::ProtocolMalformed),
         };
-        let key = self
+        let pending = self
             .pending
-            .remove(&request_id)
+            .get(&request_id)
             .ok_or(p2x_protocol::PublicErrorCode::ProtocolMalformed)?;
-        if key.binding != *binding || key.selector != *selector {
+        if pending.session_id != _session_id
+            || pending.key.binding != *binding
+            || pending.key.selector != *selector
+        {
             return Err(p2x_protocol::PublicErrorCode::ProtocolMalformed);
         }
+        let key = pending.key.clone();
+        if self
+            .waiters
+            .get(&key)
+            .is_some_and(|queue| queue.front() != Some(&request_id))
+        {
+            return Err(p2x_protocol::PublicErrorCode::ProtocolMalformed);
+        }
+        self.pending.remove(&request_id);
         if let Some(queue) = self.waiters.get_mut(&key) {
-            if queue.front() != Some(&request_id) {
-                return Err(p2x_protocol::PublicErrorCode::ProtocolMalformed);
-            }
             queue.pop_front();
             if queue.is_empty() {
                 self.waiters.remove(&key);
@@ -215,7 +259,7 @@ impl ResolverState {
                     compatible_capabilities,
                     registration_expires_at,
                 };
-                self.positive.insert(
+                self.cache_metadata(
                     key,
                     Positive {
                         metadata: metadata.clone(),
@@ -234,7 +278,7 @@ impl ResolverState {
                     p2x_protocol::PublicErrorCode::RegistryNotFound
                         | p2x_protocol::PublicErrorCode::RegistryOffline
                 ) {
-                    self.negative.insert(
+                    self.cache_negative(
                         key,
                         Negative {
                             code: error.code,
@@ -254,6 +298,39 @@ impl ResolverState {
         self.positive.remove(&key);
         self.negative.remove(&key);
     }
+
+    fn cache_metadata(&mut self, key: CacheKey, value: Positive) {
+        self.trim_cache();
+        self.positive.insert(key, value);
+    }
+
+    fn cache_negative(&mut self, key: CacheKey, value: Negative) {
+        self.trim_cache();
+        self.negative.insert(key, value);
+    }
+
+    fn trim_cache(&mut self) {
+        while self.positive.len() + self.negative.len() >= MAX_CACHE_ENTRIES {
+            if let Some(key) = self
+                .positive
+                .iter()
+                .min_by_key(|(_, value)| value.expires_at)
+                .map(|(key, _)| key.clone())
+            {
+                self.positive.remove(&key);
+            } else if let Some(key) = self
+                .negative
+                .iter()
+                .min_by_key(|(_, value)| value.expires_at)
+                .map(|(key, _)| key.clone())
+            {
+                self.negative.remove(&key);
+            } else {
+                break;
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         self.exchange_peer_id = None;
         self.positive.clear();
@@ -261,6 +338,7 @@ impl ResolverState {
         self.waiters.clear();
         self.pending.clear();
         self.queued_requests.clear();
+        self.principal_binding = None;
     }
     pub fn sweep(&mut self, now: i64) {
         self.positive.retain(|_, value| value.expires_at > now);
