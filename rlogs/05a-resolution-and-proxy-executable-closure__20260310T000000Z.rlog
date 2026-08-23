@@ -182,4 +182,18 @@ phase 7.7 graceful drain process matrix:
 - All subcases assert one terminal, readiness loss, zero final resources, and clean privacy scans.
 - Full resolution aggregate passed all 20 declared cases.
 validation: full `tests/resolution/local.sh --case all` passed.
+commit: e7a1699
+
+final local verification:
+- Full `tests/resolution/local.sh --case all` passed all 20 declared cases.
+- `graceful-drain` passed server-drain, exchange-drain, and client-cancel subcases.
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` passed.
+- `cargo test --workspace --all-targets --all-features` passed.
+- `cargo deny check` passed.
+- `cargo tree -e features` passed.
+- Auth, registry, and connectivity local suites passed.
+- All seven nightly fuzz targets passed 1000 bounded runs each with no generated corpus noise.
+- Documentation now describes the completed local process gates; only Plan 05a §7.4 deployment/platform checks remain owner-executed.
+status: Plan 05a local Definition of Done reached for locally automatable scope; Plan 06 may begin after owner review of the deployment/platform handoff.
 commit: pending phase review
