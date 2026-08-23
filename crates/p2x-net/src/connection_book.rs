@@ -198,6 +198,30 @@ impl ConnectionBook {
             })
             .min_by_key(|r| (transport_rank(&r.path), r.sequence))
     }
+
+    pub fn relay(&self, peer_id: PeerId) -> Option<&ConnectionRecord> {
+        self.ledger
+            .values()
+            .filter_map(|l| match l {
+                Lifecycle::Active(r)
+                    if r.peer_id == peer_id
+                        && !r.closing
+                        && matches!(r.path, PathKind::Relay { .. }) =>
+                {
+                    Some(r.as_ref())
+                }
+                _ => None,
+            })
+            .min_by_key(|r| r.sequence)
+    }
+
+    pub fn mark_closing(&mut self, peer_id: PeerId, connection_id: ConnectionId) -> bool {
+        let Some(Lifecycle::Active(record)) = self.ledger.get_mut(&(peer_id, connection_id)) else {
+            return false;
+        };
+        record.closing = true;
+        true
+    }
     pub fn get(&self, peer_id: PeerId, connection_id: ConnectionId) -> Option<&ConnectionRecord> {
         match self.ledger.get(&(peer_id, connection_id)) {
             Some(Lifecycle::Active(r)) => Some(r.as_ref()),
@@ -361,6 +385,21 @@ mod tests {
             ),
             Err(ConnectionBookError::WrongExchange)
         );
+    }
+
+    #[test]
+    fn relay_query_ignores_closing_connections() {
+        let exchange = PeerId::random();
+        let peer = PeerId::random();
+        let now = Instant::now();
+        let address = format!("/ip4/127.0.0.1/tcp/1/p2p/{exchange}/p2p-circuit/p2p/{peer}");
+        let mut book = ConnectionBook::new(exchange);
+        book.on_connection_established(peer, id(1), &endpoint(&address), now)
+            .unwrap();
+        assert_eq!(book.relay(peer).unwrap().connection_id, id(1));
+        assert!(book.mark_closing(peer, id(1)));
+        assert!(book.relay(peer).is_none());
+        assert!(!book.mark_closing(peer, id(2)));
     }
 
     #[test]
