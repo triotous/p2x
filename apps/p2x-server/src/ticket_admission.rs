@@ -48,7 +48,7 @@ impl TicketAdmissionLedger {
             replay: HashMap::new(),
         })
     }
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn authorize_open(
         &mut self,
         ring: &VerificationKeyRing,
@@ -192,6 +192,7 @@ impl TicketAdmissionLedger {
         self.consume_candidate(candidate, now)
     }
 
+    #[allow(dead_code)]
     pub fn validate_and_consume(
         &mut self,
         ring: &VerificationKeyRing,
@@ -243,6 +244,104 @@ impl TicketAdmissionLedger {
 mod tests {
     use super::*;
     use p2x_protocol::{TicketSigner, ticket::ConnectionTicketClaimsV1};
+    #[test]
+    fn invalid_binding_does_not_consume_replay_entry() {
+        let signer = TicketSigner::from_seed([9; 32]);
+        let peer = libp2p::identity::Keypair::generate_ed25519();
+        let id = libp2p::PeerId::from_public_key(&peer.public()).to_bytes();
+        let claims = ConnectionTicketClaimsV1::new(
+            id.to_vec(),
+            "tenant".into(),
+            id.to_vec(),
+            id.to_vec(),
+            "orders".into(),
+            [3; 32],
+            1,
+            2,
+            4,
+            10,
+            20,
+            [5; 16],
+            1,
+        )
+        .unwrap();
+        let envelope = signer.sign(&claims).unwrap();
+        let ring = verification_ring(&signer);
+        let mut expected = TicketValidation {
+            issuer_exchange_peer_id: &id,
+            client_peer_id: &id,
+            server_peer_id: &id,
+            tenant: "tenant",
+            upstream_id: "wrong",
+            selector_fingerprint: [3; 32],
+            registration_revision: 1,
+            authorization_revision: 2,
+            permissions: 4,
+            max_streams: 1,
+            now: 15,
+            clock_skew: 0,
+        };
+        let mut admission = TicketAdmissionLedger::new(1, 0).unwrap();
+        assert_eq!(
+            admission.validate_and_consume(&ring, envelope.as_bytes(), &expected, [7; 32]),
+            TicketAdmission::Rejected(PublicErrorCode::AuthTicketInvalid)
+        );
+        expected.upstream_id = "orders";
+        assert!(matches!(
+            admission.validate_and_consume(&ring, envelope.as_bytes(), &expected, [7; 32]),
+            TicketAdmission::Authorized([5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5])
+        ));
+        assert_eq!(admission.len(), 1);
+    }
+
+    #[test]
+    fn replay_retention_includes_expiry_plus_clock_skew() {
+        let signer = TicketSigner::from_seed([9; 32]);
+        let peer = libp2p::identity::Keypair::generate_ed25519();
+        let id = libp2p::PeerId::from_public_key(&peer.public()).to_bytes();
+        let claims = ConnectionTicketClaimsV1::new(
+            id.to_vec(),
+            "tenant".into(),
+            id.to_vec(),
+            id.to_vec(),
+            "orders".into(),
+            [3; 32],
+            1,
+            2,
+            4,
+            10,
+            20,
+            [5; 16],
+            1,
+        )
+        .unwrap();
+        let envelope = signer.sign(&claims).unwrap();
+        let ring = verification_ring(&signer);
+        let expected = |now| TicketValidation {
+            issuer_exchange_peer_id: &id,
+            client_peer_id: &id,
+            server_peer_id: &id,
+            tenant: "tenant",
+            upstream_id: "orders",
+            selector_fingerprint: [3; 32],
+            registration_revision: 1,
+            authorization_revision: 2,
+            permissions: 4,
+            max_streams: 1,
+            now,
+            clock_skew: 5,
+        };
+        let mut admission = TicketAdmissionLedger::new(1, 5).unwrap();
+        assert!(matches!(
+            admission.validate_and_consume(&ring, envelope.as_bytes(), &expected(15), [7; 32]),
+            TicketAdmission::Authorized(_)
+        ));
+        admission.sweep(24);
+        assert_eq!(admission.len(), 1);
+        admission.sweep(25);
+        assert_eq!(admission.len(), 0);
+    }
+
     #[test]
     fn valid_ticket_is_consumed_once_and_capacity_does_not_evict_live_entries() {
         let signer = TicketSigner::from_seed([9; 32]);

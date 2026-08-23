@@ -1,5 +1,6 @@
 use futures::io::{AsyncRead, AsyncReadExt};
 use libp2p::{PeerId, swarm::ConnectionId};
+use p2x_config::ticket_key::VerificationKeyRing;
 use p2x_net::proxy_codec;
 use p2x_protocol::{OpenProxyStreamV1, ProxyOpenResponseV1, PublicError, PublicErrorCode};
 use std::time::Duration;
@@ -15,6 +16,7 @@ pub struct Candidate {
     pub peer_id: PeerId,
     pub connection_id: ConnectionId,
     pub open: Result<OpenProxyStreamV1, PublicErrorCode>,
+    pub validation: Result<super::ticket_admission::ValidationCandidate, PublicErrorCode>,
     pub decision: oneshot::Sender<ProxyOpenResponseV1>,
 }
 
@@ -40,6 +42,8 @@ pub async fn run_worker(
     peer_id: PeerId,
     connection_id: ConnectionId,
     mut stream: libp2p::swarm::Stream,
+    verification_ring: Option<VerificationKeyRing>,
+    now: i64,
     candidates: mpsc::Sender<Candidate>,
     releases: mpsc::Sender<Release>,
 ) {
@@ -53,11 +57,22 @@ pub async fn run_worker(
     .and_then(Result::ok)
     .ok_or(PublicErrorCode::ProtocolMalformed);
     let request_id = open.as_ref().ok().map(|open| open.request_id);
+    let validation = match (&verification_ring, open.as_ref()) {
+        (Some(ring), Ok(open)) => super::ticket_admission::TicketAdmissionLedger::new(
+            super::ticket_admission::MAX_REPLAY_ENTRIES,
+            30,
+        )
+        .expect("worker verification limits are valid")
+        .verify_candidate(ring, open.ticket.as_bytes(), now),
+        (None, Ok(_)) => Err(PublicErrorCode::AuthSessionRequired),
+        (_, Err(code)) => Err(*code),
+    };
     if candidates
         .send(Candidate {
             peer_id,
             connection_id,
             open,
+            validation,
             decision,
         })
         .await

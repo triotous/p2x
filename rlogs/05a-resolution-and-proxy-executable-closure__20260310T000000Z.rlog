@@ -56,4 +56,15 @@ validation:
 - cargo test p2x-client/p2x-server all targets/features: passed.
 - cargo clippy p2x-client/p2x-server all targets/features -D warnings: passed.
 - Full worker split is not claimed until main dispatch consumes ValidationCandidate directly.
-commit: phase 6.5 pending review
+commit: phase 6.5 committed as acf63fa
+
+phase 6.6 server verification/live consume and admission tests:
+- Worker now performs immutable ticket envelope/signature/time verification and sends a ValidationCandidate; main owner performs current service/revision/claim checks and replay consumption.
+- Added server proxy limit configuration (workers, per-client workers, replay capacity, skew) with hard validation and applied configured behavior/channel limits.
+- Added replay binding-failure non-consumption and expiry-plus-skew retention tests.
+validation:
+- cargo fmt --all: passed.
+- cargo test p2x-server all targets/features: passed.
+- cargo clippy p2x-server all targets/features -D warnings: passed.
+- Remaining product gaps: full multi-open dispatch and canonical process matrix.
+commit: phase 6.6 pending review

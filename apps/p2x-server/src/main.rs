@@ -622,14 +622,15 @@ async fn main() -> io::Result<()> {
                 let response = match candidate.open {
                     Ok(open) => {
                         let now = unix_now();
-                        let mut owner_fingerprint = [0; 32];
-                        owner_fingerprint[..8].copy_from_slice(&stable_hash(candidate.peer_id).to_be_bytes());
                         match (verification_ring.as_ref(), auth_state.current_session(now), service_config.as_ref(), availability.registration_context(now)) {
-                            (Some(ring), Some(session), Some(services), Some((_, expires_at))) => {
+                            (Some(_ring), Some(session), Some(services), Some((_, expires_at))) => {
                                 let service = services.service(&open.upstream_id);
                                 match service {
                                     Some(service) => {
-                                        let admission = ticket_admission.authorize_open(ring, relay_peer_id.unwrap_or(*swarm.local_peer_id()), candidate.peer_id, *swarm.local_peer_id(), session.tenant(), service, registration_revision, expires_at, session.authorization_revision(), &open, now, owner_fingerprint);
+                                        let admission = match candidate.validation {
+                                            Ok(validation_candidate) => ticket_admission.authorize_candidate(validation_candidate, relay_peer_id.unwrap_or(*swarm.local_peer_id()), candidate.peer_id, *swarm.local_peer_id(), session.tenant(), service, registration_revision, expires_at, session.authorization_revision(), &open, now),
+                                            Err(code) => ticket_admission::TicketAdmission::Rejected(code),
+                                        };
                                         match admission {
                                             ticket_admission::TicketAdmission::Authorized(_) => proxy_open::random_stream_id().map(|stream_id| p2x_protocol::ProxyOpenResponseV1::Authorized { request_id: open.request_id, stream_id }).unwrap_or_else(|code| p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: Some(open.request_id), error: p2x_protocol::PublicError::new(code, true) }),
                                             ticket_admission::TicketAdmission::Rejected(code) => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: Some(open.request_id), error: p2x_protocol::PublicError::new(code, matches!(code, PublicErrorCode::RegistryStaleRevision | PublicErrorCode::LimitProxyStreams)) },
@@ -846,7 +847,15 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::Behaviour(PeerEvent::Proxy(p2x_net::proxy_stream::behaviour::ProxyOutput::InboundOpened { peer_id, connection_id, stream })) => {
                         proxy_workers += 1;
                         let tx = proxy_tx.clone();
-                        tokio::spawn(proxy_open::run_worker(peer_id, connection_id, stream, tx, proxy_release_tx.clone()));
+                        tokio::spawn(proxy_open::run_worker(
+                            peer_id,
+                            connection_id,
+                            stream,
+                            verification_ring.clone(),
+                            unix_now(),
+                            tx,
+                            proxy_release_tx.clone(),
+                        ));
                     }
                     SwarmEvent::Behaviour(PeerEvent::Proxy(p2x_net::proxy_stream::behaviour::ProxyOutput::InboundRejected { .. })) => {}
                     SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Authenticated { session_id, request_id, tenant, role, scopes, quota_profile, authorization_revision, expires_at, .. } }, .. })) if pending_auth.complete(&outbound_id) => {

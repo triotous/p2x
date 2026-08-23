@@ -580,7 +580,15 @@ async fn main() -> io::Result<()> {
     let mut resolve_retried = false;
     let mut resolve_setup_deadline: Option<std::time::Instant> = None;
     let mut proxy_open: Option<OpenProxyStreamV1> = None;
-    let _route_owner = route_test_hook_used.then(route_open::RouteOpenSupervisor::default);
+    let _route_owner = route_test_hook_used.then(|| {
+        route_open::RouteOpenSupervisor::new(
+            routes
+                .as_ref()
+                .map_or(route_open::MAX_ROUTE_OPENS, |config| {
+                    config.limits.max_route_opens
+                }),
+        )
+    });
     let mut proxy_request_id: Option<[u8; 16]> = None;
     let mut selected_proxy_connection: Option<libp2p::swarm::ConnectionId> = None;
     let mut proxy_setup_deadline: Option<std::time::Instant> = None;
