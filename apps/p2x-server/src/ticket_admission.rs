@@ -295,6 +295,137 @@ mod tests {
     }
 
     #[test]
+    fn ticket_binding_matrix_rejects_without_consuming_replay() {
+        let signer = TicketSigner::from_seed([9; 32]);
+        let peer = libp2p::identity::Keypair::generate_ed25519();
+        let id = libp2p::PeerId::from_public_key(&peer.public()).to_bytes();
+        let claims = ConnectionTicketClaimsV1::new(
+            id.to_vec(),
+            "tenant".into(),
+            id.to_vec(),
+            id.to_vec(),
+            "orders".into(),
+            [3; 32],
+            1,
+            2,
+            4,
+            10,
+            20,
+            [5; 16],
+            1,
+        )
+        .unwrap();
+        let envelope = signer.sign(&claims).unwrap();
+        let ring = verification_ring(&signer);
+        let base = || TicketValidation {
+            issuer_exchange_peer_id: &id,
+            client_peer_id: &id,
+            server_peer_id: &id,
+            tenant: "tenant",
+            upstream_id: "orders",
+            selector_fingerprint: [3; 32],
+            registration_revision: 1,
+            authorization_revision: 2,
+            permissions: 4,
+            max_streams: 1,
+            now: 15,
+            clock_skew: 0,
+        };
+        let mut cases = Vec::new();
+        let mut issuer = [0; 38];
+        issuer[0] = 1;
+        cases.push(("issuer", issuer.to_vec()));
+        let mut client = [0; 38];
+        client[0] = 1;
+        cases.push(("client", client.to_vec()));
+        let mut server = [0; 38];
+        server[0] = 1;
+        cases.push(("server", server.to_vec()));
+        for (name, value) in cases {
+            let mut expected = base();
+            match name {
+                "issuer" => expected.issuer_exchange_peer_id = &value,
+                "client" => expected.client_peer_id = &value,
+                "server" => expected.server_peer_id = &value,
+                _ => unreachable!(),
+            }
+            let mut admission = TicketAdmissionLedger::new(32, 0).unwrap();
+            assert_eq!(
+                admission.validate_and_consume(&ring, envelope.as_bytes(), &expected, [7; 32]),
+                TicketAdmission::Rejected(PublicErrorCode::AuthTicketInvalid)
+            );
+            assert_eq!(admission.len(), 0);
+        }
+        for (_name, expected) in [
+            (
+                "tenant",
+                TicketValidation {
+                    tenant: "other",
+                    ..base()
+                },
+            ),
+            (
+                "upstream",
+                TicketValidation {
+                    upstream_id: "other",
+                    ..base()
+                },
+            ),
+            (
+                "selector",
+                TicketValidation {
+                    selector_fingerprint: [4; 32],
+                    ..base()
+                },
+            ),
+            (
+                "registration",
+                TicketValidation {
+                    registration_revision: 2,
+                    ..base()
+                },
+            ),
+            (
+                "authorization",
+                TicketValidation {
+                    authorization_revision: 3,
+                    ..base()
+                },
+            ),
+            (
+                "permissions",
+                TicketValidation {
+                    permissions: 0,
+                    ..base()
+                },
+            ),
+            (
+                "max_streams",
+                TicketValidation {
+                    max_streams: 2,
+                    ..base()
+                },
+            ),
+            ("not_before", TicketValidation { now: 1, ..base() }),
+        ] {
+            let mut admission = TicketAdmissionLedger::new(32, 0).unwrap();
+            let expected_code = PublicErrorCode::AuthTicketInvalid;
+            assert_eq!(
+                admission.validate_and_consume(&ring, envelope.as_bytes(), &expected, [7; 32]),
+                TicketAdmission::Rejected(expected_code)
+            );
+            assert_eq!(admission.len(), 0);
+        }
+        let wrong_ring = verification_ring(&TicketSigner::from_seed([8; 32]));
+        let mut admission = TicketAdmissionLedger::new(32, 0).unwrap();
+        assert_eq!(
+            admission.validate_and_consume(&wrong_ring, envelope.as_bytes(), &base(), [7; 32]),
+            TicketAdmission::Rejected(PublicErrorCode::AuthTicketInvalid)
+        );
+        assert_eq!(admission.len(), 0);
+    }
+
+    #[test]
     fn replay_retention_includes_expiry_plus_clock_skew() {
         let signer = TicketSigner::from_seed([9; 32]);
         let peer = libp2p::identity::Keypair::generate_ed25519();

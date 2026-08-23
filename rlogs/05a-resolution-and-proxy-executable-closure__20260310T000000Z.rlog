@@ -93,4 +93,22 @@ validation:
 - Executable resolution cases passed: existing TCP/QUIC seven, idempotent-resolve, direct-open-fallback, ticket-replay, ticket-expiry, and concurrent-opens/connection-reuse.
 - ticket-bindings deliberately fails with missing complete matrix evidence.
 - six process cases deliberately fail with missing orchestration evidence; no false green status is emitted.
-commit: phase 6.7 pending review
+commit: phase 6.7 committed as 7e5f228
+
+phase 6.8 regressions, documentation, and final local gate:
+- Added exhaustive unit-level ticket binding matrix coverage for issuer/client/server, tenant, upstream, selector fingerprint, registration revision, authorization revision, permissions, max streams, not-before, and wrong verification key; every mismatch remains outside replay state.
+- Updated protocol/security/operations/test documentation to reflect implemented behavior, executable evidence, and explicit unresolved blockers. Plan files remain unchanged.
+validation:
+- cargo fmt --all -- --check: passed.
+- cargo clippy --workspace --all-targets --all-features -- -D warnings: passed.
+- cargo test --workspace --all-targets --all-features: passed.
+- cargo deny check: passed.
+- cargo tree -e features: passed.
+- bounded nightly fuzz runs for all seven targets: passed (1000 runs each, no crash).
+- tests/auth/local.sh --case all: passed.
+- tests/registry/local.sh --case all: passed.
+- tests/connectivity/local.sh --case all: passed.
+- Evidence-backed resolution cases passed: existing TCP/QUIC, rejection cases, idempotent-resolve, direct-open-fallback, ticket-replay, ticket-expiry, connection-reuse, and concurrent-opens (64).
+- Explicit resolution blockers remain nonzero: ticket-bindings process matrix, registration-revision-change, resolve-limit, proxy-limit, exchange-restart, server-restart, graceful-drain.
+- Deployment/platform phase remains owner-executed and incomplete: namespace/two-host/firewall/NAT/packet/platform/soak/package checks.
+commit: phase 6.8 pending review
