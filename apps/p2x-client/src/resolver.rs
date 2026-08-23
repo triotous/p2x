@@ -111,6 +111,7 @@ impl ResolverState {
     ) -> Result<Option<ResolveRequestV1>, p2x_protocol::PublicErrorCode> {
         self.sweep(now);
         self.set_principal_binding(binding.clone());
+        self.drop_old_session_requests(session_id);
         if self.pending.len() + self.queued_requests.len() >= MAX_PENDING_REQUESTS
             || self.pending.contains_key(&request_id)
             || self.queued_requests.contains_key(&request_id)
@@ -256,6 +257,11 @@ impl ResolverState {
                 if ticket_expires_at <= now || ticket_expires_at > registration_expires_at {
                     return Err(p2x_protocol::PublicErrorCode::RegistryStaleRevision);
                 }
+                if selector_fingerprint != selector.fingerprint(&binding.tenant)
+                    || !compatible_capabilities.contains(Capabilities::RELAY_V2)
+                {
+                    return Err(p2x_protocol::PublicErrorCode::ProtocolMalformed);
+                }
                 let metadata = ResolvedServiceMetadata {
                     server_peer_id,
                     upstream_id,
@@ -281,6 +287,14 @@ impl ResolverState {
             ResolveResponseV1::Rejected { error, .. } => {
                 if matches!(
                     error.code,
+                    p2x_protocol::PublicErrorCode::RegistryStaleRevision
+                        | p2x_protocol::PublicErrorCode::RegistryNotFound
+                        | p2x_protocol::PublicErrorCode::RegistryOffline
+                ) {
+                    self.positive.remove(&key);
+                }
+                if matches!(
+                    error.code,
                     p2x_protocol::PublicErrorCode::RegistryNotFound
                         | p2x_protocol::PublicErrorCode::RegistryOffline
                 ) {
@@ -296,15 +310,48 @@ impl ResolverState {
             }
         }
     }
+    fn drop_old_session_requests(&mut self, session_id: [u8; 16]) {
+        let stale = self
+            .pending
+            .iter()
+            .filter(|(_, request)| request.session_id != session_id)
+            .map(|(request_id, _)| *request_id)
+            .chain(
+                self.queued_requests
+                    .iter()
+                    .filter_map(|(request_id, request)| {
+                        let ResolveRequestV1::Resolve {
+                            session_id: request_session,
+                            ..
+                        } = request;
+                        (*request_session != session_id).then_some(*request_id)
+                    }),
+            )
+            .collect::<Vec<_>>();
+        for request_id in stale {
+            self.cancel(request_id);
+        }
+    }
+
     pub fn cancel(&mut self, request_id: [u8; 16]) -> bool {
-        let Some(pending) = self.pending.remove(&request_id) else {
-            return self.queued_requests.remove(&request_id).is_some();
+        let key = self
+            .pending
+            .remove(&request_id)
+            .map(|pending| pending.key)
+            .or_else(|| {
+                self.waiters
+                    .iter()
+                    .find(|(_, queue)| queue.contains(&request_id))
+                    .map(|(key, _)| key.clone())
+            });
+        let removed = self.queued_requests.remove(&request_id).is_some();
+        let Some(key) = key else {
+            return removed;
         };
-        self.queued_requests.remove(&request_id);
-        if let Some(queue) = self.waiters.get_mut(&pending.key) {
+        if let Some(queue) = self.waiters.get_mut(&key) {
             queue.retain(|id| *id != request_id);
             if queue.is_empty() {
-                self.waiters.remove(&pending.key);
+                self.waiters.remove(&key);
             }
         }
         true
@@ -462,6 +509,80 @@ mod tests {
     }
 
     #[test]
+    fn old_session_requests_are_dropped_for_a_new_session() {
+        let mut state = ResolverState::default();
+        let selector = selector();
+        let binding = PrincipalBinding {
+            tenant: p2x_protocol::Tenant::new("tenant").unwrap(),
+            role: p2x_protocol::Role::Client,
+            scopes: p2x_protocol::Scope::OpenProxyStream.bit(),
+            quota_profile: p2x_protocol::QuotaProfile::new("standard").unwrap(),
+            authorization_revision: 1,
+        };
+        assert!(
+            state
+                .begin([1; 16], binding.clone(), [2; 16], selector.clone(), 1)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            state
+                .begin([2; 16], binding.clone(), [2; 16], selector.clone(), 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .begin([3; 16], binding, [4; 16], selector, 1)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!state.has_pending([1; 16]));
+        assert!(!state.has_pending([2; 16]));
+        assert!(state.has_pending([3; 16]));
+    }
+
+    #[test]
+    fn invalid_selector_fingerprint_is_rejected() {
+        let mut state = ResolverState::default();
+        let selector = selector();
+        let binding = PrincipalBinding {
+            tenant: p2x_protocol::Tenant::new("tenant").unwrap(),
+            role: p2x_protocol::Role::Client,
+            scopes: p2x_protocol::Scope::OpenProxyStream.bit(),
+            quota_profile: p2x_protocol::QuotaProfile::new("standard").unwrap(),
+            authorization_revision: 1,
+        };
+        let request_id = [1; 16];
+        state
+            .begin(request_id, binding.clone(), [2; 16], selector.clone(), 1)
+            .unwrap();
+        let server = PeerId::random();
+        let exchange = PeerId::random();
+        state.set_exchange_peer(exchange);
+        let relay = format!("/ip4/127.0.0.1/tcp/1/p2p/{exchange}/p2p-circuit/p2p/{server}")
+            .parse::<libp2p::Multiaddr>()
+            .unwrap()
+            .to_vec();
+        let response = ResolveResponseV1::Resolved {
+            request_id,
+            server_peer_id: server.to_bytes(),
+            upstream_id: p2x_protocol::UpstreamId::new("orders").unwrap(),
+            selector_fingerprint: [3; 32],
+            registration_revision: RegistrationRevision::new(1).unwrap(),
+            relay_addresses: vec![relay],
+            compatible_capabilities: Capabilities::RELAY_V2,
+            registration_expires_at: 20,
+            ticket_expires_at: 19,
+            ticket: RawTicket::new(vec![7; 16]).unwrap(),
+        };
+        assert!(matches!(
+            state.complete(response, &binding, [2; 16], &selector, 1),
+            Err(p2x_protocol::PublicErrorCode::ProtocolMalformed)
+        ));
+    }
+
+    #[test]
     fn metadata_is_cacheable_but_ticket_is_not() {
         let mut state = ResolverState::default();
         let selector = selector();
@@ -491,7 +612,7 @@ mod tests {
             request_id: id,
             server_peer_id: peer,
             upstream_id: p2x_protocol::UpstreamId::new("orders").unwrap(),
-            selector_fingerprint: [3; 32],
+            selector_fingerprint: selector.fingerprint(&binding.tenant),
             registration_revision: RegistrationRevision::new(1).unwrap(),
             relay_addresses: vec![relay],
             compatible_capabilities: Capabilities::RELAY_V2,

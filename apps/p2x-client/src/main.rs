@@ -831,6 +831,9 @@ async fn main() -> io::Result<()> {
                             return Ok(());
                         }
                         emitter.emit(&LifecycleRecord::AuthReadiness { ready: true, generation: readiness_generation })?;
+                        if let Some(binding) = auth_state.current_session(unix_now()).map(|session| session.principal_binding()) {
+                            resolver_state.set_principal_binding(binding);
+                        }
                         if args.finite_proxy_check {
                             let route = routes.as_ref().and_then(|config| config.routes.first()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proxy check requires a route"))?;
                             let session_id = auth_state.current_session_id(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?;
@@ -909,6 +912,13 @@ async fn main() -> io::Result<()> {
                         let resolution_request_id_hash = stable_hash(request_id);
                         match resolver_state.complete(response, &binding, session_id, &selector, unix_now()) {
                             Ok(grant) if args.finite_proxy_check => {
+                                emitter.emit(&LifecycleRecord::ResolutionOutcome {
+                                    peer_id: &expected_exchange.to_string(),
+                                    request_id_hash: resolution_request_id_hash,
+                                    resolved: true,
+                                    ticket_issued: true,
+                                    code: None,
+                                })?;
                                 let peer = grant.metadata.server_peer_id;
                                 if !grant.metadata.compatible_capabilities.contains(p2x_protocol::Capabilities::RELAY_V2) { return Err(io::Error::other("resolve omitted relay capability")); }
                                 let address = grant.metadata.relay_addresses.first().ok_or_else(|| io::Error::other("resolve returned no relay address"))?;

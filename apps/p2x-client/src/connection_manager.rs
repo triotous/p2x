@@ -45,6 +45,9 @@ impl ConnectionManager {
         }
     }
     pub fn admit(&mut self, server: PeerId) -> Result<(), PublicErrorCode> {
+        if self.pending >= self.limits.max_pending_setups {
+            return Err(PublicErrorCode::LimitPeerConnections);
+        }
         if let Some(state) = self.peers.get_mut(&server) {
             if state.draining || state.pending >= self.limits.max_pending_per_server {
                 return Err(PublicErrorCode::LimitPeerConnections);
@@ -52,9 +55,6 @@ impl ConnectionManager {
             state.pending += 1;
             self.pending += 1;
             return Ok(());
-        }
-        if self.pending >= self.limits.max_pending_setups {
-            return Err(PublicErrorCode::LimitPeerConnections);
         }
         if self.peers.len() >= self.limits.max_peer_states {
             self.evict()?;
@@ -357,6 +357,26 @@ mod tests {
         assert!(manager.release(second));
         assert!(!manager.release(second));
         assert_eq!(manager.pending_count(), 0);
+    }
+
+    #[test]
+    fn global_pending_limit_applies_to_existing_peer() {
+        let mut manager = ConnectionManager::new(
+            PeerId::random(),
+            PathPolicy::default(),
+            SetupLimits {
+                max_peer_states: 1,
+                max_pending_setups: 1,
+                max_pending_per_server: 2,
+            },
+        );
+        let server = PeerId::random();
+        manager.admit(server).unwrap();
+        assert_eq!(
+            manager.admit(server),
+            Err(PublicErrorCode::LimitPeerConnections)
+        );
+        assert!(manager.release(server));
     }
 
     #[test]
