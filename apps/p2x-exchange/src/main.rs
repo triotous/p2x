@@ -119,6 +119,18 @@ struct Args {
     registry_limit_global: Option<usize>,
     #[arg(long, hide = true)]
     registry_limit_per_peer: Option<usize>,
+    #[arg(long, hide = true)]
+    resolve_limit_global: Option<usize>,
+    #[arg(long, hide = true)]
+    resolve_limit_per_client: Option<usize>,
+    #[arg(long, hide = true)]
+    resolve_limit_per_minute: Option<usize>,
+    #[arg(long, hide = true)]
+    resolve_limit_buckets: Option<usize>,
+    #[arg(long, hide = true)]
+    test_drop_first_resolve_response: bool,
+    #[arg(long, hide = true)]
+    test_hold_resolve_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -145,6 +157,34 @@ async fn main() -> io::Result<()> {
         Some(path) => Emitter::with_artifact("exchange", &run_id, path)?,
         None => Emitter::new("exchange", &run_id),
     };
+    let test_hook_used = args.resolve_limit_global.is_some()
+        || args.resolve_limit_per_client.is_some()
+        || args.resolve_limit_per_minute.is_some()
+        || args.resolve_limit_buckets.is_some()
+        || args.test_drop_first_resolve_response
+        || args.test_hold_resolve_ms.is_some();
+    if test_hook_used && std::env::var("P2X_ENABLE_TEST_HOOKS").ok().as_deref() != Some("1") {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "resolution test hooks require P2X_ENABLE_TEST_HOOKS=1",
+        ));
+    }
+    if args
+        .test_hold_resolve_ms
+        .is_some_and(|value| value > 10_000)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "test hold must be at most 10000ms",
+        ));
+    }
+    let resolve_limits = p2x_exchange::resolution::ResolutionLimits::new(
+        args.resolve_limit_global.unwrap_or(128),
+        args.resolve_limit_per_client.unwrap_or(16),
+        args.resolve_limit_per_minute.unwrap_or(120),
+        args.resolve_limit_buckets.unwrap_or(256),
+    )
+    .map_err(|code| io::Error::new(io::ErrorKind::InvalidInput, code.as_str()))?;
     let ticket_key = args
         .ticket_key_file
         .as_deref()
@@ -205,8 +245,13 @@ async fn main() -> io::Result<()> {
     let mut resolver = ticket_key
         .as_ref()
         .map(|key| {
-            Resolver::with_lifetime(local_peer_id, key, args.ticket_lifetime_secs)
-                .map_err(|code| io::Error::new(io::ErrorKind::InvalidInput, code.as_str()))
+            Resolver::with_options(
+                local_peer_id,
+                key,
+                args.ticket_lifetime_secs,
+                resolve_limits,
+            )
+            .map_err(|code| io::Error::new(io::ErrorKind::InvalidInput, code.as_str()))
         })
         .transpose()?;
     validate_advertise(
@@ -244,6 +289,7 @@ async fn main() -> io::Result<()> {
     };
     let mut reserved_servers = HashSet::new();
     let mut active_circuits = 0usize;
+    let mut dropped_first_resolve_response = false;
     registry.set_advertise_addresses(args.advertise.iter().map(ToString::to_string).collect());
     let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
     let config = ExchangeSwarmConfig {
@@ -392,6 +438,24 @@ async fn main() -> io::Result<()> {
                         ticket_issued,
                         code,
                     })?;
+                    if resolved && args.test_drop_first_resolve_response && !dropped_first_resolve_response {
+                        dropped_first_resolve_response = true;
+                        emitter.emit(&LifecycleRecord::TestFaultApplied {
+                            fault: "drop_first_resolve_response",
+                        })?;
+                        if let Some(resolver) = resolver.as_mut() {
+                            resolver.admission.release_request(peer, connection_id, request_id);
+                        }
+                        continue;
+                    }
+                    if let Some(delay) = args.test_hold_resolve_ms
+                        && resolved
+                    {
+                        emitter.emit(&LifecycleRecord::TestFaultApplied {
+                            fault: "hold_resolve_response",
+                        })?;
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
                     if swarm.behaviour_mut().resolve.send_response(channel, response).is_err()
                         && let Some(resolver) = resolver.as_mut()
                     {

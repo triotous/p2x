@@ -407,16 +407,26 @@ fn verify_envelope(e: &[u8], key_id: [u8; 16], key: &VerifyingKey) -> Result<(),
     key.verify(&m, &sig).map_err(|_| TicketError::Invalid)
 }
 
+pub fn verify_signature_with_key_resolver<R: TicketKeyResolver>(
+    envelope: &[u8],
+    resolver: &R,
+    now: i64,
+    clock_skew: i64,
+) -> Result<VerifiedTicket, TicketError> {
+    let (key_id, claims, signature) = decode_envelope(envelope)?;
+    let key = resolver.key(key_id, now).ok_or(TicketError::Invalid)?;
+    verify_signature(key_id, claims, signature, key, now, clock_skew)
+}
+
 pub fn verify_with_key_resolver<R: TicketKeyResolver>(
     envelope: &[u8],
     resolver: &R,
     expected: &TicketValidation<'_>,
 ) -> Result<VerifiedTicket, TicketError> {
-    let (key_id, claims, signature) = decode_envelope(envelope)?;
-    let key = resolver
-        .key(key_id, expected.now)
-        .ok_or(TicketError::Invalid)?;
-    verify_decoded(key_id, claims, signature, key, expected)
+    let ticket =
+        verify_signature_with_key_resolver(envelope, resolver, expected.now, expected.clock_skew)?;
+    validate_claims(&ticket, expected)?;
+    Ok(ticket)
 }
 #[cfg(test)]
 fn verify_and_validate(
@@ -428,29 +438,41 @@ fn verify_and_validate(
     let (envelope_key_id, c, sig) = decode_envelope(e)?;
     verify_decoded(envelope_key_id, c, sig, key, expected)
 }
-fn verify_decoded(
+fn verify_signature(
     key_id: [u8; 16],
-    c: ConnectionTicketClaimsV1,
-    sig: Signature,
+    claims: ConnectionTicketClaimsV1,
+    signature: Signature,
     key: &VerifyingKey,
-    expected: &TicketValidation<'_>,
+    now: i64,
+    clock_skew: i64,
 ) -> Result<VerifiedTicket, TicketError> {
-    let _ = key_id;
-    let bytes = c.encode()?;
+    let bytes = claims.encode()?;
     let mut message = b"p2x-ticket-v1\0".to_vec();
     message.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
     message.extend_from_slice(&bytes);
-    key.verify(&message, &sig)
+    key.verify(&message, &signature)
         .map_err(|_| TicketError::Invalid)?;
-    if expected.clock_skew < 0 || expected.clock_skew > 30 {
+    if !(0..=30).contains(&clock_skew) {
         return Err(TicketError::Invalid);
     }
-    if c.expires_at <= expected.now.saturating_sub(expected.clock_skew) {
+    if claims.expires_at <= now.saturating_sub(clock_skew) {
         return Err(TicketError::Expired);
     }
-    if c.not_before > expected.now.saturating_add(expected.clock_skew) {
+    if claims.not_before > now.saturating_add(clock_skew) {
         return Err(TicketError::Invalid);
     }
+    let _ = key_id;
+    Ok(VerifiedTicket {
+        ticket_id: claims.ticket_id,
+        claims,
+    })
+}
+
+fn validate_claims(
+    ticket: &VerifiedTicket,
+    expected: &TicketValidation<'_>,
+) -> Result<(), TicketError> {
+    let c = ticket.claims();
     if c.issuer_exchange_peer_id != expected.issuer_exchange_peer_id
         || c.client_peer_id != expected.client_peer_id
         || c.server_peer_id != expected.server_peer_id
@@ -464,10 +486,27 @@ fn verify_decoded(
     {
         return Err(TicketError::Invalid);
     }
-    Ok(VerifiedTicket {
-        ticket_id: c.ticket_id,
-        claims: c,
-    })
+    Ok(())
+}
+
+#[cfg(test)]
+fn verify_decoded(
+    key_id: [u8; 16],
+    claims: ConnectionTicketClaimsV1,
+    signature: Signature,
+    key: &VerifyingKey,
+    expected: &TicketValidation<'_>,
+) -> Result<VerifiedTicket, TicketError> {
+    let ticket = verify_signature(
+        key_id,
+        claims,
+        signature,
+        key,
+        expected.now,
+        expected.clock_skew,
+    )?;
+    validate_claims(&ticket, expected)?;
+    Ok(ticket)
 }
 #[cfg(test)]
 mod tests {

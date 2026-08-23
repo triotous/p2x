@@ -14,7 +14,7 @@ use std::collections::HashMap;
 const MIN_TICKET_LIFETIME: i64 = 5;
 const DEFAULT_TICKET_LIFETIME: i64 = 30;
 const MAX_IDEMPOTENCY_PER_CLIENT: usize = 8;
-const MAX_IDEMPOTENCY_GLOBAL: usize = 2048;
+const MAX_IDEMPOTENCY_GLOBAL: usize = 2_048;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CachedResponse {
@@ -28,6 +28,33 @@ pub struct ResolutionLimits {
     pub per_client_inflight: usize,
     pub per_minute: usize,
     pub buckets: usize,
+}
+impl ResolutionLimits {
+    pub const HARD_GLOBAL_INFLIGHT: usize = 1_024;
+    pub const HARD_PER_CLIENT_INFLIGHT: usize = 128;
+    pub const HARD_PER_MINUTE: usize = 1_200;
+    pub const HARD_BUCKETS: usize = 2_048;
+
+    pub fn new(
+        global_inflight: usize,
+        per_client_inflight: usize,
+        per_minute: usize,
+        buckets: usize,
+    ) -> Result<Self, PublicErrorCode> {
+        if !(1..=Self::HARD_GLOBAL_INFLIGHT).contains(&global_inflight)
+            || !(1..=Self::HARD_PER_CLIENT_INFLIGHT).contains(&per_client_inflight)
+            || !(1..=Self::HARD_PER_MINUTE).contains(&per_minute)
+            || !(1..=Self::HARD_BUCKETS).contains(&buckets)
+        {
+            return Err(PublicErrorCode::ProtocolMalformed);
+        }
+        Ok(Self {
+            global_inflight,
+            per_client_inflight,
+            per_minute,
+            buckets,
+        })
+    }
 }
 impl Default for ResolutionLimits {
     fn default() -> Self {
@@ -43,6 +70,7 @@ pub struct Resolver<'a> {
     exchange_peer_id: PeerId,
     signer: &'a TicketKey,
     ticket_lifetime: i64,
+    ticket_id_source: Box<dyn FnMut() -> Result<[u8; 16], PublicErrorCode>>,
     pub admission: ResolveAdmissionLedger,
     idempotency: HashMap<(PeerId, [u8; 16]), CachedResponse>,
     draining: bool,
@@ -58,6 +86,19 @@ impl<'a> Resolver<'a> {
         signer: &'a TicketKey,
         ticket_lifetime: i64,
     ) -> Result<Self, PublicErrorCode> {
+        Self::with_options(
+            exchange_peer_id,
+            signer,
+            ticket_lifetime,
+            ResolutionLimits::default(),
+        )
+    }
+    pub fn with_options(
+        exchange_peer_id: PeerId,
+        signer: &'a TicketKey,
+        ticket_lifetime: i64,
+        limits: ResolutionLimits,
+    ) -> Result<Self, PublicErrorCode> {
         if !(5..=60).contains(&ticket_lifetime) {
             return Err(PublicErrorCode::ProtocolMalformed);
         }
@@ -65,11 +106,26 @@ impl<'a> Resolver<'a> {
             exchange_peer_id,
             signer,
             ticket_lifetime,
-            admission: ResolveAdmissionLedger::default(),
+            ticket_id_source: Box::new(random_ticket_id),
+            admission: ResolveAdmissionLedger::with_limits(
+                limits.global_inflight,
+                limits.per_client_inflight,
+                limits.per_minute,
+                limits.buckets,
+            ),
             idempotency: HashMap::new(),
             draining: false,
             issued: 0,
         })
+    }
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn with_ticket_id_source(
+        mut self,
+        source: impl FnMut() -> Result<[u8; 16], PublicErrorCode> + 'static,
+    ) -> Self {
+        self.ticket_id_source = Box::new(source);
+        self
     }
     pub fn issued(&self) -> u64 {
         self.issued
@@ -159,7 +215,12 @@ impl<'a> Resolver<'a> {
         {
             return rejected(Some(request_id), PublicErrorCode::AuthRoleForbidden, false);
         }
-        let digest = request_digest(request_id, session_id, selector, client_capabilities);
+        let digest = request_digest(&ResolveRequestV1::Resolve {
+            request_id,
+            session_id,
+            selector: selector.clone(),
+            client_capabilities,
+        });
         if let Some(cached) = self.idempotency.get(&(peer_id, request_id)) {
             return if cached.digest == digest {
                 cached.response.clone()
@@ -210,10 +271,10 @@ impl<'a> Resolver<'a> {
                 true,
             );
         }
-        let mut ticket_id = [0; 16];
-        if getrandom::fill(&mut ticket_id).is_err() {
-            return rejected(Some(request_id), PublicErrorCode::ExchangeOverloaded, true);
-        }
+        let ticket_id = match (self.ticket_id_source)() {
+            Ok(ticket_id) => ticket_id,
+            Err(code) => return rejected(Some(request_id), code, true),
+        };
         let ticket_expires_at = now
             .saturating_add(self.ticket_lifetime)
             .min(resolved.registration_expires_at);
@@ -282,27 +343,7 @@ impl<'a> Resolver<'a> {
         response: ResolveResponseV1,
         expires_at: i64,
     ) {
-        self.sweep(i64::MIN);
-        let peer_count = self
-            .idempotency
-            .keys()
-            .filter(|(owner, _)| *owner == peer)
-            .count();
-        if peer_count >= MAX_IDEMPOTENCY_PER_CLIENT
-            && let Some(key) = self
-                .idempotency
-                .keys()
-                .filter(|(owner, _)| *owner == peer)
-                .min()
-                .copied()
-        {
-            self.idempotency.remove(&key);
-        }
-        if self.idempotency.len() >= MAX_IDEMPOTENCY_GLOBAL
-            && let Some(key) = self.idempotency.keys().min().copied()
-        {
-            self.idempotency.remove(&key);
-        }
+        debug_assert!(self.cache_available(peer));
         self.idempotency.insert(
             (peer, request_id),
             CachedResponse {
@@ -331,18 +372,18 @@ impl<'a> Resolver<'a> {
     }
 }
 
-fn request_digest(
-    request_id: [u8; 16],
-    session_id: [u8; 16],
-    selector: &p2x_protocol::UnscopedSelector,
-    capabilities: Capabilities,
-) -> [u8; 32] {
+fn random_ticket_id() -> Result<[u8; 16], PublicErrorCode> {
+    let mut ticket_id = [0; 16];
+    getrandom::fill(&mut ticket_id)
+        .map_err(|_| PublicErrorCode::ExchangeOverloaded)
+        .map(|_| ticket_id)
+}
+
+fn request_digest(request: &ResolveRequestV1) -> [u8; 32] {
     use sha2::{Digest, Sha256};
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&request_id);
-    bytes.extend_from_slice(&session_id);
-    bytes.extend_from_slice(&selector.canonical_bytes(None));
-    bytes.extend_from_slice(&capabilities.bits().to_be_bytes());
+    let bytes = request
+        .canonical_bytes()
+        .expect("validated Resolve requests have a canonical body");
     Sha256::digest(bytes).into()
 }
 fn rejected(
@@ -461,6 +502,40 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(resolver.issued(), 1);
         assert_eq!(resolver.cache_len(), 1);
+
+        resolver.ticket_id_source = Box::new(|| Err(PublicErrorCode::ExchangeOverloaded));
+        let mut new_request = request.clone();
+        let ResolveRequestV1::Resolve { request_id, .. } = &mut new_request;
+        *request_id = [3; 16];
+        let failed = resolver.resolve_and_authorize(
+            client,
+            ConnectionId::new_unchecked(1),
+            &new_request,
+            "wire-3",
+            Some(&client_session),
+            |_| Some(session(server, Role::Server, Scope::RegisterServices.bit())),
+            |_| true,
+            &registry,
+            1,
+        );
+        assert!(matches!(
+            failed,
+            ResolveResponseV1::Rejected {
+                error: PublicError {
+                    code: PublicErrorCode::ExchangeOverloaded,
+                    retryable: true,
+                },
+                ..
+            }
+        ));
+        assert_eq!(resolver.issued(), 1);
+    }
+
+    #[test]
+    fn resolution_limits_validate_hard_bounds() {
+        assert!(ResolutionLimits::new(0, 1, 1, 1).is_err());
+        assert!(ResolutionLimits::new(1_024, 128, 1_200, 2_048).is_ok());
+        assert!(ResolutionLimits::new(1_025, 1, 1, 1).is_err());
     }
 
     #[test]

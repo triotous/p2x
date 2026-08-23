@@ -4,10 +4,7 @@ use p2x_protocol::{
     Capabilities, RawTicket, RegistrationRevision, ResolveRequestV1, ResolveResponseV1,
     UnscopedSelector,
 };
-use std::{
-    collections::{HashMap, VecDeque},
-    time::{Duration, Instant},
-};
+use std::collections::{HashMap, VecDeque};
 
 pub const MAX_WAITERS_PER_SELECTOR: usize = 64;
 const MAX_PENDING_REQUESTS: usize = 128;
@@ -72,7 +69,7 @@ struct Positive {
 #[derive(Clone, Copy, Debug)]
 struct Negative {
     code: p2x_protocol::PublicErrorCode,
-    expires_at: Instant,
+    expires_at: i64,
 }
 #[derive(Default)]
 pub struct ResolverState {
@@ -112,6 +109,18 @@ impl ResolverState {
         self.sweep(now);
         self.set_principal_binding(binding.clone());
         self.drop_old_session_requests(session_id);
+        let key = CacheKey {
+            binding: binding.clone(),
+            selector: selector.clone(),
+        };
+        if let Some(code) = self
+            .negative
+            .get(&key)
+            .filter(|entry| entry.expires_at > now)
+            .map(|entry| entry.code)
+        {
+            return Err(code);
+        }
         if self.pending.len() + self.queued_requests.len() >= MAX_PENDING_REQUESTS
             || self.pending.contains_key(&request_id)
             || self.queued_requests.contains_key(&request_id)
@@ -145,13 +154,17 @@ impl ResolverState {
 
     /// Promotes the next FIFO waiter for a selector to the wire request owner.
     pub fn next_request(&mut self) -> Option<ResolveRequestV1> {
-        let (key, request_id) = self.waiters.iter().find_map(|(key, queue)| {
-            queue
-                .front()
-                .copied()
-                .filter(|id| !self.pending.contains_key(id))
-                .map(|id| (key.clone(), id))
-        })?;
+        let (key, request_id) = self
+            .waiters
+            .iter()
+            .filter_map(|(key, queue)| {
+                queue
+                    .front()
+                    .copied()
+                    .filter(|id| !self.pending.contains_key(id))
+                    .map(|id| (key.clone(), id))
+            })
+            .min_by_key(|(_, request_id)| *request_id)?;
         let request = self.queued_requests.remove(&request_id)?;
         let session_id = match &request {
             ResolveRequestV1::Resolve { session_id, .. } => *session_id,
@@ -181,13 +194,14 @@ impl ResolverState {
         &self,
         binding: &PrincipalBinding,
         selector: &UnscopedSelector,
+        now: i64,
     ) -> Option<p2x_protocol::PublicErrorCode> {
         self.negative
             .get(&CacheKey {
                 binding: binding.clone(),
                 selector: selector.clone(),
             })
-            .filter(|entry| entry.expires_at > Instant::now())
+            .filter(|entry| entry.expires_at > now)
             .map(|entry| entry.code)
     }
     pub fn complete(
@@ -302,7 +316,7 @@ impl ResolverState {
                         key,
                         Negative {
                             code: error.code,
-                            expires_at: Instant::now() + Duration::from_secs(1),
+                            expires_at: now.saturating_add(1),
                         },
                     );
                 }
@@ -409,11 +423,19 @@ impl ResolverState {
     }
     pub fn sweep(&mut self, now: i64) {
         self.positive.retain(|_, value| value.expires_at > now);
-        self.negative
-            .retain(|_, value| value.expires_at > Instant::now());
+        self.negative.retain(|_, value| value.expires_at > now);
     }
     pub fn pending(&self) -> usize {
         self.pending.len()
+    }
+    pub fn queued(&self) -> usize {
+        self.queued_requests.len()
+    }
+    pub fn waiter_count(&self) -> usize {
+        self.waiters.values().map(VecDeque::len).sum()
+    }
+    pub fn cache_counts(&self) -> (usize, usize) {
+        (self.positive.len(), self.negative.len())
     }
     pub fn cached_tickets(&self) -> usize {
         0
@@ -580,6 +602,46 @@ mod tests {
             state.complete(response, &binding, [2; 16], &selector, 1),
             Err(p2x_protocol::PublicErrorCode::ProtocolMalformed)
         ));
+    }
+
+    #[test]
+    fn negative_cache_uses_supplied_time_and_short_circuits_after_expiry() {
+        let mut state = ResolverState::default();
+        let selector = selector();
+        let binding = PrincipalBinding {
+            tenant: p2x_protocol::Tenant::new("tenant").unwrap(),
+            role: p2x_protocol::Role::Client,
+            scopes: p2x_protocol::Scope::OpenProxyStream.bit(),
+            quota_profile: p2x_protocol::QuotaProfile::new("standard").unwrap(),
+            authorization_revision: 1,
+        };
+        let request_id = [1; 16];
+        state
+            .begin(request_id, binding.clone(), [2; 16], selector.clone(), 1)
+            .unwrap();
+        state
+            .complete(
+                ResolveResponseV1::Rejected {
+                    request_id: Some(request_id),
+                    error: p2x_protocol::PublicError::new(
+                        p2x_protocol::PublicErrorCode::RegistryNotFound,
+                        true,
+                    ),
+                },
+                &binding,
+                [2; 16],
+                &selector,
+                1,
+            )
+            .unwrap_err();
+        assert_eq!(
+            state.negative(&binding, &selector, 1),
+            Some(p2x_protocol::PublicErrorCode::RegistryNotFound)
+        );
+        assert_eq!(state.cache_counts().1, 1);
+        state.sweep(2);
+        assert_eq!(state.negative(&binding, &selector, 2), None);
+        assert_eq!(state.cache_counts().1, 0);
     }
 
     #[test]

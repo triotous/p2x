@@ -21,4 +21,16 @@ validation:
 - cargo fmt --all: passed.
 - cargo test -p p2x-protocol --lib: passed (27 tests).
 - cargo test -p p2x-net --all-targets --all-features: pending before commit.
-commit: phase 6.2 pending review
+commit: phase 6.2 committed as de5abd0
+
+phase 6.3 exchange resolution and admission controls:
+- Added validated ResolutionLimits with documented hard maxima and wired configured values into the exchange admission ledger.
+- Changed request idempotency digest to hash the exact canonical Resolve body.
+- Added a fallible injected ticket-ID source seam and regression coverage for randomness failure without issuance.
+- Added guarded exchange controls for first cached successful-response drop and bounded response hold, plus privacy-safe fault lifecycle event.
+- Added resolver negative-cache supplied-clock decisions, short-circuiting, FIFO promotion ordering, queue/cache counters, and expiry regression coverage.
+validation:
+- cargo fmt --all: passed.
+- cargo test p2x-client/p2x-exchange/p2x-protocol all targets/features: passed.
+- cargo clippy for changed client/exchange/protocol targets with -D warnings: passed.
+commit: phase 6.3 pending review

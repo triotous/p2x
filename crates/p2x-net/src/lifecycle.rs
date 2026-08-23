@@ -73,6 +73,9 @@ pub enum LifecycleRecord<'a> {
         ticket_issued: bool,
         code: Option<&'a str>,
     },
+    TestFaultApplied {
+        fault: &'a str,
+    },
     Resources {
         connections: usize,
         pending_opens: usize,

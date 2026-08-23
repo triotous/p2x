@@ -128,6 +128,15 @@ impl ResolveAdmissionLedger {
         self.owners.len()
     }
 
+    pub const fn limits(&self) -> (usize, usize, usize, usize) {
+        (
+            self.max_global,
+            self.max_per_client,
+            self.max_per_minute,
+            self.max_buckets,
+        )
+    }
+
     pub fn is_admitted(&self, owner: &ResolveOwner) -> bool {
         self.owners.contains_key(owner)
     }
