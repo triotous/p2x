@@ -611,9 +611,6 @@ async fn main() -> io::Result<()> {
                     Err(code) => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: None, error: p2x_protocol::PublicError::new(code, false) },
                 };
                 let _ = candidate.decision.send(response);
-                if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
-                    proxy.inbound_release(candidate.peer_id);
-                }
             }
             Some(worker) = worker_rx.recv() => {
                 let released = worker_admission.release(worker.peer_id);
