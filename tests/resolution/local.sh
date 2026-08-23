@@ -417,10 +417,10 @@ def finish_limits(run: Run, primary_log: pathlib.Path, secondary_log: pathlib.Pa
     (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\\n")
     print(json.dumps(summary, sort_keys=True), flush=True)
 
-def finish_restart(run: Run, client_log: pathlib.Path, server_logs: list[pathlib.Path], exchange_log: pathlib.Path) -> None:
+def finish_restart(run: Run, client_log: pathlib.Path, server_logs: list[pathlib.Path], exchange_logs: list[pathlib.Path]) -> None:
     client_rows = rows(client_log)
     server_rows = [row for path in server_logs for row in rows(path)]
-    exchange_rows = rows(exchange_log)
+    exchange_rows = [row for path in exchange_logs for row in rows(path)]
     terminal = assert_one_terminal(client_log)
     if terminal.get("code") != "proxy.authorized":
         raise CaseFailure(f"{case} recovery terminal was {terminal.get('code')}")
@@ -431,27 +431,18 @@ def finish_restart(run: Run, client_log: pathlib.Path, server_logs: list[pathlib
         raise CaseFailure(f"{case} reused the old ticket response")
     if not any(row.get("event") == "operational_error" and row.get("code") == "proxy.recovering" for row in client_rows):
         raise CaseFailure(f"{case} did not emit fresh-ticket recovery evidence")
-    if not any(row.get("event") == "proxy_authorization" and not row.get("authorized") and row.get("code") == "registry.stale_revision" for row in server_rows):
-        raise CaseFailure(f"{case} did not reject the old registration revision")
+    if case == "registration-revision-change" and not any(row.get("event") == "proxy_authorization" and not row.get("authorized") and row.get("code") == "registry.stale_revision" for row in server_rows):
+        raise CaseFailure("registration-revision-change did not reject the old registration revision")
     if not any(row.get("event") == "proxy_authorization" and row.get("authorized") for row in server_rows):
-        raise CaseFailure(f"{case} did not authorize against the replacement server")
-    revisions = [row.get("revision") for row in exchange_rows if row.get("event") == "registry_transition" and row.get("code") == "registry.registered"]
-    if len([revision for revision in revisions if revision is not None]) < 2:
+        raise CaseFailure(f"{case} did not authorize against the replacement state")
+    revisions = [row.get("revision") for row in exchange_rows if row.get("event") == "registry_transition" and row.get("code") == "registry.registered" and row.get("revision") is not None]
+    if len(set(revisions)) < 2:
         raise CaseFailure(f"{case} did not observe replacement registration revision")
     forbidden = [run.client_token, run.client2_token, run.server_token, "token_secret", "raw_ticket", "session_id"] + run.private
     output = "\\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
     if any(marker and marker in output for marker in forbidden):
         raise CaseFailure("privacy scan found credentials, session data, ticket data, or selector values")
-    summary = {
-        "case": case,
-        "passed": True,
-        "observed_assertions": {
-            "old_revision_rejected": True,
-            "fresh_resolve_authorized": True,
-            "replacement_registration_observed": True,
-            "privacy_scan_clean": True,
-        },
-    }
+    summary = {"case": case, "passed": True, "observed_assertions": {"fresh_resolve_authorized": True, "replacement_registration_observed": True, "privacy_scan_clean": True}}
     (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\\n")
     print(json.dumps(summary, sort_keys=True), flush=True)
 

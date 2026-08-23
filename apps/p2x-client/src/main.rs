@@ -582,6 +582,13 @@ async fn main() -> io::Result<()> {
     let mut resolve_setup_deadline: Option<std::time::Instant> = None;
     let mut proxy_open: Option<OpenProxyStreamV1> = None;
     let mut last_proxy_open: Option<OpenProxyStreamV1> = None;
+    let mut delayed_proxy_open: Option<(
+        OpenProxyStreamV1,
+        std::time::Instant,
+        libp2p::PeerId,
+        Multiaddr,
+        p2x_protocol::Capabilities,
+    )> = None;
     let mut replay_attempted = false;
     let mut proxy_completed = 0u64;
     let proxy_target = args.test_proxy_open_count.unwrap_or(1);
@@ -652,6 +659,70 @@ async fn main() -> io::Result<()> {
                 if let (Some(peer_id), Some(attempt)) = (target_peer, attempt.as_mut()) {
                     let actions = attempt.apply(PathEvent { attempt_id: attempt.id, now, kind: PathEventKind::DirectDeadlineElapsed });
                     drive_path_actions(probe_mut(&mut swarm)?, attempt, peer_id, &emitter, actions, &mut launched)?;
+                }
+                if let Some((open, due, peer, address, capabilities)) = delayed_proxy_open.take() {
+                    if now >= due {
+                        proxy_open = Some(open);
+                        proxy_server = Some(peer);
+                        proxy_capabilities = Some(capabilities);
+                        target_peer = Some(peer);
+                        if let Some(manager) = connection_manager.as_mut() {
+                            let deadline = resolve_setup_deadline
+                                .ok_or_else(|| io::Error::other("proxy setup deadline missing"))?;
+                            let (path, actions) = manager
+                                .begin_path_at_deadline_with_capabilities(
+                                    peer,
+                                    now,
+                                    deadline,
+                                    capabilities,
+                                )
+                                .map_err(|code| io::Error::other(code.as_str()))?;
+                            proxy_setup_deadline = Some(path.setup_deadline);
+                            proxy_attempt = Some(path);
+                            let should_dial = actions
+                                .iter()
+                                .any(|action| matches!(action, PathAction::DialRelay));
+                            let mut terminal = None;
+                            if let Some(open) = proxy_open.as_ref() {
+                                let current = proxy_attempt
+                                    .as_mut()
+                                    .expect("proxy attempt was stored");
+                                let proxy = swarm
+                                    .behaviour_mut()
+                                    .proxy_stream
+                                    .as_mut()
+                                    .ok_or_else(|| io::Error::other("proxy is unavailable in product mode"))?;
+                                drive_proxy_path_actions(
+                                    proxy,
+                                    current,
+                                    peer,
+                                    open,
+                                    deadline,
+                                    &emitter,
+                                    actions,
+                                    &mut pending_proxy,
+                                    &mut selected_proxy_connection,
+                                    &mut terminal,
+                                )?;
+                            }
+                            if terminal.is_some() {
+                                let _ = manager.release(peer);
+                                emitter.terminal(&TerminalResult::simple(
+                                    &args.case_id,
+                                    "failed",
+                                    PublicErrorCode::PeerConnectionFailed.as_str(),
+                                ))?;
+                                return Ok(());
+                            }
+                            if should_dial {
+                                swarm.dial(address).map_err(io::Error::other)?;
+                            }
+                        } else {
+                            swarm.dial(address).map_err(io::Error::other)?;
+                        }
+                    } else {
+                        delayed_proxy_open = Some((open, due, peer, address, capabilities));
+                    }
                 }
                 if let (Some(peer_id), Some(current), Some(open), Some(deadline)) = (proxy_server, proxy_attempt.as_mut(), proxy_open.as_ref().cloned(), proxy_setup_deadline) {
                     let actions = current.apply(PathEvent {
@@ -1116,7 +1187,14 @@ async fn main() -> io::Result<()> {
                                     OpenMutation::Revision => { open.registration_revision = p2x_protocol::RegistrationRevision::new(open.registration_revision.get().saturating_add(1)).ok_or_else(|| io::Error::other("mutation revision exhausted"))?; }
                                 }
                                 if let Some(delay) = args.test_delay_after_resolve_ms {
-                                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                                    delayed_proxy_open = Some((
+                                        open.clone(),
+                                        std::time::Instant::now()
+                                            + std::time::Duration::from_millis(delay),
+                                        peer,
+                                        address.clone(),
+                                        grant.metadata.compatible_capabilities,
+                                    ));
                                 }
                                 if args.test_replay_first_ticket {
                                     last_proxy_open = Some(open.clone());
@@ -1124,8 +1202,12 @@ async fn main() -> io::Result<()> {
                                 if !args.test_replay_first_ticket {
                                     last_proxy_open = Some(open.clone());
                                 }
-                                proxy_open = Some(open);
-                                if let Some(manager) = connection_manager.as_mut() {
+                                if args.test_delay_after_resolve_ms.is_none() {
+                                    proxy_open = Some(open);
+                                }
+                                if args.test_delay_after_resolve_ms.is_none()
+                                    && let Some(manager) = connection_manager.as_mut()
+                                {
                                     let started = std::time::Instant::now();
                                     let setup_deadline = resolve_setup_deadline.unwrap_or_else(|| manager.setup_deadline(started));
                                     let (path, actions) = manager
@@ -1149,7 +1231,9 @@ async fn main() -> io::Result<()> {
                                         emitter.emit(&LifecycleRecord::TestFaultApplied { fault: "fail_first_direct_open_before_handshake" })?;
                                     }
                                     let should_dial = actions.iter().any(|action| matches!(action, PathAction::DialRelay));
-                                    drive_proxy_path_actions(proxy, current, peer, proxy_open.as_ref().expect("proxy open was stored"), proxy_setup_deadline.expect("proxy deadline was stored"), &emitter, actions, &mut pending_proxy, &mut selected_proxy_connection, &mut terminal)?;
+                                    if let Some(open) = proxy_open.as_ref() {
+                                        drive_proxy_path_actions(proxy, current, peer, open, proxy_setup_deadline.expect("proxy deadline was stored"), &emitter, actions, &mut pending_proxy, &mut selected_proxy_connection, &mut terminal)?;
+                                    }
                                     if terminal.is_some() {
                                         return Err(io::Error::other("proxy path setup failed"));
                                     }
@@ -1167,7 +1251,7 @@ async fn main() -> io::Result<()> {
                                             ))?;
                                         return Ok(());
                                     }
-                                } else {
+                                } else if args.test_delay_after_resolve_ms.is_none() {
                                     swarm.dial(address.clone()).map_err(io::Error::other)?;
                                 }
                             }
