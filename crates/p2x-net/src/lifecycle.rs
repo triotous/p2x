@@ -58,6 +58,14 @@ pub enum LifecycleRecord<'a> {
         peer_id: &'a str,
         ack: &'a ProbeAck,
     },
+    ProxyAuthorization {
+        peer_id: &'a str,
+        connection_id_hash: u64,
+        request_id_hash: u64,
+        stream_id_hash: Option<u64>,
+        authorized: bool,
+        code: Option<&'a str>,
+    },
     Resources {
         connections: usize,
         pending_opens: usize,

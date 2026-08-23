@@ -595,6 +595,7 @@ async fn main() -> io::Result<()> {
                 proxy_workers = proxy_workers.saturating_sub(1);
             }
             Some(candidate) = proxy_rx.recv() => {
+                let peer_name = candidate.peer_id.to_string();
                 let response = match candidate.open {
                     Ok(open) => {
                         let now = unix_now();
@@ -616,6 +617,31 @@ async fn main() -> io::Result<()> {
                     }
                     Err(code) => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: None, error: p2x_protocol::PublicError::new(code, false) },
                 };
+                let (request_id_hash, stream_id_hash, authorized, code) = match &response {
+                    p2x_protocol::ProxyOpenResponseV1::Authorized {
+                        request_id,
+                        stream_id,
+                    } => (stable_hash(request_id), Some(stable_hash(stream_id)), true, None),
+                    p2x_protocol::ProxyOpenResponseV1::Accepted {
+                        request_id,
+                        stream_id,
+                        ..
+                    } => (stable_hash(request_id), Some(stable_hash(stream_id)), true, None),
+                    p2x_protocol::ProxyOpenResponseV1::Rejected { request_id, error } => (
+                        request_id.map(stable_hash).unwrap_or_default(),
+                        None,
+                        false,
+                        Some(error.code.as_str()),
+                    ),
+                };
+                emitter.emit(&LifecycleRecord::ProxyAuthorization {
+                    peer_id: &peer_name,
+                    connection_id_hash: stable_hash(candidate.connection_id),
+                    request_id_hash,
+                    stream_id_hash,
+                    authorized,
+                    code,
+                })?;
                 let _ = candidate.decision.send(response);
             }
             Some(worker) = worker_rx.recv() => {
