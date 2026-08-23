@@ -1,0 +1,17 @@
+2026-08-23T10:32:49Z start: Review completed Plan 05 implementation, repair automatable gaps, defer deployment-dependent manual verification to the final stage, and assess next-phase readiness.
+2026-08-23T10:32:49Z baseline: Branch feat/05-resolution-tickets-and-peer-connection-manager; worktree clean; reviewed the complete Plan 05 without modifying it.
+2026-08-23T10:32:49Z validation: cargo fmt --all -- --check passed.
+2026-08-23T10:33:20Z validation: cargo clippy --workspace --all-targets --all-features -- -D warnings passed.
+2026-08-23T10:33:34Z validation: workspace tests passed through unit suites but listener-based integration tests were blocked by sandbox listener permissions, matching the documented environment constraint.
+2026-08-23T10:33:45Z validation: reran cargo test --workspace --all-targets --all-features with listener permission; all tests passed.
+2026-08-23T10:34:05Z validation: cargo deny check passed (advisories, bans, licenses, and sources); duplicate dependency versions were warnings only. cargo tree -e features passed.
+2026-08-23T10:35:10Z review finding: the server decoded one Open frame and could authorize it without requiring the client write half to close, so early application bytes could be queued before the future Accepted gate. This violated the Plan 05 fail-closed empty-stream invariant.
+2026-08-23T10:35:40Z action: added a bounded read-half EOF check before proxy authorization and a regression test proving an extra byte is protocol.malformed while an exact half-closed Open remains valid.
+2026-08-23T10:36:10Z validation: p2x-server tests and workspace Clippy passed after the fix.
+2026-08-23T10:38:30Z validation: canonical supported resolution cases resolve-ticket-tcp, resolve-ticket-quic, unknown-selector, offline-selector, cross-tenant, forced-relay, and direct-preferred all passed with correlation, exact-connection, cleanup, and privacy evidence.
+2026-08-23T10:41:30Z validation: all seven fuzz targets completed bounded nightly libFuzzer runs without crashes; generated corpus entries were kept outside the repository or cleaned after the run.
+2026-08-23T10:42:10Z validation: post-fix cargo test --workspace --all-targets --all-features passed, including TCP/QUIC network integration.
+2026-08-23T10:43:20Z validation: auth canonical case matrix passed.
+2026-08-23T10:44:45Z validation: registry canonical case matrix passed with final logical resources at zero.
+2026-08-23T10:46:50Z validation: local connectivity C01 and C05-C13 matrix passed, including 64/128 concurrency, direct/relay large transfer, renewal, and churn.
+2026-08-23T10:47:00Z gate: not ready for Plan 06. The Plan 05 canonical runner explicitly returns incomplete for 13 automatable local cases: idempotent-resolve, direct-open-fallback, ticket-replay, ticket-bindings, ticket-expiry, registration-revision-change, connection-reuse, concurrent-opens, resolve-limit, proxy-limit, exchange-restart, server-restart, and graceful-drain. These are not deployment-dependent owner checks and remain Definition-of-Done blockers. Deployment/platform-only C14, Linux namespace, two-host/NAT/firewall, packet inspection, and soak checks remain deferred to the final manual stage as requested.
