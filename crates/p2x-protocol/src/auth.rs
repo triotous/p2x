@@ -6,7 +6,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 
 pub const KNOWN_AUTH_FEATURES_V1: u64 = 0;
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum Role {
     Client,
     Server,

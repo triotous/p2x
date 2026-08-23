@@ -200,6 +200,25 @@ impl SessionLease {
     pub const fn has_scope(&self, scope: Scope) -> bool {
         self.scopes & scope.bit() != 0
     }
+
+    pub fn principal_binding(&self) -> PrincipalBinding {
+        PrincipalBinding {
+            tenant: self.tenant.clone(),
+            role: self.role,
+            scopes: self.scopes,
+            quota_profile: self.quota_profile.clone(),
+            authorization_revision: self.authorization_revision,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct PrincipalBinding {
+    pub tenant: Tenant,
+    pub role: Role,
+    pub scopes: u32,
+    pub quota_profile: QuotaProfile,
+    pub authorization_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

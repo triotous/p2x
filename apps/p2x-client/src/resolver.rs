@@ -1,4 +1,5 @@
 use libp2p::PeerId;
+use p2x_net::auth_state::PrincipalBinding;
 use p2x_protocol::{
     Capabilities, RawTicket, RegistrationRevision, ResolveRequestV1, ResolveResponseV1,
     UnscopedSelector,
@@ -47,7 +48,7 @@ pub struct AuthorizationGrant {
 }
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CacheKey {
-    session_id: [u8; 16],
+    binding: PrincipalBinding,
     selector: UnscopedSelector,
 }
 #[derive(Clone, Debug)]
@@ -65,8 +66,9 @@ pub struct ResolverState {
     exchange_peer_id: Option<PeerId>,
     positive: HashMap<CacheKey, Positive>,
     negative: HashMap<CacheKey, Negative>,
-    waiters: HashMap<CacheKey, VecDeque<u64>>,
+    waiters: HashMap<CacheKey, VecDeque<[u8; 16]>>,
     pending: HashMap<[u8; 16], CacheKey>,
+    queued_requests: HashMap<[u8; 16], ResolveRequestV1>,
 }
 impl ResolverState {
     pub fn set_exchange_peer(&mut self, exchange_peer_id: PeerId) {
@@ -75,48 +77,82 @@ impl ResolverState {
     pub fn begin(
         &mut self,
         request_id: [u8; 16],
+        binding: PrincipalBinding,
         session_id: [u8; 16],
         selector: UnscopedSelector,
         now: i64,
-    ) -> Result<ResolveRequestV1, p2x_protocol::PublicErrorCode> {
+    ) -> Result<Option<ResolveRequestV1>, p2x_protocol::PublicErrorCode> {
         self.sweep(now);
         let key = CacheKey {
-            session_id,
+            binding,
             selector: selector.clone(),
         };
         let queue = self.waiters.entry(key.clone()).or_default();
         if queue.len() >= MAX_WAITERS_PER_SELECTOR {
             return Err(p2x_protocol::PublicErrorCode::LimitResolveRequests);
         }
-        queue.push_back(u64::from_be_bytes(
-            request_id[..8].try_into().unwrap_or_default(),
-        ));
-        self.pending.insert(request_id, key.clone());
-        Ok(ResolveRequestV1::Resolve {
+        queue.push_back(request_id);
+        let request = ResolveRequestV1::Resolve {
             request_id,
             session_id,
             selector,
             client_capabilities: Capabilities::from_bits(15).expect("known capabilities"),
-        })
+        };
+        self.queued_requests.insert(request_id, request.clone());
+        if queue.len() == 1 {
+            self.pending.insert(request_id, key);
+            Ok(Some(request))
+        } else {
+            Ok(None)
+        }
     }
+
+    pub fn next_request(&mut self) -> Option<ResolveRequestV1> {
+        let (key, request_id) = self
+            .waiters
+            .iter()
+            .find_map(|(key, queue)| queue.front().copied().map(|id| (key.clone(), id)))?;
+        if self.pending.contains_key(&request_id) {
+            return None;
+        }
+        let request = self.queued_requests.remove(&request_id)?;
+        self.pending.insert(request_id, key);
+        Some(request)
+    }
+
     pub fn metadata(
         &self,
-        session_id: [u8; 16],
+        binding: &PrincipalBinding,
         selector: &UnscopedSelector,
         now: i64,
     ) -> Option<ResolvedServiceMetadata> {
         self.positive
             .get(&CacheKey {
-                session_id,
+                binding: binding.clone(),
                 selector: selector.clone(),
             })
             .filter(|entry| entry.expires_at > now)
             .map(|entry| entry.metadata.clone())
     }
+
+    pub fn negative(
+        &self,
+        binding: &PrincipalBinding,
+        selector: &UnscopedSelector,
+    ) -> Option<p2x_protocol::PublicErrorCode> {
+        self.negative
+            .get(&CacheKey {
+                binding: binding.clone(),
+                selector: selector.clone(),
+            })
+            .filter(|entry| entry.expires_at > Instant::now())
+            .map(|entry| entry.code)
+    }
     pub fn complete(
         &mut self,
         response: ResolveResponseV1,
-        session_id: [u8; 16],
+        binding: &PrincipalBinding,
+        _session_id: [u8; 16],
         selector: &UnscopedSelector,
         now: i64,
     ) -> Result<AuthorizationGrant, p2x_protocol::PublicErrorCode> {
@@ -134,15 +170,19 @@ impl ResolverState {
             .pending
             .remove(&request_id)
             .ok_or(p2x_protocol::PublicErrorCode::ProtocolMalformed)?;
-        if key.session_id != session_id || key.selector != *selector {
+        if key.binding != *binding || key.selector != *selector {
             return Err(p2x_protocol::PublicErrorCode::ProtocolMalformed);
         }
         if let Some(queue) = self.waiters.get_mut(&key) {
+            if queue.front() != Some(&request_id) {
+                return Err(p2x_protocol::PublicErrorCode::ProtocolMalformed);
+            }
             queue.pop_front();
             if queue.is_empty() {
                 self.waiters.remove(&key);
             }
         }
+        self.queued_requests.remove(&request_id);
         match response {
             ResolveResponseV1::Resolved {
                 server_peer_id,
@@ -206,9 +246,9 @@ impl ResolverState {
             }
         }
     }
-    pub fn invalidate(&mut self, session_id: [u8; 16], selector: &UnscopedSelector) {
+    pub fn invalidate(&mut self, binding: &PrincipalBinding, selector: &UnscopedSelector) {
         let key = CacheKey {
-            session_id,
+            binding: binding.clone(),
             selector: selector.clone(),
         };
         self.positive.remove(&key);
@@ -220,6 +260,7 @@ impl ResolverState {
         self.negative.clear();
         self.waiters.clear();
         self.pending.clear();
+        self.queued_requests.clear();
     }
     pub fn sweep(&mut self, now: i64) {
         self.positive.retain(|_, value| value.expires_at > now);
@@ -261,7 +302,16 @@ mod tests {
         let mut state = ResolverState::default();
         let selector = selector();
         let id = [1; 16];
-        state.begin(id, [2; 16], selector.clone(), 1).unwrap();
+        let binding = PrincipalBinding {
+            tenant: p2x_protocol::Tenant::new("tenant").unwrap(),
+            role: p2x_protocol::Role::Client,
+            scopes: p2x_protocol::Scope::OpenProxyStream.bit(),
+            quota_profile: p2x_protocol::QuotaProfile::new("standard").unwrap(),
+            authorization_revision: 1,
+        };
+        state
+            .begin(id, binding.clone(), [2; 16], selector.clone(), 1)
+            .unwrap();
         let peer = PeerId::random().to_bytes();
         let exchange = PeerId::random();
         state.set_exchange_peer(exchange);
@@ -285,8 +335,10 @@ mod tests {
             ticket_expires_at: 19,
             ticket: RawTicket::new(vec![7; 16]).unwrap(),
         };
-        let grant = state.complete(response, [2; 16], &selector, 1).unwrap();
-        assert!(state.metadata([2; 16], &selector, 1).is_some());
+        let grant = state
+            .complete(response, &binding, [2; 16], &selector, 1)
+            .unwrap();
+        assert!(state.metadata(&binding, &selector, 1).is_some());
         assert_eq!(state.cached_tickets(), 0);
         assert!(!grant.ticket.as_bytes().is_empty());
     }

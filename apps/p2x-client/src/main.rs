@@ -661,7 +661,8 @@ async fn main() -> io::Result<()> {
                             let route = routes.as_ref().and_then(|config| config.routes.first()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proxy check requires a route"))?;
                             let session_id = auth_state.current_session_id(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?;
                             let request_id = request_ids.allocate().map_err(io::Error::other)?;
-                            let request = resolver_state.begin(request_id, session_id, route.selector.clone(), unix_now()).map_err(|code| io::Error::other(code.as_str()))?;
+                            let binding = auth_state.current_session(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?.principal_binding();
+                            let request = resolver_state.begin(request_id, binding, session_id, route.selector.clone(), unix_now()).map_err(|code| io::Error::other(code.as_str()))?.ok_or_else(|| io::Error::other("resolve request was paced"))?;
                             let outbound = swarm.behaviour_mut().resolve.send_request(&expected_exchange, request.clone());
                             if !pending_resolve.begin(outbound) { return Err(io::Error::other("resolve outbound request limit exceeded")); }
                             resolve_request = Some(request);
@@ -702,7 +703,8 @@ async fn main() -> io::Result<()> {
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Resolve(RequestResponseEvent::Message { peer: _, message: RequestResponseMessage::Response { request_id: outbound_id, response }, .. })) if pending_resolve.complete(&outbound_id) => {
                         let request = resolve_request.take().ok_or_else(|| io::Error::other("resolve response without request"))?;
                         let (request_id, session_id, selector) = match request { ResolveRequestV1::Resolve { request_id, session_id, selector, .. } => (request_id, session_id, selector) };
-                        match resolver_state.complete(response, session_id, &selector, unix_now()) {
+                        let binding = auth_state.current_session(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?.principal_binding();
+                        match resolver_state.complete(response, &binding, session_id, &selector, unix_now()) {
                             Ok(grant) if args.finite_proxy_check => {
                                 let peer = grant.metadata.server_peer_id;
                                 if !grant.metadata.compatible_capabilities.contains(p2x_protocol::Capabilities::RELAY_V2) { return Err(io::Error::other("resolve omitted relay capability")); }
