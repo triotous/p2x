@@ -699,11 +699,18 @@ async fn main() -> io::Result<()> {
                                     PathDecision::Relay(connection)
                                 };
                                 manager.finish_path(server, Some(selected));
+                                manager.close_active(server);
                             }
                             emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "proxy.authorized"))?;
                             return Ok(())
                         }
-                        Err(code) => { emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?; return Ok(()); }
+                        Err(code) => {
+                            if let (Some(manager), Some(server)) = (connection_manager.as_mut(), proxy_server) {
+                                let _ = manager.release(server);
+                            }
+                            emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                            return Ok(())
+                        }
                     }
                 }
             }
