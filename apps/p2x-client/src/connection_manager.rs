@@ -203,6 +203,42 @@ impl ConnectionManager {
         started + self.policy.setup_budget
     }
 
+    pub fn has_direct(&self, server: PeerId, connection: ConnectionId) -> bool {
+        self.direct(server) == Some(connection)
+    }
+
+    pub fn begin_path_at_deadline(
+        &mut self,
+        server: PeerId,
+        started: Instant,
+        setup_deadline: Instant,
+    ) -> Result<(PathAttempt, Vec<p2x_net::PathAction>), PublicErrorCode> {
+        self.admit(server)?;
+        self.sequence = self.sequence.saturating_add(1);
+        let (direct, relay) = self
+            .peers
+            .get(&server)
+            .map(|state| {
+                (
+                    state.book.direct(server).map(|record| record.connection_id),
+                    state.book.relay(server).map(|record| record.connection_id),
+                )
+            })
+            .unwrap_or((None, None));
+        let mut attempt = PathAttempt::with_deadline(
+            p2x_net::AttemptId(self.sequence),
+            started,
+            self.policy,
+            setup_deadline,
+        );
+        let actions = attempt.apply(PathEvent {
+            attempt_id: attempt.id,
+            now: started,
+            kind: p2x_net::PathEventKind::Begin { relay, direct },
+        });
+        Ok((attempt, actions))
+    }
+
     fn evict(&mut self) -> Result<(), PublicErrorCode> {
         let victim = self
             .peers
@@ -302,5 +338,22 @@ mod tests {
         manager.finish_path(server, Some(PathDecision::Direct(direct)));
         manager.finish_path(server, None);
         assert_eq!(manager.pending_count(), 0);
+    }
+
+    #[test]
+    fn caller_deadline_is_preserved() {
+        let now = Instant::now();
+        let manager = ConnectionManager::new(
+            PeerId::random(),
+            PathPolicy::new(Duration::from_millis(10), Duration::from_secs(20)).unwrap(),
+            SetupLimits {
+                max_peer_states: 1,
+                max_pending_setups: 1,
+                max_pending_per_server: 1,
+            },
+        );
+        let deadline = now + Duration::from_millis(250);
+        assert_eq!(manager.setup_deadline(now), now + Duration::from_secs(20));
+        assert!(deadline < manager.setup_deadline(now));
     }
 }

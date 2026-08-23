@@ -533,6 +533,8 @@ async fn main() -> io::Result<()> {
     let mut pending_resolve: PendingRequest<libp2p::request_response::OutboundRequestId> =
         PendingRequest::new();
     let mut resolve_request: Option<ResolveRequestV1> = None;
+    let mut resolve_retried = false;
+    let mut resolve_setup_deadline: Option<std::time::Instant> = None;
     let mut proxy_open: Option<OpenProxyStreamV1> = None;
     let mut proxy_request_id: Option<[u8; 16]> = None;
     let mut selected_proxy_connection: Option<libp2p::swarm::ConnectionId> = None;
@@ -812,6 +814,8 @@ async fn main() -> io::Result<()> {
                             let request = resolver_state.begin(request_id, binding, session_id, route.selector.clone(), unix_now()).map_err(|code| io::Error::other(code.as_str()))?.ok_or_else(|| io::Error::other("resolve request was paced"))?;
                             let outbound = swarm.behaviour_mut().resolve.send_request(&expected_exchange, request.clone());
                             if !pending_resolve.begin(outbound) { return Err(io::Error::other("resolve outbound request limit exceeded")); }
+                            resolve_setup_deadline = connection_manager.as_ref().map(|manager| manager.setup_deadline(std::time::Instant::now()));
+                            resolve_retried = false;
                             resolve_request = Some(request);
                         }
                         if args.finite_relay_ping && let Some(address) = server_address.clone() {
@@ -847,6 +851,32 @@ async fn main() -> io::Result<()> {
                         return Ok(());
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::OutboundFailure { request_id, error: libp2p::request_response::OutboundFailure::ConnectionClosed, .. })) if credential.is_some() => { pending_auth.complete(&request_id); }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Resolve(RequestResponseEvent::OutboundFailure { request_id: outbound_id, error: libp2p::request_response::OutboundFailure::Timeout, .. })) if pending_resolve.complete(&outbound_id) => {
+                        let now = std::time::Instant::now();
+                        if !resolve_retried
+                            && resolve_setup_deadline.is_some_and(|deadline| now < deadline)
+                            && let Some(request) = resolve_request.as_ref().cloned()
+                        {
+                            let retry = swarm.behaviour_mut().resolve.send_request(&expected_exchange, request);
+                            if pending_resolve.begin(retry) {
+                                resolve_retried = true;
+                                continue;
+                            }
+                        }
+                        if let Some(request) = resolve_request.take() {
+                            let request_id = match request {
+                                ResolveRequestV1::Resolve { request_id, .. } => request_id,
+                            };
+                            resolver_state.cancel(request_id);
+                        }
+                        let code = if resolve_setup_deadline.is_some_and(|deadline| now >= deadline) {
+                            PublicErrorCode::PeerSetupTimeout
+                        } else {
+                            PublicErrorCode::ExchangeTimeout
+                        };
+                        emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                        return Ok(());
+                    }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Resolve(RequestResponseEvent::Message { peer: _, message: RequestResponseMessage::Response { request_id: outbound_id, response }, .. })) if pending_resolve.complete(&outbound_id) => {
                         let request = resolve_request.take().ok_or_else(|| io::Error::other("resolve response without request"))?;
                         let (request_id, session_id, selector) = match request { ResolveRequestV1::Resolve { request_id, session_id, selector, .. } => (request_id, session_id, selector) };
@@ -863,7 +893,8 @@ async fn main() -> io::Result<()> {
                                 proxy_open = Some(OpenProxyStreamV1 { request_id, ticket: grant.ticket, upstream_id: grant.metadata.upstream_id, registration_revision: grant.metadata.registration_revision, ingress_kind: p2x_protocol::IngressKind::FixedTcp });
                                 if let Some(manager) = connection_manager.as_mut() {
                                     let started = std::time::Instant::now();
-                                    let (path, actions) = manager.begin_path(peer, started).map_err(|code| io::Error::other(code.as_str()))?;
+                                    let setup_deadline = resolve_setup_deadline.unwrap_or_else(|| manager.setup_deadline(started));
+                                    let (path, actions) = manager.begin_path_at_deadline(peer, started, setup_deadline).map_err(|code| io::Error::other(code.as_str()))?;
                                     proxy_setup_deadline = Some(path.setup_deadline);
                                     proxy_attempt = Some(path);
                                     let mut terminal = None;

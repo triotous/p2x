@@ -157,10 +157,19 @@ impl PathAttempt {
     }
 
     pub fn with_policy(id: AttemptId, now: Instant, policy: PathPolicy) -> Self {
+        Self::with_deadline(id, now, policy, now + policy.setup_budget)
+    }
+
+    pub fn with_deadline(
+        id: AttemptId,
+        now: Instant,
+        policy: PathPolicy,
+        setup_deadline: Instant,
+    ) -> Self {
         Self {
             id,
             started_at: now,
-            setup_deadline: now + policy.setup_budget,
+            setup_deadline,
             state: PathState::Absent,
             relay_connection: None,
             direct_preference: policy.direct_preference,
