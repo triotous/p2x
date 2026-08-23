@@ -1086,6 +1086,10 @@ async fn main() -> io::Result<()> {
             }
         })
         .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while worker_admission.admitted() > 0 && tokio::time::Instant::now() < deadline {
+            let _ = tokio::time::timeout_at(deadline, worker_rx.recv()).await;
+        }
         availability.withdrawn();
     }
     if let Some(listener_id) = circuit_listener_id {
