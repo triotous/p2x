@@ -67,4 +67,18 @@ validation:
 - cargo test p2x-server all targets/features: passed.
 - cargo clippy p2x-server all targets/features -D warnings: passed.
 - Remaining product gaps: full multi-open dispatch and canonical process matrix.
-commit: phase 6.6 pending review
+commit: phase 6.6 committed as 47e7e3e
+
+phase 6.7 finite owner controls and lifecycle fingerprints:
+- Added finite diagnostic controls for proxy-open count, hidden hook validation, dropped-first-resolve retry, direct pre-handshake failure injection, replay attempt, mutation, delay, and handshake bounds.
+- Added sequential finite empty-open aggregation with repeated fresh Resolve/ticket cycles and replay rejection handling.
+- Added request/response fingerprints and cumulative issuance fields to resolution lifecycle records.
+- Added direct-failure hook at ProxyStreamBehaviour before handler notification; existing path state machine performs relay fallback.
+validation:
+- cargo fmt --all: passed.
+- cargo clippy --workspace --all-targets --all-features -D warnings: passed.
+- cargo test --workspace --all-targets --all-features: passed.
+- resolve-ticket-tcp live case: passed.
+- resolve-ticket-quic live case: passed earlier after owner changes.
+- canonical runner still has 13 status-2 cases; runner refactor is next.
+commit: phase 6.7 pending review

@@ -60,6 +60,7 @@ pub struct ProxyStreamBehaviour {
     inbound_workers: HashMap<PeerId, usize>,
     inbound_connections: HashMap<(PeerId, ConnectionId), usize>,
     max_inbound_workers: usize,
+    test_fail_next_open: bool,
     max_inbound_workers_per_peer: usize,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +102,10 @@ impl ProxyStreamBehaviour {
         self.max_inbound_workers = max_workers.clamp(1, MAX_INBOUND_WORKERS);
         self.max_inbound_workers_per_peer =
             max_workers_per_peer.clamp(1, MAX_INBOUND_WORKERS_PER_PEER);
+    }
+
+    pub fn fail_next_open_before_handshake(&mut self) {
+        self.test_fail_next_open = true;
     }
 
     pub fn inbound_count(&self) -> usize {
@@ -187,6 +192,10 @@ impl ProxyStreamBehaviour {
             },
         );
         self.commands.push_back(request_id);
+        if self.test_fail_next_open {
+            self.test_fail_next_open = false;
+            self.fail(request_id, "test.direct_open_failed_before_handshake");
+        }
         Ok(request_id)
     }
     pub fn inbound_admit(&mut self, peer_id: PeerId) -> Result<(), &'static str> {

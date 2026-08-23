@@ -36,7 +36,8 @@ use p2x_net::{
     proxy_stream::behaviour::{ProxyOutput, ProxyRequestId},
 };
 use p2x_protocol::{
-    AuthRequest, AuthResponse, OpenProxyStreamV1, PublicErrorCode, ResolveRequestV1, Role,
+    AuthRequest, AuthResponse, OpenProxyStreamV1, PublicErrorCode, ResolveRequestV1,
+    ResolveResponseV1, Role,
 };
 use std::{
     collections::{HashSet, VecDeque},
@@ -581,9 +582,11 @@ async fn main() -> io::Result<()> {
         PendingRequest::new();
     let mut resolve_request: Option<ResolveRequestV1> = None;
     let mut resolve_retried = false;
-    let mut resolve_response_seen = false;
+    let mut dropped_resolve_response = false;
     let mut resolve_setup_deadline: Option<std::time::Instant> = None;
     let mut proxy_open: Option<OpenProxyStreamV1> = None;
+    let mut last_proxy_open: Option<OpenProxyStreamV1> = None;
+    let mut replay_attempted = false;
     let mut proxy_completed = 0u64;
     let proxy_target = args.test_proxy_open_count.unwrap_or(1);
     let _route_owner = route_test_hook_used.then(|| {
@@ -597,6 +600,7 @@ async fn main() -> io::Result<()> {
     });
     let mut proxy_request_id: Option<[u8; 16]> = None;
     let mut selected_proxy_connection: Option<libp2p::swarm::ConnectionId> = None;
+    let mut test_direct_failure_applied = false;
     let mut proxy_setup_deadline: Option<std::time::Instant> = None;
     let mut proxy_capabilities: Option<p2x_protocol::Capabilities> = None;
     let mut proxy_attempt: Option<PathAttempt> = None;
@@ -776,6 +780,18 @@ async fn main() -> io::Result<()> {
                                 authorized: true,
                                 code: None,
                             })?;
+                            if args.test_replay_first_ticket && !replay_attempted {
+                                replay_attempted = true;
+                                let replay = last_proxy_open.clone().ok_or_else(|| io::Error::other("replay grant missing"))?;
+                                let server = proxy_server.ok_or_else(|| io::Error::other("replay peer missing"))?;
+                                let connection = selected_proxy_connection.ok_or_else(|| io::Error::other("replay connection missing"))?;
+                                let deadline = proxy_setup_deadline.unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(5));
+                                let request = swarm.behaviour_mut().proxy_stream.as_mut().ok_or_else(|| io::Error::other("proxy is unavailable in product mode"))?.open_on_at_deadline(server, connection, replay.clone(), std::time::Instant::now(), deadline).map_err(io::Error::other)?;
+                                pending_proxy = Some(request);
+                                proxy_request_id = Some(replay.request_id);
+                                proxy_open = Some(replay);
+                                continue;
+                            }
                             if proxy_completed >= proxy_target {
                                 emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "proxy.authorized"))?;
                                 return Ok(())
@@ -799,6 +815,18 @@ async fn main() -> io::Result<()> {
                             continue
                         }
                         Err(code) => {
+                            if replay_attempted && code == PublicErrorCode::AuthTicketReplayed {
+                                emitter.emit(&LifecycleRecord::ProxyAuthorization {
+                                    peer_id: &proxy_server.ok_or_else(|| io::Error::other("replay peer missing"))?.to_string(),
+                                    connection_id_hash: selected_proxy_connection.map(stable_hash).unwrap_or_default(),
+                                    request_id_hash: stable_hash(proxy_result.request_id),
+                                    stream_id_hash: None,
+                                    authorized: false,
+                                    code: Some(code.as_str()),
+                                })?;
+                                emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", code.as_str()))?;
+                                return Ok(())
+                            }
                             if let (Some(manager), Some(server)) = (connection_manager.as_mut(), proxy_server) {
                                 let _ = manager.release(server);
                             }
@@ -970,20 +998,6 @@ async fn main() -> io::Result<()> {
                                 continue;
                             }
                         }
-                        if let Some(request) = resolve_request.as_ref()
-                            && args.test_drop_first_resolve_response
-                            && !resolve_response_seen
-                        {
-                            resolve_response_seen = true;
-                            let retry = swarm.behaviour_mut().resolve.send_request(&expected_exchange, request.clone());
-                            if pending_resolve.begin(retry) {
-                                resolve_retried = true;
-                                emitter.emit(&LifecycleRecord::TestFaultApplied {
-                                    fault: "drop_first_resolve_response",
-                                })?;
-                                continue;
-                            }
-                        }
                         if let Some(request) = resolve_request.take() {
                             let request_id = match request {
                                 ResolveRequestV1::Resolve { request_id, .. } => request_id,
@@ -999,18 +1013,38 @@ async fn main() -> io::Result<()> {
                         return Ok(());
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Resolve(RequestResponseEvent::Message { peer: _, message: RequestResponseMessage::Response { request_id: outbound_id, response }, .. })) if pending_resolve.complete(&outbound_id) => {
+                        if args.test_drop_first_resolve_response
+                            && !dropped_resolve_response
+                            && matches!(&response, ResolveResponseV1::Resolved { .. })
+                            && let Some(request) = resolve_request.as_ref().cloned()
+                        {
+                            let retry = swarm
+                                .behaviour_mut()
+                                .resolve
+                                .send_request(&expected_exchange, request);
+                            if pending_resolve.begin(retry) {
+                                dropped_resolve_response = true;
+                                emitter.emit(&LifecycleRecord::TestFaultApplied {
+                                    fault: "drop_first_resolve_response",
+                                })?;
+                                continue;
+                            }
+                        }
                         let request = resolve_request.take().ok_or_else(|| io::Error::other("resolve response without request"))?;
                         let (request_id, session_id, selector) = match request { ResolveRequestV1::Resolve { request_id, session_id, selector, .. } => (request_id, session_id, selector) };
                         let binding = auth_state.current_session(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?.principal_binding();
                         let resolution_request_id_hash = stable_hash(request_id);
-                        resolve_response_seen = true;
+                        let response_fingerprint = response
+                            .canonical_bytes()
+                            .map(stable_hash)
+                            .unwrap_or_default();
                         match resolver_state.complete(response, &binding, session_id, &selector, unix_now()) {
                             Ok(grant) if args.finite_proxy_check || args.test_proxy_open_count.is_some() => {
                                 emitter.emit(&LifecycleRecord::ResolutionOutcome {
                                     peer_id: &expected_exchange.to_string(),
                                     request_id_hash: resolution_request_id_hash,
                                     request_fingerprint: resolution_request_id_hash,
-                                    response_fingerprint: stable_hash(grant.metadata.registration_revision),
+                                    response_fingerprint,
                                     issuance_count: 1,
                                     resolved: true,
                                     ticket_issued: true,
@@ -1024,7 +1058,22 @@ async fn main() -> io::Result<()> {
                                 proxy_server = Some(peer);
                                 proxy_capabilities = Some(grant.metadata.compatible_capabilities);
                                 proxy_request_id = Some(request_id);
-                                proxy_open = Some(OpenProxyStreamV1 { request_id, ticket: grant.ticket, upstream_id: grant.metadata.upstream_id, registration_revision: grant.metadata.registration_revision, ingress_kind: p2x_protocol::IngressKind::FixedTcp });
+                                let mut open = OpenProxyStreamV1 { request_id, ticket: grant.ticket, upstream_id: grant.metadata.upstream_id, registration_revision: grant.metadata.registration_revision, ingress_kind: p2x_protocol::IngressKind::FixedTcp };
+                                match args.test_open_mutation {
+                                    OpenMutation::None => {}
+                                    OpenMutation::TicketByte => {
+                                        let mut bytes = open.ticket.as_bytes().to_vec();
+                                        if let Some(byte) = bytes.last_mut() { *byte ^= 1; }
+                                        open.ticket = p2x_protocol::RawTicket::new(bytes).map_err(io::Error::other)?;
+                                    }
+                                    OpenMutation::UpstreamId => { open.upstream_id = p2x_protocol::UpstreamId::new("mutated").map_err(io::Error::other)?; }
+                                    OpenMutation::Revision => { open.registration_revision = p2x_protocol::RegistrationRevision::new(open.registration_revision.get().saturating_add(1)).ok_or_else(|| io::Error::other("mutation revision exhausted"))?; }
+                                }
+                                if let Some(delay) = args.test_delay_after_resolve_ms {
+                                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                                }
+                                last_proxy_open = Some(open.clone());
+                                proxy_open = Some(open);
                                 if let Some(manager) = connection_manager.as_mut() {
                                     let started = std::time::Instant::now();
                                     let setup_deadline = resolve_setup_deadline.unwrap_or_else(|| manager.setup_deadline(started));
@@ -1040,6 +1089,14 @@ async fn main() -> io::Result<()> {
                                     proxy_attempt = Some(path);
                                     let mut terminal = None;
                                     let proxy = swarm.behaviour_mut().proxy_stream.as_mut().ok_or_else(|| io::Error::other("proxy is unavailable in product mode"))?;
+                                    if args.test_fail_first_direct_open_before_handshake
+                                        && !test_direct_failure_applied
+                                        && matches!(proxy_attempt.as_ref().map(|attempt| attempt.state), Some(p2x_net::PathState::Committed { decision: PathDecision::Direct(_), .. }))
+                                    {
+                                        test_direct_failure_applied = true;
+                                        proxy.fail_next_open_before_handshake();
+                                        emitter.emit(&LifecycleRecord::TestFaultApplied { fault: "fail_first_direct_open_before_handshake" })?;
+                                    }
                                     let current = proxy_attempt.as_mut().expect("proxy attempt was stored");
                                     let should_dial = actions.iter().any(|action| matches!(action, PathAction::DialRelay));
                                     drive_proxy_path_actions(proxy, current, peer, proxy_open.as_ref().expect("proxy open was stored"), proxy_setup_deadline.expect("proxy deadline was stored"), &emitter, actions, &mut pending_proxy, &mut selected_proxy_connection, &mut terminal)?;
@@ -1070,7 +1127,7 @@ async fn main() -> io::Result<()> {
                                     peer_id: &expected_exchange.to_string(),
                                     request_id_hash: resolution_request_id_hash,
                                     request_fingerprint: resolution_request_id_hash,
-                                    response_fingerprint: stable_hash(code.as_str()),
+                                    response_fingerprint,
                                     issuance_count: 0,
                                     resolved: false,
                                     ticket_issued: false,

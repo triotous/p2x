@@ -430,6 +430,12 @@ async fn main() -> io::Result<()> {
                             Some(error.code.as_str()),
                         ),
                     };
+                    let request_fingerprint = match &request {
+                        p2x_protocol::ResolveRequestV1::Resolve { .. } => request
+                            .canonical_bytes()
+                            .map(stable_hash)
+                            .unwrap_or_default(),
+                    };
                     let response_fingerprint = response
                         .canonical_bytes()
                         .map(stable_hash)
@@ -438,7 +444,7 @@ async fn main() -> io::Result<()> {
                     emitter.emit(&LifecycleRecord::ResolutionOutcome {
                         peer_id: &peer_name,
                         request_id_hash,
-                        request_fingerprint: request_id_hash,
+                        request_fingerprint,
                         response_fingerprint,
                         issuance_count: resolver.as_ref().map_or(0, Resolver::issued),
                         resolved,
