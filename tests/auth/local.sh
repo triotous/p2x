@@ -347,12 +347,12 @@ for line in open(sys.argv[1]):
 PY
 ); [[ -n "$rotation_addr" ]] && break; sleep .05; done
   [[ -n "$rotation_addr" ]] || { echo "rotation exchange did not become ready" >&2; exit 1; }
-  P2X_TOKEN="$rotation_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$rotation_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --finite-auth-check --case-id rotation-second --routes-file "$services_file" --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/rotation-second.ndjson" 2>&1 &
+  P2X_TOKEN="$rotation_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$rotation_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --finite-auth-check --case-id rotation-second --routes-file "$routes_file" --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/rotation-second.ndjson" 2>&1 &
   pids+=("$!")
   for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$out/rotation-second.ndjson" && break; sleep .05; done
   grep -q '"code":"auth.pong"' "$out/rotation-second.ndjson" || { echo "rotated credential did not authenticate" >&2; exit 1; }
   if [[ "$case_name" == rotation-revoke-old ]]; then
-    P2X_TOKEN="$client_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$rotation_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --finite-auth-check --case-id old-token --routes-file "$services_file" --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/old-token.ndjson" 2>&1 &
+    P2X_TOKEN="$client_token" "$root/target/debug/p2x-client" --identity-file "$client_key" --exchange "$rotation_addr" --exchange-peer-id "$exchange_peer" --credential-env P2X_TOKEN --finite-auth-check --case-id old-token --routes-file "$routes_file" --tcp-listen /ip4/127.0.0.1/tcp/0 --quic-listen /ip4/127.0.0.1/udp/0/quic-v1 >"$out/old-token.ndjson" 2>&1 &
     pids+=("$!")
     for _ in $(seq 1 200); do grep -q '"event":"terminal"' "$out/old-token.ndjson" && break; sleep .05; done
     grep -q '"code":"auth.invalid_credential"' "$out/old-token.ndjson" || { echo "old credential still authenticated" >&2; exit 1; }

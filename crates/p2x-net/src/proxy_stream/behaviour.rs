@@ -50,6 +50,7 @@ pub enum ProxyOutput {
 pub struct ProxyStreamBehaviour {
     inbound_enabled: bool,
     outbound_enabled: bool,
+    draining: bool,
     next: u64,
     known: HashSet<(PeerId, ConnectionId)>,
     pending: HashMap<ProxyRequestId, PendingOpen>,
@@ -85,6 +86,9 @@ impl ProxyStreamBehaviour {
             outbound_enabled: false,
             ..Self::default()
         }
+    }
+    pub fn set_draining(&mut self, draining: bool) {
+        self.draining = draining;
     }
     pub fn open_on(
         &mut self,
@@ -368,6 +372,16 @@ impl NetworkBehaviour for ProxyStreamBehaviour {
             }
             ProxyEvent::InboundOpened { stream } => {
                 if !self.inbound_enabled {
+                    return;
+                }
+                if self.draining {
+                    if self.inbound_events.len() < MAX_PENDING {
+                        self.inbound_events.push_back(ProxyOutput::InboundRejected {
+                            peer_id: peer,
+                            connection_id: id,
+                            code: "peer.draining",
+                        });
+                    }
                     return;
                 }
                 if self.inbound_events.len() < MAX_PENDING

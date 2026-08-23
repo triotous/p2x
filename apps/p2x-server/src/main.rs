@@ -1038,6 +1038,9 @@ async fn main() -> io::Result<()> {
         }
     }
     if config.mode == RuntimeMode::Product {
+        if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
+            proxy.set_draining(true);
+        }
         let _ = availability.begin_shutdown();
         let snapshot = availability.readiness(unix_now());
         emitter.emit(&LifecycleRecord::ServerReadiness {
