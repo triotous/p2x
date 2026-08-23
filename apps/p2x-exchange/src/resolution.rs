@@ -304,6 +304,10 @@ impl<'a> Resolver<'a> {
         self.draining = draining;
     }
 
+    pub fn cache_len(&self) -> usize {
+        self.idempotency.len()
+    }
+
     pub fn sweep(&mut self, now: i64) {
         self.idempotency
             .retain(|_, cached| cached.expires_at.saturating_add(5) > now);
@@ -367,6 +371,86 @@ mod tests {
             expires_at: 100,
         }
     }
+    #[test]
+    fn same_request_replays_without_new_issuance() {
+        let key = TicketKey::from_seed([9; 32]);
+        let exchange = PeerId::random();
+        let client = PeerId::random();
+        let server = PeerId::random();
+        let mut resolver = Resolver::new(exchange, &key);
+        let mut registry = Registry::default();
+        let tenant = Tenant::new("tenant").unwrap();
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            p2x_protocol::MetadataKey::new("service").unwrap(),
+            p2x_protocol::MetadataValue::new("orders").unwrap(),
+        );
+        let selector =
+            p2x_protocol::UnscopedSelector::new(p2x_protocol::ProtocolClass::Http, metadata)
+                .unwrap();
+        let services =
+            p2x_protocol::ServiceSet::new(vec![p2x_protocol::ServiceAdvertisementV1::new(
+                p2x_protocol::UpstreamId::new("orders").unwrap(),
+                selector.clone(),
+                p2x_protocol::Health::Ready,
+            )])
+            .unwrap();
+        registry.set_advertise_addresses(vec![format!("/ip4/127.0.0.1/tcp/1/p2p/{exchange}")]);
+        let registration = p2x_protocol::RegistryRequestV1::Register {
+            request_id: [8; 16],
+            session_id: [2; 16],
+            instance_id: p2x_protocol::InstanceId::new([3; 16]),
+            requested_lease_seconds: 30,
+            capabilities: Capabilities::from_bits(15).unwrap(),
+            services,
+        };
+        registry
+            .register(
+                server,
+                &tenant,
+                Role::Server,
+                Scope::RegisterServices.bit(),
+                &QuotaProfile::new("standard").unwrap(),
+                1,
+                true,
+                registration,
+                1,
+            )
+            .unwrap();
+        let request = ResolveRequestV1::Resolve {
+            request_id: [1; 16],
+            session_id: [2; 16],
+            selector,
+            client_capabilities: Capabilities::RELAY_V2,
+        };
+        let client_session = session(client, Role::Client, Scope::OpenProxyStream.bit());
+        let first = resolver.resolve_and_authorize(
+            client,
+            ConnectionId::new_unchecked(1),
+            &request,
+            "wire-1",
+            Some(&client_session),
+            |_| Some(session(server, Role::Server, Scope::RegisterServices.bit())),
+            |_| true,
+            &registry,
+            1,
+        );
+        let second = resolver.resolve_and_authorize(
+            client,
+            ConnectionId::new_unchecked(1),
+            &request,
+            "wire-2",
+            Some(&client_session),
+            |_| Some(session(server, Role::Server, Scope::RegisterServices.bit())),
+            |_| true,
+            &registry,
+            1,
+        );
+        assert_eq!(first, second);
+        assert_eq!(resolver.issued(), 1);
+        assert_eq!(resolver.cache_len(), 1);
+    }
+
     #[test]
     fn authorization_rejects_missing_client_scope_before_lookup() {
         let key = TicketKey::from_seed([9; 32]);
