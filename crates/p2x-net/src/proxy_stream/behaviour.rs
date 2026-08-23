@@ -110,14 +110,24 @@ impl ProxyStreamBehaviour {
         if deadline <= now {
             return Err("peer.setup_timeout");
         }
-        self.open_on_at(peer_id, connection_id, open, now)
+        self.open_on_at_deadline_inner(peer_id, connection_id, open, deadline)
     }
     pub fn open_on_at(
         &mut self,
         peer_id: PeerId,
         connection_id: ConnectionId,
         open: OpenProxyStreamV1,
-        now: Instant,
+        _now: Instant,
+    ) -> Result<ProxyRequestId, &'static str> {
+        self.open_on_at_deadline_inner(peer_id, connection_id, open, _now + OPEN_DEADLINE)
+    }
+
+    fn open_on_at_deadline_inner(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        open: OpenProxyStreamV1,
+        deadline: Instant,
     ) -> Result<ProxyRequestId, &'static str> {
         if !self.outbound_enabled {
             return Err("proxy.outbound_disabled");
@@ -150,7 +160,7 @@ impl ProxyStreamBehaviour {
                     connection_id,
                     open,
                 },
-                deadline: now + OPEN_DEADLINE,
+                deadline,
                 phase: Phase::Queued,
                 terminal: None,
             },
