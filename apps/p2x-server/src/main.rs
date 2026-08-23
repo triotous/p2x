@@ -115,6 +115,12 @@ fn unix_millis() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+fn request_id_start() -> io::Result<u128> {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
+    Ok((u128::from_be_bytes(bytes) % (u128::MAX - 1)).saturating_add(1))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RegistryOperationKind {
     Register,
@@ -442,7 +448,7 @@ async fn main() -> io::Result<()> {
     let mut proxy_workers = 0usize;
     let mut resource_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut first_probe_dropped = false;
-    let mut request_ids = p2x_protocol::CorrelationIdGenerator::new(1);
+    let mut request_ids = p2x_protocol::CorrelationIdGenerator::new(request_id_start()?);
     let mut auth_request_id = request_ids.allocate().map_err(io::Error::other)?;
     let mut ping_request_id = request_ids.allocate().map_err(io::Error::other)?;
     let mut auth_state = AuthState::new();

@@ -153,4 +153,10 @@ phase 7.3 stale revision classification:
 - Current server registration revision mismatches now return `registry.stale_revision` before replay consumption, while claim/tenant/authorization mismatches remain `auth.ticket_invalid`.
 - Added a regression test proving a stale current revision rejects without allocating replay state.
 validation: server Clippy and targeted stale-revision test passed.
+commit: fe62031
+
+phase 7.4 restart-safe server request IDs:
+- Replaced server process-local request-ID restart from `1` with a fresh random nonzero start, preventing stale exchange idempotency collisions after a same-identity server restart.
+- Targeted server stale-revision admission test passed; workspace fmt/clippy/tests passed.
+- Initial server-restart process attempt exposed a second recovery issue: replacement server registration events and client fresh resolve still need deterministic owner correlation.
 commit: pending phase review
