@@ -144,6 +144,9 @@ impl OpenProxyStreamV1 {
         finish(output)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, ProxyProtocolError> {
+        if bytes.len() > MAX_PROXY_HANDSHAKE_FRAME {
+            return Err(ProxyProtocolError::FrameTooLarge);
+        }
         let mut position = 0;
         if take(bytes, &mut position, 1)?[0] != VERSION {
             return Err(ProxyProtocolError::UnsupportedVersion);
@@ -220,6 +223,9 @@ impl ProxyOpenResponseV1 {
         finish(output)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, ProxyProtocolError> {
+        if bytes.len() > MAX_PROXY_HANDSHAKE_FRAME {
+            return Err(ProxyProtocolError::FrameTooLarge);
+        }
         let mut position = 0;
         if take(bytes, &mut position, 1)?[0] != VERSION {
             return Err(ProxyProtocolError::UnsupportedVersion);
@@ -298,6 +304,18 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn oversized_frames_are_rejected_before_parsing() {
+        assert_eq!(
+            OpenProxyStreamV1::decode(&vec![0; MAX_PROXY_HANDSHAKE_FRAME + 1]),
+            Err(ProxyProtocolError::FrameTooLarge)
+        );
+        assert_eq!(
+            ProxyOpenResponseV1::decode(&vec![0; MAX_PROXY_HANDSHAKE_FRAME + 1]),
+            Err(ProxyProtocolError::FrameTooLarge)
+        );
+    }
+
     #[test]
     fn trailing_and_unknown_values_are_rejected() {
         let response = ProxyOpenResponseV1::Authorized {

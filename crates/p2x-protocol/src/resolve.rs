@@ -206,6 +206,9 @@ impl ResolveRequestV1 {
         Ok(output)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, ResolveProtocolError> {
+        if bytes.len() > MAX_RESOLVE_FRAME {
+            return Err(ResolveProtocolError::FrameTooLarge);
+        }
         let mut position = 0;
         if take(bytes, &mut position, 1)?[0] != VERSION {
             return Err(ResolveProtocolError::UnsupportedVersion);
@@ -287,6 +290,9 @@ impl ResolveResponseV1 {
         Ok(output)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, ResolveProtocolError> {
+        if bytes.len() > MAX_RESOLVE_FRAME {
+            return Err(ResolveProtocolError::FrameTooLarge);
+        }
         let mut position = 0;
         if take(bytes, &mut position, 1)?[0] != VERSION {
             return Err(ResolveProtocolError::UnsupportedVersion);
@@ -443,6 +449,18 @@ mod tests {
         .unwrap()
         .to_vec();
         assert!(valid_addresses(&[relay]));
+    }
+
+    #[test]
+    fn oversized_frames_are_rejected_before_parsing() {
+        assert_eq!(
+            ResolveRequestV1::decode(&vec![0; MAX_RESOLVE_FRAME + 1]),
+            Err(ResolveProtocolError::FrameTooLarge)
+        );
+        assert_eq!(
+            ResolveResponseV1::decode(&vec![0; MAX_RESOLVE_FRAME + 1]),
+            Err(ResolveProtocolError::FrameTooLarge)
+        );
     }
 
     #[test]
