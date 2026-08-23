@@ -125,3 +125,6 @@ binding matrix completion:
 - `ticket-bindings` now runs and passes the complete unit matrix plus real ticket-byte mutation; all 13 required subcase names are included in the summary.
 - Aggregate resolution rerun still reports six explicit orchestration blockers: registration-revision-change, resolve-limit, proxy-limit, exchange-restart, server-restart, graceful-drain.
 validation: workspace static/tests remained green; no generated fuzz corpus noise retained.
+
+limit-hook attempt:
+- A temporary held-worker process-hook attempt was tested and reverted because the finite client owner still opens sequentially, so it could not prove exact N+1 saturation; the runner continues to fail resolve-limit/proxy-limit explicitly.
