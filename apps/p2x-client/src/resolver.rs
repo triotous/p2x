@@ -144,13 +144,13 @@ impl ResolverState {
 
     /// Promotes the next FIFO waiter for a selector to the wire request owner.
     pub fn next_request(&mut self) -> Option<ResolveRequestV1> {
-        let (key, request_id) = self
-            .waiters
-            .iter()
-            .find_map(|(key, queue)| queue.front().copied().map(|id| (key.clone(), id)))?;
-        if self.pending.contains_key(&request_id) {
-            return None;
-        }
+        let (key, request_id) = self.waiters.iter().find_map(|(key, queue)| {
+            queue
+                .front()
+                .copied()
+                .filter(|id| !self.pending.contains_key(id))
+                .map(|id| (key.clone(), id))
+        })?;
         let request = self.queued_requests.remove(&request_id)?;
         let session_id = match &request {
             ResolveRequestV1::Resolve { session_id, .. } => *session_id,
@@ -296,6 +296,20 @@ impl ResolverState {
             }
         }
     }
+    pub fn cancel(&mut self, request_id: [u8; 16]) -> bool {
+        let Some(pending) = self.pending.remove(&request_id) else {
+            return self.queued_requests.remove(&request_id).is_some();
+        };
+        self.queued_requests.remove(&request_id);
+        if let Some(queue) = self.waiters.get_mut(&pending.key) {
+            queue.retain(|id| *id != request_id);
+            if queue.is_empty() {
+                self.waiters.remove(&pending.key);
+            }
+        }
+        true
+    }
+
     pub fn invalidate(&mut self, binding: &PrincipalBinding, selector: &UnscopedSelector) {
         let key = CacheKey {
             binding: binding.clone(),
@@ -384,6 +398,63 @@ mod tests {
             .unwrap()
             .to_vec();
         assert!(!valid_relay_address(&wrong, Some(exchange), server));
+    }
+
+    #[test]
+    fn queued_waiters_promote_in_fifo_and_cancel_releases_one() {
+        let mut state = ResolverState::default();
+        let selector = selector();
+        let binding = PrincipalBinding {
+            tenant: p2x_protocol::Tenant::new("tenant").unwrap(),
+            role: p2x_protocol::Role::Client,
+            scopes: p2x_protocol::Scope::OpenProxyStream.bit(),
+            quota_profile: p2x_protocol::QuotaProfile::new("standard").unwrap(),
+            authorization_revision: 1,
+        };
+        assert!(
+            state
+                .begin([1; 16], binding.clone(), [2; 16], selector.clone(), 1)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            state
+                .begin([2; 16], binding.clone(), [2; 16], selector.clone(), 1)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state.pending(), 1);
+        assert!(state.cancel([1; 16]));
+        assert_eq!(state.pending(), 0);
+        let next = state.next_request().unwrap();
+        assert!(matches!(
+            next,
+            ResolveRequestV1::Resolve { request_id, .. } if request_id == [2; 16]
+        ));
+        assert!(state.cancel([2; 16]));
+    }
+
+    #[test]
+    fn principal_binding_change_clears_pending_and_metadata() {
+        let mut state = ResolverState::default();
+        let selector = selector();
+        let binding = PrincipalBinding {
+            tenant: p2x_protocol::Tenant::new("tenant").unwrap(),
+            role: p2x_protocol::Role::Client,
+            scopes: p2x_protocol::Scope::OpenProxyStream.bit(),
+            quota_profile: p2x_protocol::QuotaProfile::new("standard").unwrap(),
+            authorization_revision: 1,
+        };
+        state
+            .begin([1; 16], binding.clone(), [2; 16], selector.clone(), 1)
+            .unwrap();
+        let changed = PrincipalBinding {
+            authorization_revision: 2,
+            ..binding
+        };
+        state.set_principal_binding(changed);
+        assert_eq!(state.pending(), 0);
+        assert!(state.next_request().is_none());
     }
 
     #[test]
