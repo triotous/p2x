@@ -8,6 +8,7 @@ mod proxy_open;
 mod resolver;
 
 use clap::{Parser, ValueEnum};
+use connection_manager::{ConnectionManager, SetupLimits};
 use futures::StreamExt;
 use libp2p::{
     Multiaddr,
@@ -26,6 +27,7 @@ use p2x_net::{
     builder::{PeerSwarmConfig, RuntimeMode, build_peer_swarm, lab_identity, start_peer_listeners},
     connection_book::{ConnectionBook, PathKind},
     lifecycle::{ConnectionState, Emitter, LifecycleRecord, TerminalResult, stable_hash},
+    path_selector::PathPolicy,
     probe::{ProbeAck, ProbeHeader, ProbeMode, ProbePath, ProbeTerminal, SCHEMA_VERSION},
     probe_stream::behaviour::ProbeOutput,
     probe_worker::execute_probe_client_futures_with_timeout,
@@ -418,6 +420,22 @@ async fn main() -> io::Result<()> {
     let mut resolver_state = resolver::ResolverState::default();
     resolver_state.set_exchange_peer(expected_exchange);
     let mut connections = ConnectionBook::new(expected_exchange);
+    let mut connection_manager = routes.as_ref().map(|config| {
+        let policy = PathPolicy::new(
+            std::time::Duration::from_millis(config.network.direct_preference_ms),
+            std::time::Duration::from_millis(config.network.connection_setup_timeout_ms),
+        )
+        .expect("validated route timing");
+        ConnectionManager::new(
+            expected_exchange,
+            policy,
+            SetupLimits {
+                max_peer_states: config.limits.max_peer_states,
+                max_pending_setups: config.limits.max_pending_setups,
+                max_pending_per_server: config.limits.max_pending_per_server,
+            },
+        )
+    });
     let mut exchange_addresses = AddressCursor::new();
     if let Some(index) = exchange_addresses.next(args.exchange.len()) {
         swarm
@@ -693,6 +711,7 @@ async fn main() -> io::Result<()> {
                                 let address = grant.metadata.relay_addresses.first().ok_or_else(|| io::Error::other("resolve returned no relay address"))?;
                                 let address = std::str::from_utf8(address).map_err(|_| io::Error::other("resolve returned invalid relay address"))?.parse::<Multiaddr>().map_err(io::Error::other)?;
                                 target_peer = Some(peer);
+                                if let Some(manager) = connection_manager.as_mut() { manager.admit(peer).map_err(|code| io::Error::other(code.as_str()))?; }
                                 proxy_request_id = Some(request_id);
                                 proxy_open = Some(OpenProxyStreamV1 { request_id, ticket: grant.ticket, upstream_id: grant.metadata.upstream_id, registration_revision: grant.metadata.registration_revision, ingress_kind: p2x_protocol::IngressKind::FixedTcp });
                                 swarm.dial(address).map_err(io::Error::other)?;
