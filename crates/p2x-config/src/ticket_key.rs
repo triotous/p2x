@@ -158,7 +158,7 @@ impl p2x_protocol::ticket::TicketKeyResolver for VerificationKeyRing {
 impl VerificationKeyRing {
     pub fn load(path: &Path) -> Result<Self, TicketKeyError> {
         let file = VerificationKeyFile::load(path)?;
-        if file.schema_version != 1 || file.keys.len() > 256 {
+        if file.schema_version != 1 || file.keys.is_empty() || file.keys.len() > 256 {
             return Err(TicketKeyError::InvalidConfiguration);
         }
         let mut ring = Self::default();

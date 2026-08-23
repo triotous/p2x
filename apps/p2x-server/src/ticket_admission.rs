@@ -142,6 +142,11 @@ impl TicketAdmissionLedger {
     pub fn clear(&mut self) {
         self.replay.clear();
     }
+
+    #[allow(dead_code)]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
 }
 #[cfg(test)]
 mod tests {

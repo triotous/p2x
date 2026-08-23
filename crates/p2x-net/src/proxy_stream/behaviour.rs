@@ -247,6 +247,8 @@ impl ProxyStreamBehaviour {
         self.fail(request_id, "proxy.cancelled")
     }
     pub fn shutdown(&mut self) {
+        self.inbound_workers.clear();
+        self.inbound_connections.clear();
         let requests = self.pending.keys().copied().collect::<Vec<_>>();
         for request in requests {
             self.fail(request, "proxy.shutdown");
