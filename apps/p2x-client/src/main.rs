@@ -656,13 +656,19 @@ async fn main() -> io::Result<()> {
             }
             Some(proxy_result) = proxy_result_rx.recv() => {
                 if proxy_request_id == Some(proxy_result.request_id) {
-                    if let Some(server) = proxy_server
-                        && let Some(manager) = connection_manager.as_mut()
-                    {
-                        manager.close_active(server);
-                    }
                     match proxy_result.result {
-                        Ok(_) => { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "proxy.authorized"))?; return Ok(()); }
+                        Ok(_) => {
+                            if let (Some(manager), Some(server), Some(connection)) = (connection_manager.as_mut(), proxy_server, selected_proxy_connection) {
+                                let selected = if connections.is_direct(server, connection) {
+                                    PathDecision::Direct(connection)
+                                } else {
+                                    PathDecision::Relay(connection)
+                                };
+                                manager.finish_path(server, Some(selected));
+                            }
+                            emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "proxy.authorized"))?;
+                            return Ok(())
+                        }
                         Err(code) => { emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?; return Ok(()); }
                     }
                 }
@@ -835,14 +841,6 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Proxy(ProxyOutput::OutboundOpened { request_id, peer_id, connection_id, stream })) if pending_proxy == Some(request_id) => {
                         let open = proxy_open.take().ok_or_else(|| io::Error::other("proxy stream opened without grant"))?;
-                        let selected = if selected_proxy_connection == Some(connection_id) {
-                            PathDecision::Direct(connection_id)
-                        } else {
-                            PathDecision::Relay(connection_id)
-                        };
-                        if let Some(manager) = connection_manager.as_mut() {
-                            manager.finish_path(peer_id, Some(selected));
-                        }
                         if let Some(current) = proxy_attempt.as_mut() {
                             let _ = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ExactOpenSucceeded { request_id: PathRequestId(request_id.0), connection: connection_id } });
                             let _ = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::PayloadAccepted });
