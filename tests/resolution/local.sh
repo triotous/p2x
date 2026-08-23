@@ -152,6 +152,7 @@ class Run:
         self.exchange_peer = self.make_identity("exchange")
         self.server_peer = self.make_identity("server")
         self.client_peer = self.make_identity("client")
+        self.client2_peer = self.make_identity("client2")
         self.exchange_tcp = free_port(socket.SOCK_STREAM)
         self.exchange_quic = free_port(socket.SOCK_DGRAM)
         self.mode = CASE_PROFILE[case][1]
@@ -175,6 +176,7 @@ class Run:
         )
         self.exchange_address = None
         self.client_token, client_digest = token("client")
+        self.client2_token, client2_digest = token("client2")
         self.server_token, server_digest = token("server")
         now = int(time.time())
         self.ticket_key = self.secret / "ticket.key"
@@ -203,6 +205,16 @@ credentials:
     not_before: {now - 60}
     expires_at: {now + 3600}
     revoked: false
+  - credential_id: client2
+    token_sha256: \"{client2_digest}\"
+    peer_id: \"{self.client2_peer}\"
+    tenant: test
+    role: client
+    scopes: [open_proxy_stream]
+    quota_profile: standard
+    not_before: {now - 60}
+    expires_at: {now + 3600}
+    revoked: false
   - credential_id: server
     token_sha256: \"{server_digest}\"
     peer_id: \"{self.server_peer}\"
@@ -218,12 +230,18 @@ credentials:
         self.credentials.chmod(0o600)
         self.services = self.secret / "services.yaml"
         enabled = "false" if case == "offline-selector" else "true"
+        proxy = "" if case != "proxy-limit" else """proxy:
+  max_workers: 1
+  max_workers_per_client: 1
+  max_replay_entries: 1
+  ticket_clock_skew: 5
+"""
         self.services.write_text(
             f"""schema_version: 1
 registration:
   requested_lease_seconds: 30
   refresh_seconds: 10
-services:
+{proxy}services:
   - upstream_id: orders
     selector:
       protocol: http
@@ -265,6 +283,22 @@ limits:
         process = subprocess.Popen(argv, cwd=root, env=child_env, stdout=handle, stderr=subprocess.STDOUT)
         self.processes.append((process, log, handle))
         return log
+
+    def start_client(self, name: str, exchange_address: str, client_args: list[str], token_value: str | None = None, identity_name: str = "client") -> pathlib.Path:
+        return self.start(
+            name,
+            [
+                str(bin_dir / "p2x-client"),
+                "--identity-file", str(self.secret / f"{identity_name}.key"),
+                "--exchange", exchange_address,
+                "--exchange-peer-id", self.exchange_peer,
+                "--credential-env", "P2X_TOKEN",
+                "--routes-file", str(self.routes),
+                *client_args,
+                "--case-id", f"{case}-{name}",
+            ],
+            {"P2X_TOKEN": token_value or (self.client2_token if identity_name == "client2" else self.client_token), "P2X_ENABLE_TEST_HOOKS": "1"},
+        )
 
     def stop(self, log: pathlib.Path, graceful: bool = True) -> None:
         for process, path, handle in self.processes:

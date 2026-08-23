@@ -862,7 +862,17 @@ async fn main() -> io::Result<()> {
                             proxy_release_tx.clone(),
                         ));
                     }
-                    SwarmEvent::Behaviour(PeerEvent::Proxy(p2x_net::proxy_stream::behaviour::ProxyOutput::InboundRejected { .. })) => {}
+                    SwarmEvent::Behaviour(PeerEvent::Proxy(p2x_net::proxy_stream::behaviour::ProxyOutput::InboundRejected { peer_id, connection_id, stream, code })) => {
+                        drop(stream);
+                        emitter.emit(&LifecycleRecord::ProxyAuthorization {
+                            peer_id: &peer_id.to_string(),
+                            connection_id_hash: stable_hash(connection_id),
+                            request_id_hash: 0,
+                            stream_id_hash: None,
+                            authorized: false,
+                            code: Some(code),
+                        })?;
+                    }
                     SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Authenticated { session_id, request_id, tenant, role, scopes, quota_profile, authorization_revision, expires_at, .. } }, .. })) if pending_auth.complete(&outbound_id) => {
                         let next_ping_id = request_ids.allocate().map_err(io::Error::other)?;
                         if let AuthAction::Ping { request_id: ping_id, session_id, nonce } = auth_state.authenticated_with_context(request_id, session_id, expires_at, tenant, role, scopes, quota_profile, authorization_revision, next_ping_id, 1, unix_now()) {

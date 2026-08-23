@@ -43,6 +43,7 @@ pub enum ProxyOutput {
     InboundRejected {
         peer_id: PeerId,
         connection_id: ConnectionId,
+        stream: Option<libp2p::swarm::Stream>,
         code: &'static str,
     },
 }
@@ -448,6 +449,7 @@ impl NetworkBehaviour for ProxyStreamBehaviour {
                         self.inbound_events.push_back(ProxyOutput::InboundRejected {
                             peer_id: peer,
                             connection_id: id,
+                            stream: Some(stream),
                             code: "peer.draining",
                         });
                     }
@@ -465,6 +467,7 @@ impl NetworkBehaviour for ProxyStreamBehaviour {
                     self.inbound_events.push_back(ProxyOutput::InboundRejected {
                         peer_id: peer,
                         connection_id: id,
+                        stream: Some(stream),
                         code: "limit.proxy_streams",
                     });
                 }
