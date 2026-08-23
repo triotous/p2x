@@ -368,10 +368,7 @@ fn valid_addresses(addresses: &[Vec<u8>]) -> bool {
             if address.is_empty() || address.len() > MAX_MULTIADDR_BYTES {
                 return false;
             }
-            let Ok(text) = std::str::from_utf8(address) else {
-                return false;
-            };
-            let Ok(address) = text.parse::<multiaddr::Multiaddr>() else {
+            let Ok(address) = multiaddr::Multiaddr::try_from(address.clone()) else {
                 return false;
             };
             let parts = address.iter().collect::<Vec<_>>();
@@ -435,6 +432,20 @@ mod tests {
         );
     }
     #[test]
+    fn binary_multiaddr_bytes_are_accepted() {
+        let peer = PeerId::random().to_bytes();
+        let exchange = PeerId::random();
+        let relay = format!(
+            "/ip4/127.0.0.1/tcp/1/p2p/{exchange}/p2p-circuit/p2p/{}",
+            PeerId::from_bytes(&peer).unwrap()
+        )
+        .parse::<multiaddr::Multiaddr>()
+        .unwrap()
+        .to_vec();
+        assert!(valid_addresses(&[relay]));
+    }
+
+    #[test]
     fn response_bounds_and_expiry_are_checked() {
         let peer = PeerId::random().to_bytes();
         let exchange = PeerId::random();
@@ -442,13 +453,14 @@ mod tests {
             "/ip4/127.0.0.1/tcp/1/p2p/{exchange}/p2p-circuit/p2p/{}",
             PeerId::from_bytes(&peer).unwrap()
         );
+        let relay = relay.parse::<multiaddr::Multiaddr>().unwrap().to_vec();
         let response = ResolveResponseV1::Resolved {
             request_id: [1; 16],
             server_peer_id: peer,
             upstream_id: UpstreamId::new("orders").unwrap(),
             selector_fingerprint: [3; 32],
             registration_revision: RegistrationRevision::new(1).unwrap(),
-            relay_addresses: vec![relay.into_bytes()],
+            relay_addresses: vec![relay],
             compatible_capabilities: Capabilities::RELAY_V2,
             registration_expires_at: 20,
             ticket_expires_at: 19,

@@ -11,10 +11,7 @@ use std::{
 pub const MAX_WAITERS_PER_SELECTOR: usize = 64;
 
 fn valid_relay_address(address: &[u8], exchange: Option<PeerId>, server: PeerId) -> bool {
-    let Ok(address) = std::str::from_utf8(address) else {
-        return false;
-    };
-    let Ok(address) = address.parse::<libp2p::Multiaddr>() else {
+    let Ok(address) = libp2p::Multiaddr::try_from(address.to_vec()) else {
         return false;
     };
     let parts = address.iter().collect::<Vec<_>>();
@@ -249,6 +246,17 @@ mod tests {
         UnscopedSelector::new(p2x_protocol::ProtocolClass::Http, metadata).unwrap()
     }
     #[test]
+    fn binary_multiaddr_bytes_are_revalidated() {
+        let exchange = PeerId::random();
+        let server = PeerId::random();
+        let address = format!("/ip4/127.0.0.1/tcp/1/p2p/{exchange}/p2p-circuit/p2p/{server}")
+            .parse::<libp2p::Multiaddr>()
+            .unwrap()
+            .to_vec();
+        assert!(valid_relay_address(&address, Some(exchange), server));
+    }
+
+    #[test]
     fn metadata_is_cacheable_but_ticket_is_not() {
         let mut state = ResolverState::default();
         let selector = selector();
@@ -261,14 +269,17 @@ mod tests {
             "/ip4/127.0.0.1/tcp/1/p2p/{}/p2p-circuit/p2p/{}",
             exchange,
             PeerId::from_bytes(&peer).unwrap()
-        );
+        )
+        .parse::<libp2p::Multiaddr>()
+        .unwrap()
+        .to_vec();
         let response = ResolveResponseV1::Resolved {
             request_id: id,
             server_peer_id: peer,
             upstream_id: p2x_protocol::UpstreamId::new("orders").unwrap(),
             selector_fingerprint: [3; 32],
             registration_revision: RegistrationRevision::new(1).unwrap(),
-            relay_addresses: vec![relay.into_bytes()],
+            relay_addresses: vec![relay],
             compatible_capabilities: Capabilities::RELAY_V2,
             registration_expires_at: 20,
             ticket_expires_at: 19,

@@ -707,7 +707,7 @@ async fn main() -> io::Result<()> {
                                 let peer = grant.metadata.server_peer_id;
                                 if !grant.metadata.compatible_capabilities.contains(p2x_protocol::Capabilities::RELAY_V2) { return Err(io::Error::other("resolve omitted relay capability")); }
                                 let address = grant.metadata.relay_addresses.first().ok_or_else(|| io::Error::other("resolve returned no relay address"))?;
-                                let address = std::str::from_utf8(address).map_err(|_| io::Error::other("resolve returned invalid relay address"))?.parse::<Multiaddr>().map_err(io::Error::other)?;
+                                let address = Multiaddr::try_from(address.clone()).map_err(io::Error::other)?;
                                 target_peer = Some(peer);
                                 if let Some(manager) = connection_manager.as_mut() { manager.admit(peer).map_err(|code| io::Error::other(code.as_str()))?; }
                                 proxy_request_id = Some(request_id);
