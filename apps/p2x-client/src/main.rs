@@ -573,13 +573,47 @@ async fn main() -> io::Result<()> {
                     let actions = attempt.apply(PathEvent { attempt_id: attempt.id, now, kind: PathEventKind::DirectDeadlineElapsed });
                     drive_path_actions(probe_mut(&mut swarm)?, attempt, peer_id, &emitter, actions, &mut launched)?;
                 }
-                if let (Some(peer_id), Some(current), Some(open), Some(deadline)) = (proxy_server, proxy_attempt.as_mut(), proxy_open.as_ref().cloned(), proxy_setup_deadline)
-                    && current.expired(now)
-                {
-                    let mut terminal = None;
-                    let proxy = swarm.behaviour_mut().proxy_stream.as_mut().ok_or_else(|| io::Error::other("proxy is unavailable in product mode"))?;
-                    drive_proxy_path_actions(proxy, current, peer_id, &open, deadline, &emitter, vec![PathAction::Finish(p2x_net::PathFailure::SetupExpired)], &mut pending_proxy, &mut selected_proxy_connection, &mut terminal)?;
-                    return Err(io::Error::other("proxy setup timeout"));
+                if let (Some(peer_id), Some(current), Some(open), Some(deadline)) = (proxy_server, proxy_attempt.as_mut(), proxy_open.as_ref().cloned(), proxy_setup_deadline) {
+                    let actions = current.apply(PathEvent {
+                        attempt_id: current.id,
+                        now,
+                        kind: PathEventKind::DirectDeadlineElapsed,
+                    });
+                    if !actions.is_empty() {
+                        let proxy = swarm
+                            .behaviour_mut()
+                            .proxy_stream
+                            .as_mut()
+                            .ok_or_else(|| io::Error::other("proxy is unavailable in product mode"))?;
+                        let mut terminal = None;
+                        drive_proxy_path_actions(
+                            proxy,
+                            current,
+                            peer_id,
+                            &open,
+                            deadline,
+                            &emitter,
+                            actions,
+                            &mut pending_proxy,
+                            &mut selected_proxy_connection,
+                            &mut terminal,
+                        )?;
+                        if terminal.is_some() {
+                            if let Some(manager) = connection_manager.as_mut() {
+                                let _ = manager.release(peer_id);
+                            }
+                            return Err(io::Error::other("proxy path setup failed"));
+                        }
+                        if pending_proxy.is_some() {
+                            proxy_request_id = Some(open.request_id);
+                        }
+                    }
+                    if current.expired(now) {
+                        if let Some(manager) = connection_manager.as_mut() {
+                            let _ = manager.release(peer_id);
+                        }
+                        return Err(io::Error::other("proxy setup timeout"));
+                    }
                 }
                 if let Some((id, token)) = credential.as_ref() {
                     match auth_state.tick(request_ids.allocate().map_err(io::Error::other)?, unix_now()) {
@@ -710,11 +744,16 @@ async fn main() -> io::Result<()> {
                                 && let (Some(open), Some(deadline), Some(current)) = (proxy_open.as_ref().cloned(), proxy_setup_deadline, proxy_attempt.as_mut())
                             {
                                 let kind = if observed_path == ProbePath::Relay {
-                                    PathEventKind::RelayReady(connection_id)
+                                    Some(PathEventKind::RelayReady(connection_id))
+                                } else if connection_manager
+                                    .as_ref()
+                                    .is_some_and(|manager| manager.direct(peer_id) == Some(connection_id))
+                                {
+                                    Some(PathEventKind::DirectReady(connection_id))
                                 } else {
-                                    PathEventKind::DirectReady(connection_id)
+                                    None
                                 };
-                                let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind });
+                                let actions = kind.map_or_else(Vec::new, |kind| current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind }));
                                 let proxy = swarm.behaviour_mut().proxy_stream.as_mut().ok_or_else(|| io::Error::other("proxy is unavailable in product mode"))?;
                                 let mut terminal = None;
                                 drive_proxy_path_actions(proxy, current, peer_id, &open, deadline, &emitter, actions, &mut pending_proxy, &mut selected_proxy_connection, &mut terminal)?;
@@ -1024,6 +1063,20 @@ async fn main() -> io::Result<()> {
                                 if let Some(current) = attempt.as_mut() {
                                     let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::DcutrFailed });
                                     drive_path_actions(probe_mut(&mut swarm)?, current, event.remote_peer_id, &emitter, actions, &mut launched)?;
+                                }
+                                if let (Some(current), Some(open), Some(deadline)) = (proxy_attempt.as_mut(), proxy_open.as_ref().cloned(), proxy_setup_deadline)
+                                    && proxy_server == Some(event.remote_peer_id)
+                                {
+                                    let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::DcutrFailed });
+                                    let proxy = swarm.behaviour_mut().proxy_stream.as_mut().ok_or_else(|| io::Error::other("proxy is unavailable in product mode"))?;
+                                    let mut terminal = None;
+                                    drive_proxy_path_actions(proxy, current, event.remote_peer_id, &open, deadline, &emitter, actions, &mut pending_proxy, &mut selected_proxy_connection, &mut terminal)?;
+                                    if pending_proxy.is_some() {
+                                        proxy_request_id = Some(open.request_id);
+                                    }
+                                    if terminal.is_some() {
+                                        return Err(io::Error::other("proxy path setup failed"));
+                                    }
                                 }
                                 let message = error.to_string(); emitter.emit(&LifecycleRecord::OperationalError { code: "dcutr.failed", message: &message })?;
                             }
