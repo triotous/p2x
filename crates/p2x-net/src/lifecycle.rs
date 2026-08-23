@@ -69,6 +69,9 @@ pub enum LifecycleRecord<'a> {
     ResolutionOutcome {
         peer_id: &'a str,
         request_id_hash: u64,
+        request_fingerprint: u64,
+        response_fingerprint: u64,
+        issuance_count: u64,
         resolved: bool,
         ticket_issued: bool,
         code: Option<&'a str>,

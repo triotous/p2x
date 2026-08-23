@@ -206,6 +206,8 @@ struct Args {
     finite_proxy_check: bool,
     #[arg(long, hide = true, default_value_t = 0)]
     test_hold_relay_seconds: u64,
+    #[arg(long, hide = true)]
+    test_drop_first_resolve_response: bool,
     #[arg(long, hide = true, default_value_t = 1)]
     test_relay_circuit_count: u32,
     #[arg(long, hide = true, action = clap::ArgAction::Append)]
@@ -375,7 +377,8 @@ async fn main() -> io::Result<()> {
         || args.test_replay_first_ticket
         || !matches!(args.test_open_mutation, OpenMutation::None)
         || args.test_fail_first_direct_open_before_handshake
-        || args.test_hold_proxy_handshake_ms.is_some();
+        || args.test_hold_proxy_handshake_ms.is_some()
+        || args.test_drop_first_resolve_response;
     if route_test_hook_used && std::env::var("P2X_ENABLE_TEST_HOOKS").ok().as_deref() != Some("1") {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -578,8 +581,11 @@ async fn main() -> io::Result<()> {
         PendingRequest::new();
     let mut resolve_request: Option<ResolveRequestV1> = None;
     let mut resolve_retried = false;
+    let mut resolve_response_seen = false;
     let mut resolve_setup_deadline: Option<std::time::Instant> = None;
     let mut proxy_open: Option<OpenProxyStreamV1> = None;
+    let mut proxy_completed = 0u64;
+    let proxy_target = args.test_proxy_open_count.unwrap_or(1);
     let _route_owner = route_test_hook_used.then(|| {
         route_open::RouteOpenSupervisor::new(
             routes
@@ -761,6 +767,7 @@ async fn main() -> io::Result<()> {
                                 manager.close_active(server);
                             }
                             let peer = proxy_server.ok_or_else(|| io::Error::other("proxy authorization peer missing"))?;
+                            proxy_completed = proxy_completed.saturating_add(1);
                             emitter.emit(&LifecycleRecord::ProxyAuthorization {
                                 peer_id: &peer.to_string(),
                                 connection_id_hash: selected_proxy_connection.map(stable_hash).unwrap_or_default(),
@@ -769,8 +776,27 @@ async fn main() -> io::Result<()> {
                                 authorized: true,
                                 code: None,
                             })?;
-                            emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "proxy.authorized"))?;
-                            return Ok(())
+                            if proxy_completed >= proxy_target {
+                                emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "proxy.authorized"))?;
+                                return Ok(())
+                            }
+                            proxy_open = None;
+                            proxy_attempt = None;
+                            proxy_server = None;
+                            pending_proxy = None;
+                            selected_proxy_connection = None;
+                            proxy_request_id = None;
+                            let route = routes.as_ref().and_then(|config| config.routes.first()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proxy check requires a route"))?;
+                            let session_id = auth_state.current_session_id(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?;
+                            let binding = auth_state.current_session(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?.principal_binding();
+                            let request_id = request_ids.allocate().map_err(io::Error::other)?;
+                            let request = resolver_state.begin(request_id, binding, session_id, route.selector.clone(), unix_now()).map_err(|code| io::Error::other(code.as_str()))?.ok_or_else(|| io::Error::other("resolve request was paced"))?;
+                            let outbound = swarm.behaviour_mut().resolve.send_request(&expected_exchange, request.clone());
+                            if !pending_resolve.begin(outbound) { return Err(io::Error::other("resolve outbound request limit exceeded")); }
+                            resolve_request = Some(request);
+                            resolve_setup_deadline = connection_manager.as_ref().map(|manager| manager.setup_deadline(std::time::Instant::now()));
+                            resolve_retried = false;
+                            continue
                         }
                         Err(code) => {
                             if let (Some(manager), Some(server)) = (connection_manager.as_mut(), proxy_server) {
@@ -826,7 +852,7 @@ async fn main() -> io::Result<()> {
                                 emitter.emit(&LifecycleRecord::OperationalError { code: "connection.rejected", message: &message })?;
                                 continue;
                             }
-                            if args.finite_proxy_check
+                            if (args.finite_proxy_check || args.test_proxy_open_count.is_some())
                                 && proxy_server == Some(peer_id)
                                 && let (Some(open), Some(deadline), Some(current)) = (proxy_open.as_ref().cloned(), proxy_setup_deadline, proxy_attempt.as_mut())
                             {
@@ -887,7 +913,7 @@ async fn main() -> io::Result<()> {
                         if let Some(binding) = auth_state.current_session(unix_now()).map(|session| session.principal_binding()) {
                             resolver_state.set_principal_binding(binding);
                         }
-                        if args.finite_proxy_check {
+                        if args.finite_proxy_check || args.test_proxy_open_count.is_some() {
                             let route = routes.as_ref().and_then(|config| config.routes.first()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proxy check requires a route"))?;
                             let session_id = auth_state.current_session_id(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?;
                             let request_id = request_ids.allocate().map_err(io::Error::other)?;
@@ -944,6 +970,20 @@ async fn main() -> io::Result<()> {
                                 continue;
                             }
                         }
+                        if let Some(request) = resolve_request.as_ref()
+                            && args.test_drop_first_resolve_response
+                            && !resolve_response_seen
+                        {
+                            resolve_response_seen = true;
+                            let retry = swarm.behaviour_mut().resolve.send_request(&expected_exchange, request.clone());
+                            if pending_resolve.begin(retry) {
+                                resolve_retried = true;
+                                emitter.emit(&LifecycleRecord::TestFaultApplied {
+                                    fault: "drop_first_resolve_response",
+                                })?;
+                                continue;
+                            }
+                        }
                         if let Some(request) = resolve_request.take() {
                             let request_id = match request {
                                 ResolveRequestV1::Resolve { request_id, .. } => request_id,
@@ -963,11 +1003,15 @@ async fn main() -> io::Result<()> {
                         let (request_id, session_id, selector) = match request { ResolveRequestV1::Resolve { request_id, session_id, selector, .. } => (request_id, session_id, selector) };
                         let binding = auth_state.current_session(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?.principal_binding();
                         let resolution_request_id_hash = stable_hash(request_id);
+                        resolve_response_seen = true;
                         match resolver_state.complete(response, &binding, session_id, &selector, unix_now()) {
-                            Ok(grant) if args.finite_proxy_check => {
+                            Ok(grant) if args.finite_proxy_check || args.test_proxy_open_count.is_some() => {
                                 emitter.emit(&LifecycleRecord::ResolutionOutcome {
                                     peer_id: &expected_exchange.to_string(),
                                     request_id_hash: resolution_request_id_hash,
+                                    request_fingerprint: resolution_request_id_hash,
+                                    response_fingerprint: stable_hash(grant.metadata.registration_revision),
+                                    issuance_count: 1,
                                     resolved: true,
                                     ticket_issued: true,
                                     code: None,
@@ -1025,6 +1069,9 @@ async fn main() -> io::Result<()> {
                                 emitter.emit(&LifecycleRecord::ResolutionOutcome {
                                     peer_id: &expected_exchange.to_string(),
                                     request_id_hash: resolution_request_id_hash,
+                                    request_fingerprint: resolution_request_id_hash,
+                                    response_fingerprint: stable_hash(code.as_str()),
+                                    issuance_count: 0,
                                     resolved: false,
                                     ticket_issued: false,
                                     code: Some(code.as_str()),

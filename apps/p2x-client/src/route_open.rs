@@ -125,7 +125,12 @@ impl RouteOpenSupervisor {
                 now,
             )?
             .map(|request| vec![RouteAction::SendResolve { open_id, request }])
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                vec![RouteAction::Complete {
+                    open_id,
+                    result: Err(PublicErrorCode::LimitResolveRequests),
+                }]
+            });
         self.opens.insert(
             open_id,
             RouteOpen {
