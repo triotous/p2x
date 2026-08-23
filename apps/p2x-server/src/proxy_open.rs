@@ -46,6 +46,7 @@ pub async fn run_worker(
     verification_ring: Option<VerificationKeyRing>,
     now: i64,
     clock_skew: i64,
+    hold_handshake_ms: Option<u64>,
     candidates: mpsc::Sender<Candidate>,
     releases: mpsc::Sender<Release>,
 ) {
@@ -59,6 +60,9 @@ pub async fn run_worker(
     .and_then(Result::ok)
     .ok_or(PublicErrorCode::ProtocolMalformed);
     let request_id = open.as_ref().ok().map(|open| open.request_id);
+    if let Some(delay) = hold_handshake_ms {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
     let validation = match (&verification_ring, open.as_ref()) {
         (Some(ring), Ok(open)) => super::ticket_admission::TicketAdmissionLedger::new(
             super::ticket_admission::MAX_REPLAY_ENTRIES,

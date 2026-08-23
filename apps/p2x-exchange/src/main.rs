@@ -77,6 +77,15 @@ fn chrono_like_now() -> i64 {
         .as_secs() as i64
 }
 
+struct HeldResolveResponse {
+    peer: libp2p::PeerId,
+    connection_id: libp2p::swarm::ConnectionId,
+    request_id: libp2p::request_response::InboundRequestId,
+    channel: libp2p::request_response::ResponseChannel<p2x_protocol::ResolveResponseV1>,
+    response: p2x_protocol::ResolveResponseV1,
+    due_at: std::time::Instant,
+}
+
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(long)]
@@ -290,6 +299,7 @@ async fn main() -> io::Result<()> {
     let mut reserved_servers = HashSet::new();
     let mut active_circuits = 0usize;
     let mut dropped_first_resolve_response = false;
+    let mut held_resolve_responses: Vec<HeldResolveResponse> = Vec::new();
     registry.set_advertise_addresses(args.advertise.iter().map(ToString::to_string).collect());
     let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
     let config = ExchangeSwarmConfig {
@@ -319,6 +329,17 @@ async fn main() -> io::Result<()> {
             _ = tokio::signal::ctrl_c() => break,
             _ = maintenance.tick() => {
                 let now = chrono_like_now();
+                let now_instant = std::time::Instant::now();
+                let held = std::mem::take(&mut held_resolve_responses);
+                for held in held {
+                    if held.due_at > now_instant {
+                        held_resolve_responses.push(held);
+                    } else if swarm.behaviour_mut().resolve.send_response(held.channel, held.response).is_err()
+                        && let Some(resolver) = resolver.as_mut()
+                    {
+                        resolver.admission.release_request(held.peer, held.connection_id, held.request_id);
+                    }
+                }
                 let actions = sessions.sweep(now);
                 for action in actions {
                     match action {
@@ -467,9 +488,15 @@ async fn main() -> io::Result<()> {
                         emitter.emit(&LifecycleRecord::TestFaultApplied {
                             fault: "hold_resolve_response",
                         })?;
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                    }
-                    if swarm.behaviour_mut().resolve.send_response(channel, response).is_err()
+                        held_resolve_responses.push(HeldResolveResponse {
+                            peer,
+                            connection_id,
+                            request_id,
+                            channel,
+                            response,
+                            due_at: std::time::Instant::now() + Duration::from_millis(delay),
+                        });
+                    } else if swarm.behaviour_mut().resolve.send_response(channel, response).is_err()
                         && let Some(resolver) = resolver.as_mut()
                     {
                         resolver.admission.release_request(peer, connection_id, request_id);
