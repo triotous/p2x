@@ -19,9 +19,7 @@ async fn run_auth_round_trip(quic: bool) {
     let peer_config = PeerSwarmConfig {
         tcp_listen: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
         quic_listen: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
-        mode: p2x_net::builder::RuntimeMode::Product,
-        relay_client_enabled: false,
-        registry_enabled: false,
+        surface: p2x_net::builder::PeerSurface::ProductClient,
         auth_fault: None,
     };
     let mut exchange = build_exchange_swarm(

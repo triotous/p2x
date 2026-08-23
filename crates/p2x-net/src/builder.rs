@@ -32,6 +32,19 @@ pub enum RuntimeMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PeerSurface {
+    #[default]
+    ProductClient,
+    ProductServer,
+    ConnectivityLab,
+}
+impl PeerSurface {
+    pub const fn is_connectivity_lab(self) -> bool {
+        matches!(self, Self::ConnectivityLab)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RelayProfile {
     #[default]
     Product,
@@ -147,9 +160,7 @@ impl Default for ExchangeSwarmConfig {
 pub struct PeerSwarmConfig {
     pub tcp_listen: Multiaddr,
     pub quic_listen: Multiaddr,
-    pub mode: RuntimeMode,
-    pub relay_client_enabled: bool,
-    pub registry_enabled: bool,
+    pub surface: PeerSurface,
     pub auth_fault: Option<crate::auth_codec::AuthFault>,
 }
 
@@ -160,9 +171,7 @@ impl Default for PeerSwarmConfig {
             quic_listen: "/ip4/127.0.0.1/udp/0/quic-v1"
                 .parse()
                 .expect("valid QUIC default"),
-            mode: RuntimeMode::Product,
-            relay_client_enabled: false,
-            registry_enabled: false,
+            surface: PeerSurface::ProductClient,
             auth_fault: None,
         }
     }
@@ -170,7 +179,11 @@ impl Default for PeerSwarmConfig {
 
 impl PeerSwarmConfig {
     pub fn is_connectivity_lab(&self) -> bool {
-        self.mode == RuntimeMode::ConnectivityLab
+        self.surface.is_connectivity_lab()
+    }
+
+    pub const fn is_product_server(&self) -> bool {
+        matches!(self.surface, PeerSurface::ProductServer)
     }
 }
 
@@ -540,6 +553,9 @@ pub fn build_peer_swarm(
     config.validate()?;
     let peer_id = PeerId::from_public_key(&keypair.public());
     let public_key = keypair.public();
+    let lab = config.surface.is_connectivity_lab();
+    let product_client = matches!(config.surface, PeerSurface::ProductClient);
+    let product_server = matches!(config.surface, PeerSurface::ProductServer);
     libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -566,12 +582,10 @@ pub fn build_peer_swarm(
         .map_err(|e| BuildError::Builder(e.to_string()))?
         .with_behaviour(|_, relay_client| PeerBehaviour {
             relay_client: libp2p::swarm::behaviour::toggle::Toggle::from(
-                (config.mode == RuntimeMode::ConnectivityLab || config.relay_client_enabled)
-                    .then_some(relay_client),
+                (lab || product_client || product_server).then_some(relay_client),
             ),
             dcutr: libp2p::swarm::behaviour::toggle::Toggle::from(
-                (config.mode == RuntimeMode::ConnectivityLab || config.relay_client_enabled)
-                    .then(|| dcutr::Behaviour::new(peer_id)),
+                (lab || product_client || product_server).then(|| dcutr::Behaviour::new(peer_id)),
             ),
             identify: identify::Behaviour::new(
                 identify::Config::new(IDENTIFY_PROTOCOL.to_owned(), public_key)
@@ -583,11 +597,11 @@ pub fn build_peer_swarm(
                     .with_timeout(Duration::from_secs(PING_TIMEOUT_SECONDS)),
             ),
             probe_stream: libp2p::swarm::behaviour::toggle::Toggle::from(
-                (config.mode == RuntimeMode::ConnectivityLab).then(ProbeStreamBehaviour::default),
+                lab.then(ProbeStreamBehaviour::default),
             ),
             proxy_stream: libp2p::swarm::behaviour::toggle::Toggle::from(
-                (config.mode == RuntimeMode::Product).then(|| {
-                    if config.registry_enabled {
+                (product_client || product_server).then(|| {
+                    if product_server {
                         ProxyStreamBehaviour::server()
                     } else {
                         ProxyStreamBehaviour::product()
@@ -596,7 +610,7 @@ pub fn build_peer_swarm(
             ),
             resolve: libp2p::request_response::Behaviour::with_codec(
                 ResolveCodec,
-                (config.mode == RuntimeMode::Product && !config.registry_enabled).then_some((
+                product_client.then_some((
                     libp2p::StreamProtocol::new(RESOLVE_PROTOCOL),
                     libp2p::request_response::ProtocolSupport::Outbound,
                 )),
@@ -614,7 +628,7 @@ pub fn build_peer_swarm(
             ),
             registry: libp2p::request_response::Behaviour::with_codec(
                 RegistryCodec,
-                (config.mode == RuntimeMode::Product && config.registry_enabled).then_some((
+                product_server.then_some((
                     libp2p::StreamProtocol::new(REGISTRY_PROTOCOL),
                     libp2p::request_response::ProtocolSupport::Outbound,
                 )),
@@ -692,7 +706,7 @@ mod tests {
         let product = build_peer_swarm(
             libp2p::identity::Keypair::generate_ed25519(),
             &PeerSwarmConfig {
-                relay_client_enabled: true,
+                surface: PeerSurface::ProductClient,
                 ..Default::default()
             },
         )
@@ -704,7 +718,7 @@ mod tests {
         let lab = build_peer_swarm(
             libp2p::identity::Keypair::generate_ed25519(),
             &PeerSwarmConfig {
-                mode: RuntimeMode::ConnectivityLab,
+                surface: PeerSurface::ConnectivityLab,
                 ..Default::default()
             },
         )

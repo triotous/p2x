@@ -19,7 +19,9 @@ impl Default for PathPolicy {
 }
 impl PathPolicy {
     pub fn new(direct_preference: Duration, setup_budget: Duration) -> Option<Self> {
-        if setup_budget.is_zero() || direct_preference >= setup_budget {
+        if setup_budget.is_zero()
+            || (direct_preference != Duration::ZERO && direct_preference >= setup_budget)
+        {
             return None;
         }
         Some(Self {
@@ -176,8 +178,7 @@ impl PathAttempt {
                 if let Some(direct) = direct {
                     self.commit_and_open(PathDecision::Direct(direct), false)
                 } else if let Some(relay) = relay {
-                    self.wait_for_direct(relay, event.now);
-                    vec![]
+                    self.wait_for_direct(relay, event.now)
                 } else {
                     self.state = PathState::RelayDialing;
                     vec![PathAction::DialRelay]
@@ -187,8 +188,7 @@ impl PathAttempt {
                 if matches!(self.state, PathState::RelayDialing | PathState::Absent) =>
             {
                 self.relay_connection = Some(relay);
-                self.wait_for_direct(relay, event.now);
-                vec![]
+                self.wait_for_direct(relay, event.now)
             }
             PathEventKind::DirectReady(direct) => match self.state {
                 PathState::RelayDialing => {
@@ -293,11 +293,15 @@ impl PathAttempt {
         now >= self.setup_deadline
     }
 
-    fn wait_for_direct(&mut self, relay_id: ConnectionId, now: Instant) {
+    fn wait_for_direct(&mut self, relay_id: ConnectionId, now: Instant) -> Vec<PathAction> {
+        if self.direct_preference.is_zero() {
+            return self.commit_and_open(PathDecision::Relay(relay_id), false);
+        }
         self.state = PathState::DirectWaiting {
             relay_id,
             direct_deadline: (now + self.direct_preference).min(self.setup_deadline),
         };
+        vec![]
     }
 
     fn commit_waiting_relay(&mut self) -> Vec<PathAction> {
@@ -618,6 +622,24 @@ mod tests {
                 .is_empty()
         );
         assert!(matches!(attempt.state, PathState::Streaming { .. }));
+    }
+
+    #[test]
+    fn zero_direct_preference_is_valid_and_commits_relay_immediately() {
+        let now = Instant::now();
+        let policy = PathPolicy::new(Duration::ZERO, Duration::from_secs(1)).unwrap();
+        let mut attempt = PathAttempt::with_policy(AttemptId(3), now, policy);
+        assert_eq!(
+            attempt.apply(PathEvent {
+                attempt_id: AttemptId(3),
+                now,
+                kind: PathEventKind::Begin {
+                    relay: Some(id(1)),
+                    direct: None,
+                },
+            }),
+            vec![PathAction::OpenExact { connection: id(1) }]
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ use p2x_net::{
         AddressCursor, AuthAction, AuthState, ConnectionLoss, ExchangeConnections, PendingRequest,
         RedialBackoff,
     },
-    builder::{PeerSwarmConfig, RuntimeMode, build_peer_swarm, lab_identity, start_peer_listeners},
+    builder::{PeerSurface, PeerSwarmConfig, build_peer_swarm, lab_identity, start_peer_listeners},
     connection_book::{ConnectionBook, PathKind},
     lifecycle::{ConnectionState, Emitter, LifecycleRecord, TerminalResult, stable_hash},
     path_selector::PathPolicy,
@@ -354,13 +354,11 @@ async fn main() -> io::Result<()> {
     let config = PeerSwarmConfig {
         tcp_listen: args.tcp_listen,
         quic_listen: args.quic_listen,
-        mode: if args.unsafe_connectivity_lab {
-            RuntimeMode::ConnectivityLab
+        surface: if args.unsafe_connectivity_lab {
+            PeerSurface::ConnectivityLab
         } else {
-            RuntimeMode::Product
+            PeerSurface::ProductClient
         },
-        relay_client_enabled: true,
-        registry_enabled: false,
         auth_fault: args.auth_fault.map(Into::into),
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;

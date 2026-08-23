@@ -20,7 +20,7 @@ use p2x_net::{
         RedialBackoff,
     },
     builder::{
-        PeerEvent, PeerSwarmConfig, RuntimeMode, build_peer_swarm, lab_identity,
+        PeerEvent, PeerSurface, PeerSwarmConfig, build_peer_swarm, lab_identity,
         start_peer_listeners,
     },
     connection_book::ConnectionBook,
@@ -392,13 +392,11 @@ async fn main() -> io::Result<()> {
     let config = PeerSwarmConfig {
         tcp_listen: args.tcp_listen,
         quic_listen: args.quic_listen,
-        mode: if args.unsafe_connectivity_lab {
-            RuntimeMode::ConnectivityLab
+        surface: if args.unsafe_connectivity_lab {
+            PeerSurface::ConnectivityLab
         } else {
-            RuntimeMode::Product
+            PeerSurface::ProductServer
         },
-        relay_client_enabled: !args.unsafe_connectivity_lab,
-        registry_enabled: !args.unsafe_connectivity_lab,
         auth_fault: None,
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
@@ -446,14 +444,14 @@ async fn main() -> io::Result<()> {
     let mut register_response_replayed = false;
     let mut changed_register_replayed = false;
     let mut late_refresh_sent = false;
-    if config.mode == RuntimeMode::Product
+    if !config.is_connectivity_lab()
         && let Some(index) = exchange_addresses.next(args.exchange.len())
     {
         swarm
             .dial(args.exchange[index].clone())
             .map_err(io::Error::other)?;
     }
-    if config.mode == RuntimeMode::Product
+    if !config.is_connectivity_lab()
         && let Some(index) = exchange_addresses.next(args.exchange.len())
     {
         let exchange = args.exchange[index].clone();
@@ -476,7 +474,7 @@ async fn main() -> io::Result<()> {
                 .with(Protocol::P2p(*swarm.local_peer_id())),
         );
     }
-    if config.mode == RuntimeMode::ConnectivityLab
+    if config.is_connectivity_lab()
         && let Some(index) = exchange_addresses.next(args.exchange.len())
     {
         let exchange = args.exchange[index].clone();
@@ -520,7 +518,7 @@ async fn main() -> io::Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = resource_tick.tick() => {
-                if config.mode == RuntimeMode::Product {
+                if !config.is_connectivity_lab() {
                     match availability.tick(unix_now()) {
                         availability::AvailabilityAction::Refresh if !args.test_suppress_registry_refresh && !registration_requested && registry_operation.is_none() => {
                             if let (Some(peer_id), Some(session_id), Some(revision), Some(services)) = (relay_peer_id, auth_state.current_session_id(unix_now()), registration_revision, service_config.as_ref()) {
@@ -632,7 +630,7 @@ async fn main() -> io::Result<()> {
                         emitter.emit(&LifecycleRecord::ListenerReady { listener_id: &listener, address: &address })?;
                         if address.contains("p2p-circuit") && let (Some(peer_id), Some(connection_id)) = (relay_peer_id, relay_connection_id) {
                             reservation.apply(ReservationEvent::RelayAddressConfirmed { generation: reservation_generation, peer_id, connection_id, listener_id, address: address.parse().map_err(io::Error::other)? }).map_err(io::Error::other)?;
-                            if config.mode == RuntimeMode::Product && reservation.is_ready() && !registration_requested && registry_operation.is_none()
+                            if !config.is_connectivity_lab() && reservation.is_ready() && !registration_requested && registry_operation.is_none()
                                 && let Some(session_id) = auth_state.current_session_id(unix_now())
                             {
                                 let operation = new_register(&mut request_ids, session_id, instance_id, service_config.as_ref().expect("product services"), reservation.generation)?;
@@ -684,7 +682,7 @@ async fn main() -> io::Result<()> {
                         emitter.emit(&LifecycleRecord::ConnectionObserved { peer_id: &peer, connection_id_hash: stable_hash(connection_id), state: ConnectionState::Established, path: Some(path), reason: None })?;
                         if relay_peer_id == Some(peer_id) {
                             exchange_connections.established(connection_id);
-                            if config.mode == RuntimeMode::Product {
+                            if !config.is_connectivity_lab() {
                                 relay_connection_id = Some(connection_id);
                             }
                             exchange_redial.reset();
@@ -700,7 +698,7 @@ async fn main() -> io::Result<()> {
                             }
                         }
                         if relay_peer_id == Some(peer_id)
-                            && config.mode == RuntimeMode::ConnectivityLab
+                            && config.is_connectivity_lab()
                             && !reservation_requested
                             && let Some(address) = pending_circuit.clone()
                         {
@@ -716,7 +714,7 @@ async fn main() -> io::Result<()> {
                         }
                     }
                     SwarmEvent::ConnectionClosed { peer_id, connection_id, cause, .. } => {
-                        if config.mode == RuntimeMode::Product
+                        if !config.is_connectivity_lab()
                             && relay_peer_id == Some(peer_id)
                             && relay_connection_id == Some(connection_id) {
                             if let Some(listener_id) = circuit_listener_id.take() {
@@ -734,7 +732,7 @@ async fn main() -> io::Result<()> {
                             registry_operation = None;
                             registry_retry_due_at = None;
                         }
-                        if config.mode == RuntimeMode::ConnectivityLab
+                        if config.is_connectivity_lab()
                             && relay_peer_id == Some(peer_id)
                             && relay_connection_id == Some(connection_id) {
                             reservation.apply(ReservationEvent::ExchangeLost { generation: reservation_generation, peer_id, connection_id }).map_err(io::Error::other)?;
@@ -800,8 +798,8 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Response { request_id: outbound_id, response: AuthResponse::Pong { request_id, nonce, .. } }, .. })) if credential.is_some() && pending_auth.complete(&outbound_id) && request_id == ping_request_id && auth_state.pong(request_id, nonce) == AuthAction::Ready => {
                         readiness_generation = readiness_generation.saturating_add(1);
-                        if config.mode == RuntimeMode::Product { let _ = availability.auth_ready(); }
-                        if config.mode == RuntimeMode::Product
+                        if !config.is_connectivity_lab() { let _ = availability.auth_ready(); }
+                        if !config.is_connectivity_lab()
                             && args.test_register_without_reservation
                             && registry_operation.is_none()
                             && let (Some(session_id), Some(services)) = (auth_state.current_session_id(unix_now()), service_config.as_ref())
@@ -813,7 +811,7 @@ async fn main() -> io::Result<()> {
                                 registration_requested = true;
                             }
                         }
-                        if config.mode == RuntimeMode::Product && !args.test_register_without_reservation && !reservation_requested && let (Some(address), Some(connection_id)) = (pending_circuit.clone(), relay_connection_id) {
+                        if !config.is_connectivity_lab() && !args.test_register_without_reservation && !reservation_requested && let (Some(address), Some(connection_id)) = (pending_circuit.clone(), relay_connection_id) {
                             reservation_generation = reservation_generation.saturating_add(1);
                             reservation.apply(ReservationEvent::GenerationStarted { generation: reservation_generation, peer_id: peer, connection_id }).map_err(io::Error::other)?;
                             let listener_id = swarm.listen_on(address).map_err(io::Error::other)?;
@@ -821,7 +819,7 @@ async fn main() -> io::Result<()> {
                             reservation.apply(ReservationEvent::ReservationRequested { generation: reservation_generation, peer_id: peer, connection_id }).map_err(io::Error::other)?;
                             reservation_requested = true;
                         }
-                        if config.mode == RuntimeMode::Product
+                        if !config.is_connectivity_lab()
                             && reservation.is_ready()
                             && registration_revision.is_none()
                             && !registration_requested
@@ -856,13 +854,13 @@ async fn main() -> io::Result<()> {
                         return Ok(());
                     }
                     SwarmEvent::Behaviour(PeerEvent::Auth(RequestResponseEvent::OutboundFailure { request_id, error: libp2p::request_response::OutboundFailure::ConnectionClosed, .. })) if credential.is_some() => { pending_auth.complete(&request_id); }
-                    SwarmEvent::Behaviour(PeerEvent::Relay(libp2p::relay::client::Event::ReservationReqAccepted { relay_peer_id: peer_id, renewal, .. })) if config.mode == RuntimeMode::ConnectivityLab || config.mode == RuntimeMode::Product => {
+                    SwarmEvent::Behaviour(PeerEvent::Relay(libp2p::relay::client::Event::ReservationReqAccepted { relay_peer_id: peer_id, renewal, .. })) => {
                         if let (Some(connection_id), Some(listener_id)) = (relay_connection_id, circuit_listener_id) {
                             reservation.apply(ReservationEvent::ReservationAccepted { generation: reservation.generation, peer_id, connection_id, listener_id, renewal }).map_err(io::Error::other)?;
-                            if config.mode == RuntimeMode::Product {
+                            if !config.is_connectivity_lab() {
                                 let _ = availability.reservation_ready(reservation.generation);
                             }
-                            if config.mode == RuntimeMode::Product && reservation.is_ready() && !registration_requested && registry_operation.is_none() && let Some(session_id) = auth_state.current_session_id(unix_now()) {
+                            if !config.is_connectivity_lab() && reservation.is_ready() && !registration_requested && registry_operation.is_none() && let Some(session_id) = auth_state.current_session_id(unix_now()) {
                                 let operation = new_register(&mut request_ids, session_id, instance_id, service_config.as_ref().expect("product services"), reservation.generation)?;
                                 let outbound = send_registry(&mut swarm, peer_id, &operation);
                                 if !pending_registry.begin(outbound) { return Err(io::Error::other("registry outbound request limit exceeded")); }
@@ -1034,7 +1032,7 @@ async fn main() -> io::Result<()> {
             }
         }
     }
-    if config.mode == RuntimeMode::Product {
+    if !config.is_connectivity_lab() {
         if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
             proxy.set_draining(true);
         }
@@ -1048,7 +1046,7 @@ async fn main() -> io::Result<()> {
             registration: snapshot.registration,
         })?;
     }
-    if config.mode == RuntimeMode::Product
+    if !config.is_connectivity_lab()
         && let (Some(peer_id), Some(session_id), Some(revision)) = (
             relay_peer_id,
             auth_state.current_session_id(unix_now()),

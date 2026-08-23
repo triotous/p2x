@@ -4,8 +4,8 @@ use libp2p::{
     swarm::SwarmEvent,
 };
 use p2x_net::builder::{
-    ExchangeEvent, ExchangeSwarmConfig, PeerEvent, PeerSwarmConfig, RuntimeMode,
-    build_exchange_swarm, build_peer_swarm, start_exchange_listeners, start_peer_listeners,
+    ExchangeEvent, ExchangeSwarmConfig, PeerEvent, PeerSwarmConfig, build_exchange_swarm,
+    build_peer_swarm, start_exchange_listeners, start_peer_listeners,
 };
 use p2x_protocol::selector::{MetadataKey, MetadataValue, ProtocolClass, UnscopedSelector};
 use p2x_protocol::{
@@ -44,9 +44,7 @@ async fn run_registry_round_trip(quic: bool) {
     let peer_config = PeerSwarmConfig {
         tcp_listen: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
         quic_listen: "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap(),
-        mode: RuntimeMode::Product,
-        relay_client_enabled: false,
-        registry_enabled: true,
+        surface: p2x_net::builder::PeerSurface::ProductServer,
         auth_fault: None,
     };
     let mut exchange = build_exchange_swarm(
