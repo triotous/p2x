@@ -656,6 +656,11 @@ async fn main() -> io::Result<()> {
             }
             Some(proxy_result) = proxy_result_rx.recv() => {
                 if proxy_request_id == Some(proxy_result.request_id) {
+                    if let Some(server) = proxy_server
+                        && let Some(manager) = connection_manager.as_mut()
+                    {
+                        manager.close_active(server);
+                    }
                     match proxy_result.result {
                         Ok(_) => { emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "proxy.authorized"))?; return Ok(()); }
                         Err(code) => { emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?; return Ok(()); }
