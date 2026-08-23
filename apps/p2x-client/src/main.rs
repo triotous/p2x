@@ -578,6 +578,7 @@ async fn main() -> io::Result<()> {
         PendingRequest::new();
     let mut resolve_request: Option<ResolveRequestV1> = None;
     let mut resolve_retried = false;
+    let mut recovery_resolve_retried = false;
     let mut resolve_sent_at: Option<std::time::Instant> = None;
     let mut resolve_setup_deadline: Option<std::time::Instant> = None;
     let mut proxy_open: Option<OpenProxyStreamV1> = None;
@@ -888,6 +889,7 @@ async fn main() -> io::Result<()> {
                             let session_id = auth_state.current_session_id(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?;
                             let binding = auth_state.current_session(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?.principal_binding();
                             let request_id = request_ids.allocate().map_err(io::Error::other)?;
+                            recovery_resolve_retried = false;
                             let request = resolver_state.begin(request_id, binding, session_id, route.selector.clone(), unix_now()).map_err(|code| io::Error::other(code.as_str()))?.ok_or_else(|| io::Error::other("resolve request was paced"))?;
                             let outbound = swarm.behaviour_mut().resolve.send_request(&expected_exchange, request.clone());
                             if !pending_resolve.begin(outbound) { return Err(io::Error::other("resolve outbound request limit exceeded")); }
@@ -946,6 +948,7 @@ async fn main() -> io::Result<()> {
                                 if !pending_resolve.begin(outbound) { return Err(io::Error::other("resolve outbound request limit exceeded")); }
                                 resolve_request = Some(request);
                                 resolve_retried = false;
+                                recovery_resolve_retried = true;
                                 resolve_sent_at = Some(std::time::Instant::now());
                                 emitter.emit(&LifecycleRecord::OperationalError { code: "proxy.recovering", message: "fresh ticket resolution" })?;
                                 continue;
@@ -1258,6 +1261,23 @@ async fn main() -> io::Result<()> {
                             }
                             Ok(_) => {}
                             Err(code) => {
+                                if args.recover_after_failure
+                                    && recovery_resolve_retried
+                                    && matches!(code, PublicErrorCode::RegistryNotFound | PublicErrorCode::RegistryOffline)
+                                    && resolve_setup_deadline.is_some_and(|deadline| std::time::Instant::now() < deadline)
+                                {
+                                    recovery_resolve_retried = false;
+                                    resolver_state.invalidate(&binding, &selector);
+                                    let request_id = request_ids.allocate().map_err(io::Error::other)?;
+                                    let request = resolver_state.begin(request_id, binding.clone(), session_id, selector.clone(), unix_now()).map_err(|error| io::Error::other(error.as_str()))?.ok_or_else(|| io::Error::other("resolve request was paced"))?;
+                                    let outbound = swarm.behaviour_mut().resolve.send_request(&expected_exchange, request.clone());
+                                    if !pending_resolve.begin(outbound) { return Err(io::Error::other("resolve outbound request limit exceeded")); }
+                                    resolve_request = Some(request);
+                                    resolve_retried = false;
+                                    resolve_sent_at = Some(std::time::Instant::now());
+                                    emitter.emit(&LifecycleRecord::OperationalError { code: "proxy.recovering", message: "retrying while replacement registration converges" })?;
+                                    continue;
+                                }
                                 emitter.emit(&LifecycleRecord::ResolutionOutcome {
                                     peer_id: &expected_exchange.to_string(),
                                     request_id_hash: resolution_request_id_hash,

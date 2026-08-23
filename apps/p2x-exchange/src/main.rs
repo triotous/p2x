@@ -610,6 +610,35 @@ async fn main() -> io::Result<()> {
     if let Some(resolver) = resolver.as_mut() {
         resolver.set_draining(true);
     }
+    for held in std::mem::take(&mut held_resolve_responses) {
+        let request_id = match held.response {
+            p2x_protocol::ResolveResponseV1::Resolved { request_id, .. }
+            | p2x_protocol::ResolveResponseV1::Rejected {
+                request_id: Some(request_id),
+                ..
+            } => request_id,
+            p2x_protocol::ResolveResponseV1::Rejected {
+                request_id: None, ..
+            } => {
+                continue;
+            }
+        };
+        let response = p2x_protocol::ResolveResponseV1::Rejected {
+            request_id: Some(request_id),
+            error: PublicError::new(PublicErrorCode::ExchangeDraining, true),
+        };
+        if swarm
+            .behaviour_mut()
+            .resolve
+            .send_response(held.channel, response)
+            .is_err()
+            && let Some(resolver) = resolver.as_mut()
+        {
+            resolver
+                .admission
+                .release_request(held.peer, held.connection_id, held.request_id);
+        }
+    }
     let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while (registry_admission.inflight() > 0
         || admission.inflight() > 0
