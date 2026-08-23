@@ -38,7 +38,10 @@ async fn read_frame<T: AsyncRead + Unpin>(io: &mut T) -> Result<Vec<u8>, ProxyPr
         .await
         .map_err(|_| ProxyProtocolError::Malformed)?;
     let length = u32::from_be_bytes(header) as usize;
-    if length == 0 || length > MAX_PROXY_HANDSHAKE_FRAME {
+    if length == 0 {
+        return Err(ProxyProtocolError::Malformed);
+    }
+    if length > MAX_PROXY_HANDSHAKE_FRAME {
         return Err(ProxyProtocolError::FrameTooLarge);
     }
     let mut body = vec![0; length];

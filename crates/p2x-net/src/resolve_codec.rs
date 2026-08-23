@@ -14,7 +14,10 @@ async fn read_frame<T: AsyncRead + Unpin + Send>(
         .await
         .map_err(|_| ResolveProtocolError::Malformed)?;
     let length = u32::from_be_bytes(header) as usize;
-    if length == 0 || length > MAX_RESOLVE_FRAME {
+    if length == 0 {
+        return Err(ResolveProtocolError::Malformed);
+    }
+    if length > MAX_RESOLVE_FRAME {
         return Err(ResolveProtocolError::FrameTooLarge);
     }
     let mut body = vec![0; length];

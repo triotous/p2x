@@ -1,4 +1,4 @@
-use crate::{connection_book::ConnectionId, probe_stream::handler::RequestId};
+use crate::connection_book::ConnectionId;
 use std::time::{Duration, Instant};
 
 pub const SETUP_BUDGET: Duration = Duration::from_secs(20);
@@ -33,6 +33,9 @@ impl PathPolicy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AttemptId(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PathRequestId(pub u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PathDecision {
@@ -72,7 +75,7 @@ pub enum PathState {
     },
     StreamOpening {
         decision: PathDecision,
-        request_id: RequestId,
+        request_id: PathRequestId,
         relay_id: Option<ConnectionId>,
         relay_fallback_used: bool,
     },
@@ -98,18 +101,18 @@ pub enum PathEventKind {
     DcutrFailed,
     DirectDeadlineElapsed,
     ExactOpenQueued {
-        request_id: RequestId,
+        request_id: PathRequestId,
         connection: ConnectionId,
     },
     ExactOpenRejected {
         connection: ConnectionId,
     },
     ExactOpenSucceeded {
-        request_id: RequestId,
+        request_id: PathRequestId,
         connection: ConnectionId,
     },
     ExactOpenFailed {
-        request_id: RequestId,
+        request_id: PathRequestId,
         connection: ConnectionId,
     },
     PayloadAccepted,
@@ -129,7 +132,7 @@ pub struct PathEvent {
 pub enum PathAction {
     DialRelay,
     OpenExact { connection: ConnectionId },
-    CancelOpen { request_id: RequestId },
+    CancelOpen { request_id: PathRequestId },
     CloseStream,
     Finish(PathFailure),
 }
@@ -409,7 +412,6 @@ impl PathAttempt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::probe_stream::handler::RequestId;
 
     fn id(value: usize) -> ConnectionId {
         ConnectionId::new_unchecked(value)
@@ -497,7 +499,7 @@ mod tests {
             &attempt,
             now,
             PathEventKind::ExactOpenQueued {
-                request_id: RequestId(7),
+                request_id: PathRequestId(7),
                 connection: id(2),
             },
         ));
@@ -506,7 +508,7 @@ mod tests {
                 &attempt,
                 now,
                 PathEventKind::ExactOpenFailed {
-                    request_id: RequestId(7),
+                    request_id: PathRequestId(7),
                     connection: id(2),
                 },
             )),
@@ -518,7 +520,7 @@ mod tests {
                     &attempt,
                     now,
                     PathEventKind::ExactOpenSucceeded {
-                        request_id: RequestId(7),
+                        request_id: PathRequestId(7),
                         connection: id(2),
                     },
                 ))
@@ -528,7 +530,7 @@ mod tests {
             &attempt,
             now,
             PathEventKind::ExactOpenQueued {
-                request_id: RequestId(8),
+                request_id: PathRequestId(8),
                 connection: id(1),
             },
         ));
@@ -537,13 +539,13 @@ mod tests {
                 &attempt,
                 now,
                 PathEventKind::ExactOpenFailed {
-                    request_id: RequestId(8),
+                    request_id: PathRequestId(8),
                     connection: id(1),
                 },
             )),
             vec![
                 PathAction::CancelOpen {
-                    request_id: RequestId(8)
+                    request_id: PathRequestId(8)
                 },
                 PathAction::Finish(PathFailure::ExactOpenFailed),
             ]
@@ -567,7 +569,7 @@ mod tests {
             &attempt,
             now,
             PathEventKind::ExactOpenQueued {
-                request_id: RequestId(1),
+                request_id: PathRequestId(1),
                 connection: id(2),
             },
         ));
@@ -575,7 +577,7 @@ mod tests {
             attempt.apply(event(&attempt, now, PathEventKind::Cancelled)),
             vec![
                 PathAction::CancelOpen {
-                    request_id: RequestId(1)
+                    request_id: PathRequestId(1)
                 },
                 PathAction::Finish(PathFailure::Cancelled),
             ]
@@ -604,7 +606,7 @@ mod tests {
             &attempt,
             now,
             PathEventKind::ExactOpenQueued {
-                request_id: RequestId(1),
+                request_id: PathRequestId(1),
                 connection: id(2),
             },
         ));
@@ -612,7 +614,7 @@ mod tests {
             &attempt,
             now,
             PathEventKind::ExactOpenSucceeded {
-                request_id: RequestId(1),
+                request_id: PathRequestId(1),
                 connection: id(2),
             },
         ));

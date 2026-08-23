@@ -19,7 +19,7 @@ use libp2p::{
     },
 };
 use p2x_net::{
-    AttemptId, PathAction, PathAttempt, PathDecision, PathEvent, PathEventKind,
+    AttemptId, PathAction, PathAttempt, PathDecision, PathEvent, PathEventKind, PathRequestId,
     auth_state::{
         AddressCursor, AuthAction, AuthState, ConnectionLoss, ExchangeConnections, PendingRequest,
         RedialBackoff,
@@ -222,8 +222,6 @@ fn drive_path_actions(
                 let now = std::time::Instant::now();
                 match behaviour.open_on(peer_id, connection) {
                     Ok(request_id) => {
-                        let path_request_id =
-                            p2x_net::probe_stream::handler::RequestId(request_id.0);
                         *launched += 1;
                         emitter.emit(&LifecycleRecord::PathSelected {
                             request_id: request_id.0,
@@ -240,7 +238,7 @@ fn drive_path_actions(
                             attempt_id: attempt.id,
                             now,
                             kind: PathEventKind::ExactOpenQueued {
-                                request_id: path_request_id,
+                                request_id: PathRequestId(request_id.0),
                                 connection,
                             },
                         }));
@@ -253,7 +251,7 @@ fn drive_path_actions(
                 }
             }
             PathAction::CancelOpen { request_id } => {
-                behaviour.cancel(request_id);
+                behaviour.cancel(p2x_net::probe_stream::handler::RequestId(request_id.0));
             }
             PathAction::DialRelay | PathAction::CloseStream | PathAction::Finish(_) => {}
         }
@@ -797,7 +795,7 @@ async fn main() -> io::Result<()> {
                         ProbeOutput::OutboundOpened { stream, request_id, peer_id, connection_id } => {
                             let mut stream = stream;
                             if let Some(current) = attempt.as_mut() {
-                                let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ExactOpenSucceeded { request_id: p2x_net::probe_stream::handler::RequestId(request_id.0), connection: connection_id } });
+                                let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ExactOpenSucceeded { request_id: PathRequestId(request_id.0), connection: connection_id } });
                                 drive_path_actions(probe_mut(&mut swarm)?, current, peer_id, &emitter, actions, &mut launched)?;
                                 let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::PayloadAccepted });
                                 drive_path_actions(probe_mut(&mut swarm)?, current, peer_id, &emitter, actions, &mut launched)?;
@@ -824,7 +822,7 @@ async fn main() -> io::Result<()> {
                         }
                         ProbeOutput::OutboundFailed { request_id, peer_id, connection_id, code } => {
                             if let Some(current) = attempt.as_mut() {
-                                let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ExactOpenFailed { request_id: p2x_net::probe_stream::handler::RequestId(request_id.0), connection: connection_id } });
+                                let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::ExactOpenFailed { request_id: PathRequestId(request_id.0), connection: connection_id } });
                                 drive_path_actions(probe_mut(&mut swarm)?, current, peer_id, &emitter, actions, &mut launched)?;
                             }
                             if args.recover_after_failure && !recovery_attempted {

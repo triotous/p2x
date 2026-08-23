@@ -147,7 +147,11 @@ fn selector(bytes: &[u8], position: &mut usize) -> Result<UnscopedSelector, Reso
             return Err(malformed());
         }
         previous = Some(key.as_str().to_owned());
-        let value = MetadataValue::new(&text(bytes, position)?).map_err(|_| malformed())?;
+        let raw_value = text(bytes, position)?;
+        let value = MetadataValue::new(&raw_value).map_err(|_| malformed())?;
+        if value.as_str() != raw_value {
+            return Err(malformed());
+        }
         if metadata.insert(key, value).is_some() {
             return Err(malformed());
         }
@@ -494,6 +498,26 @@ mod tests {
             Err(ResolveProtocolError::Malformed)
         );
     }
+    #[test]
+    fn non_canonical_trimmed_values_are_rejected() {
+        let request = ResolveRequestV1::Resolve {
+            request_id: [1; 16],
+            session_id: [2; 16],
+            selector: selector(),
+            client_capabilities: Capabilities::RELAY_V2,
+        };
+        let mut bytes = request.canonical_bytes().unwrap();
+        let value = bytes
+            .windows(2)
+            .position(|window| window == [0, 6])
+            .unwrap();
+        bytes.insert(value + 2, b' ');
+        assert_eq!(
+            ResolveRequestV1::decode(&bytes),
+            Err(ResolveProtocolError::Malformed)
+        );
+    }
+
     #[test]
     fn selector_order_is_required() {
         let request = ResolveRequestV1::Resolve {

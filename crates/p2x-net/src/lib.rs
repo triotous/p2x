@@ -19,7 +19,7 @@ pub use connection_book::{
 };
 pub use path_selector::{
     AttemptId, PathAction, PathAttempt, PathDecision, PathEvent, PathEventKind, PathFailure,
-    PathPolicy, PathState,
+    PathPolicy, PathRequestId, PathState,
 };
 pub use proxy_codec::{read_open, read_response, write_open, write_response};
 pub use registry_codec::{
