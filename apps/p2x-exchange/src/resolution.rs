@@ -282,7 +282,7 @@ impl<'a> Resolver<'a> {
         response: ResolveResponseV1,
         expires_at: i64,
     ) {
-        self.sweep(expires_at);
+        self.sweep(i64::MIN);
         let peer_count = self
             .idempotency
             .keys()
