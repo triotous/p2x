@@ -518,6 +518,17 @@ fn release_route_setup(
     }
 }
 
+fn route_proxy_rejection_needs_fresh_ticket(code: PublicErrorCode) -> bool {
+    matches!(
+        code,
+        PublicErrorCode::RegistryStaleRevision
+            | PublicErrorCode::AuthSessionRequired
+            | PublicErrorCode::PeerConnectionFailed
+            | PublicErrorCode::PeerSetupTimeout
+            | PublicErrorCode::ExchangeTimeout
+    )
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let started_at = std::time::Instant::now();
@@ -767,8 +778,13 @@ async fn main() -> io::Result<()> {
     let mut proxy_completed = 0u64;
     let proxy_target = args.test_proxy_open_count.unwrap_or(1);
     let proxy_concurrency = args.test_proxy_concurrency.unwrap_or(1);
-    let multi_proxy_mode = proxy_target > 1;
-    let mut route_owner = multi_proxy_mode.then(|| {
+    let supervised_proxy_mode = (args.finite_proxy_check || args.test_proxy_open_count.is_some())
+        && !args.test_replay_first_ticket
+        && matches!(args.test_open_mutation, OpenMutation::None)
+        && args.test_delay_after_resolve_ms.is_none()
+        && !args.test_fail_first_direct_open_before_handshake
+        && !args.recover_after_failure;
+    let mut route_owner = supervised_proxy_mode.then(|| {
         route_open::RouteOpenSupervisor::new(
             routes
                 .as_ref()
@@ -818,7 +834,7 @@ async fn main() -> io::Result<()> {
                     emitter.emit(&LifecycleRecord::OperationalError { code: "connection.outgoing", message: &message })?;
                 }
                 let now = std::time::Instant::now();
-                if multi_proxy_mode {
+                if supervised_proxy_mode {
                     let timed_out = route_resolve_wires
                         .iter()
                         .filter(|(_, (_, _, sent_at))| now.duration_since(*sent_at) >= std::time::Duration::from_secs(5))
@@ -1164,15 +1180,25 @@ async fn main() -> io::Result<()> {
                                 authorized: false,
                                 code: Some(code.as_str()),
                             })?;
-                            let proxy_wire_id = route_owner.as_ref().and_then(|owner| owner.proxy_request_id(open_id)).ok_or_else(|| io::Error::other("route proxy request missing"))?;
-                            let action = route_owner.as_mut().expect("multi-open owner exists").proxy_failed_at(
-                                &mut resolver_state,
-                                open_id,
-                                proxy_wire_id,
-                                route_open::RetryClass::Ambiguous,
-                                unix_now(),
-                                std::time::Instant::now(),
-                            );
+                            let action = if route_proxy_rejection_needs_fresh_ticket(code) {
+                                release_route_setup(
+                                    connection_manager.as_mut().expect("route connection manager exists"),
+                                    &mut swarm,
+                                    server,
+                                    open_id,
+                                );
+                                let proxy_wire_id = route_owner.as_ref().and_then(|owner| owner.proxy_request_id(open_id)).ok_or_else(|| io::Error::other("route proxy request missing"))?;
+                                route_owner.as_mut().expect("multi-open owner exists").proxy_failed_at(
+                                    &mut resolver_state,
+                                    open_id,
+                                    proxy_wire_id,
+                                    route_open::RetryClass::Ambiguous,
+                                    unix_now(),
+                                    std::time::Instant::now(),
+                                )
+                            } else {
+                                route_owner.as_mut().expect("multi-open owner exists").complete(open_id, Err(code))
+                            };
                             let completed_actions = drive_route_actions(
                                 &mut swarm,
                                 route_owner.as_mut().expect("multi-open owner exists"),
@@ -1418,10 +1444,10 @@ async fn main() -> io::Result<()> {
                                     return Ok(());
                                 }
                             }
-                            if multi_proxy_mode {
+                            if supervised_proxy_mode {
                                 // RouteOpenSupervisor already dispatched every matching path event.
                             } else if (args.finite_proxy_check || args.test_proxy_open_count.is_some())
-                                && !multi_proxy_mode
+                                && !supervised_proxy_mode
                                 && proxy_server == Some(peer_id)
                                 && let (Some(open), Some(deadline), Some(current)) = (proxy_open.as_ref().cloned(), proxy_setup_deadline, proxy_attempt.as_mut())
                             {
@@ -1491,7 +1517,7 @@ async fn main() -> io::Result<()> {
                         if let Some(binding) = auth_state.current_session(unix_now()).map(|session| session.principal_binding()) {
                             resolver_state.set_principal_binding(binding);
                         }
-                        if multi_proxy_mode {
+                        if supervised_proxy_mode {
                             let route = routes.as_ref().and_then(|config| config.routes.first()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proxy check requires a route"))?;
                             let session_id = auth_state.current_session_id(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?;
                             let binding = auth_state.current_session(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?.principal_binding();
@@ -1597,12 +1623,13 @@ async fn main() -> io::Result<()> {
                         let (open_id, wire_id, _) = route_resolve_wires.remove(&outbound_id).expect("checked route wire exists");
                         let request_id = route_owner.as_ref().and_then(|owner| owner.resolve_request_id(open_id)).ok_or_else(|| io::Error::other("route resolve request missing"))?;
                         let response_fingerprint = response.canonical_bytes().map(stable_hash).unwrap_or_default();
-                        let resolve_result = route_owner.as_mut().expect("multi-open owner exists").resolve_completed(
+                        let resolve_result = route_owner.as_mut().expect("multi-open owner exists").resolve_completed_at(
                             &mut resolver_state,
                             open_id,
                             wire_id,
                             response,
                             unix_now(),
+                            std::time::Instant::now(),
                         );
                         let mut actions = Vec::new();
                         match resolve_result {
@@ -2241,5 +2268,15 @@ mod tests {
 
         assert_eq!(launched, 0);
         assert!(opened.is_empty());
+    }
+
+    #[test]
+    fn capacity_rejections_are_terminal_for_a_route_open() {
+        assert!(!route_proxy_rejection_needs_fresh_ticket(
+            PublicErrorCode::LimitProxyStreams
+        ));
+        assert!(route_proxy_rejection_needs_fresh_ticket(
+            PublicErrorCode::RegistryStaleRevision
+        ));
     }
 }

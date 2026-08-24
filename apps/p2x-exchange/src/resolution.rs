@@ -15,6 +15,7 @@ const MIN_TICKET_LIFETIME: i64 = 5;
 const DEFAULT_TICKET_LIFETIME: i64 = 30;
 const MAX_IDEMPOTENCY_PER_CLIENT: usize = 128;
 const MAX_IDEMPOTENCY_GLOBAL: usize = 2_048;
+const MAX_TICKET_CLOCK_SKEW: i64 = 30;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CachedResponse {
@@ -363,7 +364,7 @@ impl<'a> Resolver<'a> {
 
     pub fn sweep(&mut self, now: i64) {
         self.idempotency
-            .retain(|_, cached| cached.expires_at.saturating_add(5) > now);
+            .retain(|_, cached| cached.expires_at.saturating_add(MAX_TICKET_CLOCK_SKEW) > now);
         self.admission.sweep(now);
     }
     pub fn clear(&mut self) {
@@ -536,6 +537,24 @@ mod tests {
         assert!(ResolutionLimits::new(0, 1, 1, 1).is_err());
         assert!(ResolutionLimits::new(1_024, 128, 1_200, 2_048).is_ok());
         assert!(ResolutionLimits::new(1_025, 1, 1, 1).is_err());
+    }
+
+    #[test]
+    fn idempotent_response_is_retained_through_maximum_ticket_skew() {
+        let key = TicketKey::from_seed([9; 32]);
+        let peer = PeerId::random();
+        let mut resolver = Resolver::new(PeerId::random(), &key);
+        resolver.cache(
+            peer,
+            [1; 16],
+            [2; 32],
+            rejected(Some([1; 16]), PublicErrorCode::RegistryOffline, true),
+            10,
+        );
+        resolver.sweep(39);
+        assert_eq!(resolver.cache_len(), 1);
+        resolver.sweep(40);
+        assert_eq!(resolver.cache_len(), 0);
     }
 
     #[test]

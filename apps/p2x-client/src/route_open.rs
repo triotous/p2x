@@ -197,6 +197,18 @@ impl RouteOpenSupervisor {
         response: ResolveResponseV1,
         now: i64,
     ) -> Result<Vec<RouteAction>, PublicErrorCode> {
+        self.resolve_completed_at(resolver, open_id, wire_id, response, now, Instant::now())
+    }
+
+    pub fn resolve_completed_at(
+        &mut self,
+        resolver: &mut ResolverState,
+        open_id: OpenId,
+        wire_id: u64,
+        response: ResolveResponseV1,
+        now: i64,
+        now_instant: Instant,
+    ) -> Result<Vec<RouteAction>, PublicErrorCode> {
         let open = self
             .opens
             .get_mut(&open_id)
@@ -205,6 +217,10 @@ impl RouteOpenSupervisor {
             return Err(PublicErrorCode::ProtocolMalformed);
         }
         open.resolve_wire_id = None;
+        if now_instant >= open.deadline {
+            resolver.cancel(open.resolve_request.resolve_request_id());
+            return Err(PublicErrorCode::PeerSetupTimeout);
+        }
         let grant = resolver.complete(
             response,
             &open.binding,
@@ -685,6 +701,26 @@ mod tests {
         }
         assert!(owner.resolve_sent(id, 8));
         assert!(owner.resolve_timed_out(id, 7, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn response_at_absolute_deadline_is_rejected_and_releases_resolver_owner() {
+        let mut owner = RouteOpenSupervisor::new(1);
+        let mut resolver = ResolverState::default();
+        let deadline = Instant::now() + std::time::Duration::from_millis(10);
+        let (id, _) = owner
+            .admit(&mut resolver, binding(), [2; 16], selector(), 1, deadline)
+            .unwrap();
+        assert!(owner.resolve_sent(id, 7));
+        let response = ResolveResponseV1::Rejected {
+            request_id: Some(request_id(1)),
+            error: p2x_protocol::PublicError::new(PublicErrorCode::RegistryOffline, true),
+        };
+        assert!(matches!(
+            owner.resolve_completed_at(&mut resolver, id, 7, response, 1, deadline),
+            Err(PublicErrorCode::PeerSetupTimeout)
+        ));
+        assert_eq!(resolver.pending(), 0);
     }
 
     #[test]

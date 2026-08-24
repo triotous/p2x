@@ -375,7 +375,13 @@ def finish_limits(run: Run, primary_log: pathlib.Path, secondary_log: pathlib.Pa
     primary_terminal = assert_one_terminal(primary_log)
     secondary_terminal = assert_one_terminal(secondary_log)
     expected_secondary = "limit.resolve_requests" if case == "resolve-limit" else "limit.proxy_streams"
-    if primary_terminal.get("code") != "proxy.authorized" or secondary_terminal.get("code") != expected_secondary:
+    terminal_codes = [primary_terminal.get("code"), secondary_terminal.get("code")]
+    terminals_match = (
+        sorted(terminal_codes) == sorted(["proxy.authorized", expected_secondary])
+        if case == "resolve-limit"
+        else terminal_codes == ["proxy.authorized", expected_secondary]
+    )
+    if not terminals_match:
         raise CaseFailure(
             f"limit terminals were unexpected: primary={primary_terminal.get('code')} secondary={secondary_terminal.get('code')}"
         )
