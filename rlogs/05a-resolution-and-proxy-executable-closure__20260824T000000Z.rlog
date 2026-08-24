@@ -34,3 +34,28 @@ validation:
 - cargo test -p p2x-server --all-targets --all-features: passed, including owner_pipeline.
 - server Clippy initially identified the public len/is_empty API requirement after library exposure; is_empty was added and final Clippy will be rerun before commit.
 blockers: none
+
+phase review remediation 3: deadline, retention, retry, and executable gate closure
+- Routed ordinary finite product opens through RouteOpenSupervisor, while retaining the focused legacy path only for explicit replay, mutation, delayed-response, direct-open fault, and restart-recovery diagnostics.
+- Enforced the single absolute route deadline when a resolve response arrives and added regression coverage proving the resolver owner is released at the boundary.
+- Retained exchange idempotency responses through the maximum supported 30-second ticket clock skew and added exact-boundary coverage.
+- Classified explicit proxy capacity rejection as terminal instead of ambiguous. Fresh-ticket retries now occur only for the bounded recoverable set and release the prior connection-manager waiter/setup ownership before retrying.
+- Made resolve-limit process evidence independent of client scheduling order: exactly one terminal must authorize and exactly one must reject with limit.resolve_requests, with exchange-side admission/ticket-state evidence still required.
+- Updated protocol, client-connection, and resolution-runner documentation to match executable owner, concurrency, retention, and atomic admission behavior.
+validation:
+- cargo fmt --all -- --check: passed.
+- cargo clippy --workspace --all-targets --all-features -- -D warnings: passed.
+- cargo test --workspace --all-targets --all-features: passed, including TCP/QUIC protocol networks and the real exchange-to-server owner pipeline.
+- tests/resolution/local.sh --case all: all product cases passed after individually re-running and closing proxy-limit and resolve-limit findings; concurrent-opens completed 128 opens with a 64-open window.
+- tests/auth/local.sh --case all: passed.
+- tests/registry/local.sh --case all: passed.
+- tests/connectivity/local.sh --case all: passed, including 64/128 concurrent and 100-cycle churn cases.
+- all seven nightly fuzz targets completed 1,000 runs without a crash; generated corpus noise was removed and committed representative corpus remained unchanged.
+- cargo deny check: passed (advisories, bans, licenses, sources; configured duplicate-version warnings only).
+- cargo tree -e features: passed.
+- git diff --check: passed; Plan 05a remained unchanged.
+remaining:
+- Only Plan 05a section 7.4 owner-executed deployment/platform validation remains deferred to the final project phase: Linux namespaces, two-host C14/product TCP+QUIC paths, real firewall/NAT packet evidence, Linux/native macOS behavior, and long soak/packaging.
+phase_gate:
+- All locally executable Definition of Done requirements pass. The branch is ready to proceed to Plan 06 without carrying unresolved local Plan 05a ownership or verification debt.
+blockers: none
