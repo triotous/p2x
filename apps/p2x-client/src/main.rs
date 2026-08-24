@@ -10,7 +10,7 @@ mod resolver;
 mod route_open;
 
 use clap::{Parser, ValueEnum};
-use connection_manager::{ConnectionManager, SetupLimits};
+use connection_manager::{ConnectionManager, ResolvedPeerMetadata, SetupLimits};
 use futures::StreamExt;
 use libp2p::{
     Multiaddr,
@@ -39,7 +39,7 @@ use p2x_protocol::{
     AuthRequest, AuthResponse, OpenProxyStreamV1, PublicErrorCode, ResolveRequestV1, Role,
 };
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     path::PathBuf,
 };
@@ -348,6 +348,176 @@ fn drive_proxy_path_actions(
     Ok(())
 }
 
+type MultiResolveWire = HashMap<
+    libp2p::request_response::OutboundRequestId,
+    (route_open::OpenId, u64, std::time::Instant),
+>;
+type RouteCompletion = (
+    route_open::OpenId,
+    Option<libp2p::PeerId>,
+    Result<(), PublicErrorCode>,
+);
+
+#[allow(clippy::too_many_arguments)]
+fn drive_route_actions(
+    swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
+    owner: &mut route_open::RouteOpenSupervisor,
+    exchange_peer: libp2p::PeerId,
+    emitter: &Emitter,
+    connections: &ConnectionBook,
+    resolve_wires: &mut MultiResolveWire,
+    proxy_requests: &mut HashMap<ProxyRequestId, route_open::OpenId>,
+    next_wire_id: &mut u64,
+    actions: Vec<route_open::RouteAction>,
+) -> io::Result<Vec<RouteCompletion>> {
+    let mut actions = VecDeque::from(actions);
+    let mut completed = Vec::new();
+    while let Some(action) = actions.pop_front() {
+        match action {
+            route_open::RouteAction::SendResolve { open_id, request } => {
+                *next_wire_id = next_wire_id
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("resolve wire ID exhausted"))?;
+                let outbound = swarm
+                    .behaviour_mut()
+                    .resolve
+                    .send_request(&exchange_peer, request);
+                if !owner.resolve_sent(open_id, *next_wire_id) {
+                    return Err(io::Error::other("route owner rejected resolve dispatch"));
+                }
+                resolve_wires.insert(
+                    outbound,
+                    (open_id, *next_wire_id, std::time::Instant::now()),
+                );
+            }
+            route_open::RouteAction::DialRelay {
+                open_id: _,
+                peer: _,
+                address,
+            } => {
+                let address = Multiaddr::try_from(address).map_err(io::Error::other)?;
+                swarm.dial(address).map_err(io::Error::other)?;
+            }
+            route_open::RouteAction::OpenExact {
+                open_id,
+                connection,
+                open,
+            } => {
+                let deadline = owner
+                    .path_input(open_id)
+                    .map(|input| input.5)
+                    .ok_or_else(|| io::Error::other("route path input missing"))?;
+                let peer = owner
+                    .path_input(open_id)
+                    .map(|input| input.0)
+                    .ok_or_else(|| io::Error::other("route peer missing"))?;
+                let request = swarm
+                    .behaviour_mut()
+                    .proxy_stream
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("proxy is unavailable in product mode"))?
+                    .open_on_at_deadline(
+                        peer,
+                        connection,
+                        open,
+                        std::time::Instant::now(),
+                        deadline,
+                    );
+                match request {
+                    Ok(request_id) => {
+                        if !owner.proxy_queued(open_id, request_id.0, connection) {
+                            return Err(io::Error::other("route owner rejected proxy dispatch"));
+                        }
+                        proxy_requests.insert(request_id, open_id);
+                        emitter.emit(&LifecycleRecord::PathSelected {
+                            request_id: request_id.0,
+                            connection_id_hash: stable_hash(connection),
+                            selected_path: if connections.is_direct(peer, connection) {
+                                ProbePath::Direct
+                            } else {
+                                ProbePath::Relay
+                            },
+                        })?;
+                    }
+                    Err(_) => {
+                        let attempt_id = owner
+                            .path_attempt_id(open_id)
+                            .ok_or_else(|| io::Error::other("route path attempt missing"))?;
+                        if let Some(next) = owner.path_event(
+                            open_id,
+                            PathEvent {
+                                attempt_id,
+                                now: std::time::Instant::now(),
+                                kind: PathEventKind::ExactOpenRejected { connection },
+                            },
+                        ) {
+                            actions.extend(next);
+                        }
+                    }
+                }
+            }
+            route_open::RouteAction::CloseConnection { connection, .. } => {
+                swarm.close_connection(connection);
+            }
+            route_open::RouteAction::Complete {
+                open_id,
+                server,
+                result,
+            } => completed.push((open_id, server, result)),
+            route_open::RouteAction::StartHandshakeWorker { .. } => {
+                return Err(io::Error::other(
+                    "handshake worker action must be dispatched from an opened stream",
+                ));
+            }
+        }
+    }
+    Ok(completed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_route_window(
+    owner: &mut route_open::RouteOpenSupervisor,
+    resolver: &mut resolver::ResolverState,
+    binding: p2x_net::auth_state::PrincipalBinding,
+    session_id: [u8; 16],
+    selector: &p2x_protocol::UnscopedSelector,
+    now: i64,
+    setup_budget: std::time::Duration,
+    target: u64,
+    concurrency: u64,
+    admitted: &mut u64,
+) -> Result<Vec<route_open::RouteAction>, PublicErrorCode> {
+    let mut actions = Vec::new();
+    while *admitted < target && owner.len() < concurrency as usize {
+        let (_, admitted_actions) = owner.admit(
+            resolver,
+            binding.clone(),
+            session_id,
+            selector.clone(),
+            now,
+            std::time::Instant::now() + setup_budget,
+        )?;
+        *admitted = admitted.saturating_add(1);
+        actions.extend(admitted_actions);
+    }
+    Ok(actions)
+}
+
+fn release_route_setup(
+    manager: &mut ConnectionManager,
+    swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
+    server: libp2p::PeerId,
+    waiter_id: route_open::OpenId,
+) {
+    manager.release_waiter(server, waiter_id.0);
+    let _ = manager.release(server);
+    for action in manager.pool_close_actions(server) {
+        if let connection_manager::ConnectionSetupAction::Close { connection } = action {
+            swarm.close_connection(connection);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let started_at = std::time::Instant::now();
@@ -596,7 +766,9 @@ async fn main() -> io::Result<()> {
     let mut replay_attempted = false;
     let mut proxy_completed = 0u64;
     let proxy_target = args.test_proxy_open_count.unwrap_or(1);
-    let _route_owner = route_test_hook_used.then(|| {
+    let proxy_concurrency = args.test_proxy_concurrency.unwrap_or(1);
+    let multi_proxy_mode = proxy_target > 1;
+    let mut route_owner = multi_proxy_mode.then(|| {
         route_open::RouteOpenSupervisor::new(
             routes
                 .as_ref()
@@ -605,6 +777,10 @@ async fn main() -> io::Result<()> {
                 }),
         )
     });
+    let mut route_admitted = 0u64;
+    let mut route_resolve_wires = MultiResolveWire::new();
+    let mut route_proxy_requests = HashMap::<ProxyRequestId, route_open::OpenId>::new();
+    let mut route_wire_sequence = 0u64;
     let mut proxy_request_id: Option<[u8; 16]> = None;
     let mut selected_proxy_connection: Option<libp2p::swarm::ConnectionId> = None;
     let mut test_direct_failure_applied = false;
@@ -615,6 +791,7 @@ async fn main() -> io::Result<()> {
     let mut pending_proxy: Option<ProxyRequestId> = None;
     let mut maintenance = tokio::time::interval(std::time::Duration::from_millis(100));
     struct ProxyResult {
+        open_id: Option<route_open::OpenId>,
         request_id: [u8; 16],
         result: Result<([u8; 16], [u8; 16]), PublicErrorCode>,
     }
@@ -641,6 +818,52 @@ async fn main() -> io::Result<()> {
                     emitter.emit(&LifecycleRecord::OperationalError { code: "connection.outgoing", message: &message })?;
                 }
                 let now = std::time::Instant::now();
+                if multi_proxy_mode {
+                    let timed_out = route_resolve_wires
+                        .iter()
+                        .filter(|(_, (_, _, sent_at))| now.duration_since(*sent_at) >= std::time::Duration::from_secs(5))
+                        .map(|(outbound, _)| *outbound)
+                        .collect::<Vec<_>>();
+                    for outbound in timed_out {
+                        let Some((open_id, wire_id, _)) = route_resolve_wires.remove(&outbound) else { continue; };
+                        let request_id = route_owner.as_ref().and_then(|owner| owner.resolve_request_id(open_id)).ok_or_else(|| io::Error::other("route resolve request missing"))?;
+                        let action = route_owner.as_mut().expect("multi-open owner exists").resolve_timed_out(open_id, wire_id, now);
+                        if matches!(action, Some(route_open::RouteAction::Complete { .. })) { resolver_state.cancel(request_id); }
+                        let completed_actions = drive_route_actions(
+                            &mut swarm,
+                            route_owner.as_mut().expect("multi-open owner exists"),
+                            expected_exchange,
+                            &emitter,
+                            &connections,
+                            &mut route_resolve_wires,
+                            &mut route_proxy_requests,
+                            &mut route_wire_sequence,
+                            action.into_iter().collect(),
+                        )?;
+                        if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
+                            if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
+                            emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                            return Ok(());
+                        }
+                    }
+                    let path_actions = route_owner.as_mut().expect("multi-open owner exists").tick_paths(now);
+                    let completed_actions = drive_route_actions(
+                        &mut swarm,
+                        route_owner.as_mut().expect("multi-open owner exists"),
+                        expected_exchange,
+                        &emitter,
+                        &connections,
+                        &mut route_resolve_wires,
+                        &mut route_proxy_requests,
+                        &mut route_wire_sequence,
+                        path_actions,
+                    )?;
+                    if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
+                        if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
+                        emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                        return Ok(());
+                    }
+                }
                 if deferred_resolve_retry_at.is_some_and(|due| due <= now)
                     && resolve_request.is_none()
                     && (exchange_restarted || recovery_resolve_retried)
@@ -801,7 +1024,9 @@ async fn main() -> io::Result<()> {
                         _ => {}
                     }
                 }
-                emitter.emit(&LifecycleRecord::Resources { connections: connections.len(), pending_opens: swarm.behaviour().probe_stream.as_ref().map_or(0, |probe| probe.pending_count()), workers: 0, tasks: 0 })?;
+                let proxy_pending = swarm.behaviour().proxy_stream.as_ref().map_or(0, |proxy| proxy.pending_count());
+                let route_pending = route_owner.as_ref().map_or(0, route_open::RouteOpenSupervisor::len);
+                emitter.emit(&LifecycleRecord::Resources { connections: connections.len(), pending_opens: proxy_pending.max(route_pending).max(swarm.behaviour().probe_stream.as_ref().map_or(0, |probe| probe.pending_count())), workers: route_owner.as_ref().map_or(0, route_open::RouteOpenSupervisor::handshake_count), tasks: 0 })?;
             }
             Some(worker) = worker_rx.recv() => {
                 let peer = worker.peer_id.to_string();
@@ -864,6 +1089,113 @@ async fn main() -> io::Result<()> {
                 }
             }
             Some(proxy_result) = proxy_result_rx.recv() => {
+                if let Some(open_id) = proxy_result.open_id {
+                    let (server, _, _, _, _, _) = route_owner.as_ref().and_then(|owner| owner.path_input(open_id)).ok_or_else(|| io::Error::other("route result owner missing"))?;
+                    let connection = route_owner.as_ref().and_then(|owner| owner.selected_connection(open_id)).ok_or_else(|| io::Error::other("route selected connection missing"))?;
+                    match proxy_result.result {
+                        Ok((request_id, stream_id)) => {
+                            emitter.emit(&LifecycleRecord::ProxyAuthorization {
+                                peer_id: &server.to_string(),
+                                connection_id_hash: stable_hash(connection),
+                                request_id_hash: stable_hash(request_id),
+                                stream_id_hash: Some(stable_hash(stream_id)),
+                                authorized: true,
+                                code: None,
+                            })?;
+                            let action = route_owner.as_mut().expect("multi-open owner exists").complete(open_id, Ok(())).ok_or_else(|| io::Error::other("route completion owner missing"))?;
+                            let completed_actions = drive_route_actions(
+                                &mut swarm,
+                                route_owner.as_mut().expect("multi-open owner exists"),
+                                expected_exchange,
+                                &emitter,
+                                &connections,
+                                &mut route_resolve_wires,
+                                &mut route_proxy_requests,
+                                &mut route_wire_sequence,
+                                vec![action],
+                            )?;
+                            for (_, completed_server, result) in completed_actions {
+                                result.map_err(|code| io::Error::other(code.as_str()))?;
+                                if let (Some(manager), Some(completed_server)) = (connection_manager.as_mut(), completed_server) {
+                                    release_route_setup(manager, &mut swarm, completed_server, open_id);
+                                }
+                            }
+                            proxy_completed = proxy_completed.saturating_add(1);
+                            if proxy_completed >= proxy_target {
+                                emitter.terminal(&TerminalResult::simple(&args.case_id, "passed", "proxy.authorized"))?;
+                                return Ok(());
+                            }
+                            let route = routes.as_ref().and_then(|config| config.routes.first()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proxy check requires a route"))?;
+                            let session_id = auth_state.current_session_id(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?;
+                            let binding = auth_state.current_session(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?.principal_binding();
+                            let setup_budget = std::time::Duration::from_millis(routes.as_ref().expect("routes are loaded").network.connection_setup_timeout_ms);
+                            let mut actions = admit_route_window(
+                                route_owner.as_mut().expect("multi-open owner exists"),
+                                &mut resolver_state,
+                                binding,
+                                session_id,
+                                &route.selector,
+                                unix_now(),
+                                setup_budget,
+                                proxy_target,
+                                proxy_concurrency,
+                                &mut route_admitted,
+                            ).map_err(|code| io::Error::other(code.as_str()))?;
+                            actions.extend(route_owner.as_mut().expect("multi-open owner exists").promote_waiters(&mut resolver_state));
+                            let completed_actions = drive_route_actions(
+                                &mut swarm,
+                                route_owner.as_mut().expect("multi-open owner exists"),
+                                expected_exchange,
+                                &emitter,
+                                &connections,
+                                &mut route_resolve_wires,
+                                &mut route_proxy_requests,
+                                &mut route_wire_sequence,
+                                actions,
+                            )?;
+                            if !completed_actions.is_empty() { return Err(io::Error::other("route replacement completed unexpectedly")); }
+                        }
+                        Err(code) => {
+                            emitter.emit(&LifecycleRecord::ProxyAuthorization {
+                                peer_id: &server.to_string(),
+                                connection_id_hash: stable_hash(connection),
+                                request_id_hash: stable_hash(proxy_result.request_id),
+                                stream_id_hash: None,
+                                authorized: false,
+                                code: Some(code.as_str()),
+                            })?;
+                            let proxy_wire_id = route_owner.as_ref().and_then(|owner| owner.proxy_request_id(open_id)).ok_or_else(|| io::Error::other("route proxy request missing"))?;
+                            let action = route_owner.as_mut().expect("multi-open owner exists").proxy_failed_at(
+                                &mut resolver_state,
+                                open_id,
+                                proxy_wire_id,
+                                route_open::RetryClass::Ambiguous,
+                                unix_now(),
+                                std::time::Instant::now(),
+                            );
+                            let completed_actions = drive_route_actions(
+                                &mut swarm,
+                                route_owner.as_mut().expect("multi-open owner exists"),
+                                expected_exchange,
+                                &emitter,
+                                &connections,
+                                &mut route_resolve_wires,
+                                &mut route_proxy_requests,
+                                &mut route_wire_sequence,
+                                action.into_iter().collect(),
+                            )?;
+                            if completed_actions.is_empty() && route_owner.as_ref().is_some_and(|owner| owner.len() > 0) {
+                                continue;
+                            }
+                            if let Some((_, completed_server, _)) = completed_actions.into_iter().next()
+                                && let Some(manager) = connection_manager.as_mut()
+                            { let _ = completed_server.map(|peer| manager.release(peer)); }
+                            emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
                 if proxy_request_id == Some(proxy_result.request_id) {
                     match proxy_result.result {
                         Ok((request_id, stream_id)) => {
@@ -1006,7 +1338,7 @@ async fn main() -> io::Result<()> {
                             }
                         }
                         if let Some(manager) = connection_manager.as_mut()
-                            && target_peer == Some(peer_id)
+                            && (target_peer == Some(peer_id) || manager.has_peer(peer_id))
                             && let Err(error) = manager.on_connection_established(
                                 peer_id,
                                 connection_id,
@@ -1022,14 +1354,74 @@ async fn main() -> io::Result<()> {
                             })?;
                             continue;
                         }
-                        if target_peer == Some(peer_id) {
+                        let route_peer = route_owner
+                            .as_ref()
+                            .is_some_and(|owner| !owner.open_ids_for_server(peer_id).is_empty());
+                        if target_peer == Some(peer_id) || route_peer {
                             if let Err(error) = connections.on_connection_established(peer_id, connection_id, &endpoint, std::time::Instant::now()) {
                                 swarm.close_connection(connection_id);
                                 let message = error.to_string();
                                 emitter.emit(&LifecycleRecord::OperationalError { code: "connection.rejected", message: &message })?;
                                 continue;
                             }
-                            if (args.finite_proxy_check || args.test_proxy_open_count.is_some())
+                            if route_peer {
+                                if observed_path == ProbePath::Relay
+                                    && let Some(manager) = connection_manager.as_mut()
+                                {
+                                    manager.relay_connection_ready(peer_id);
+                                    let _ = manager.begin_dcutr(peer_id);
+                                }
+                                let open_ids = route_owner
+                                    .as_ref()
+                                    .expect("multi-open owner exists")
+                                    .open_ids_for_server(peer_id);
+                                let mut actions = Vec::new();
+                                for open_id in open_ids {
+                                    let attempt_id = route_owner
+                                        .as_ref()
+                                        .and_then(|owner| owner.path_attempt_id(open_id))
+                                        .ok_or_else(|| io::Error::other("route path attempt missing"))?;
+                                    let kind = if observed_path == ProbePath::Relay {
+                                        PathEventKind::RelayReady(connection_id)
+                                    } else {
+                                        continue;
+                                    };
+                                    actions.extend(
+                                        route_owner
+                                            .as_mut()
+                                            .expect("multi-open owner exists")
+                                            .path_event(
+                                                open_id,
+                                                PathEvent {
+                                                    attempt_id,
+                                                    now: std::time::Instant::now(),
+                                                    kind,
+                                                },
+                                            )
+                                            .unwrap_or_default(),
+                                    );
+                                }
+                                let completed_actions = drive_route_actions(
+                                    &mut swarm,
+                                    route_owner.as_mut().expect("multi-open owner exists"),
+                                    expected_exchange,
+                                    &emitter,
+                                    &connections,
+                                    &mut route_resolve_wires,
+                                    &mut route_proxy_requests,
+                                    &mut route_wire_sequence,
+                                    actions,
+                                )?;
+                                if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
+                                    if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
+                                    emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                                    return Ok(());
+                                }
+                            }
+                            if multi_proxy_mode {
+                                // RouteOpenSupervisor already dispatched every matching path event.
+                            } else if (args.finite_proxy_check || args.test_proxy_open_count.is_some())
+                                && !multi_proxy_mode
                                 && proxy_server == Some(peer_id)
                                 && let (Some(open), Some(deadline), Some(current)) = (proxy_open.as_ref().cloned(), proxy_setup_deadline, proxy_attempt.as_mut())
                             {
@@ -1099,7 +1491,38 @@ async fn main() -> io::Result<()> {
                         if let Some(binding) = auth_state.current_session(unix_now()).map(|session| session.principal_binding()) {
                             resolver_state.set_principal_binding(binding);
                         }
-                        if args.finite_proxy_check || args.test_proxy_open_count.is_some() {
+                        if multi_proxy_mode {
+                            let route = routes.as_ref().and_then(|config| config.routes.first()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proxy check requires a route"))?;
+                            let session_id = auth_state.current_session_id(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?;
+                            let binding = auth_state.current_session(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?.principal_binding();
+                            let setup_budget = std::time::Duration::from_millis(routes.as_ref().expect("routes are loaded").network.connection_setup_timeout_ms);
+                            let actions = admit_route_window(
+                                route_owner.as_mut().expect("multi-open owner exists"),
+                                &mut resolver_state,
+                                binding,
+                                session_id,
+                                &route.selector,
+                                unix_now(),
+                                setup_budget,
+                                proxy_target,
+                                proxy_concurrency,
+                                &mut route_admitted,
+                            ).map_err(|code| io::Error::other(code.as_str()))?;
+                            let completed_actions = drive_route_actions(
+                                &mut swarm,
+                                route_owner.as_mut().expect("multi-open owner exists"),
+                                expected_exchange,
+                                &emitter,
+                                &connections,
+                                &mut route_resolve_wires,
+                                &mut route_proxy_requests,
+                                &mut route_wire_sequence,
+                                actions,
+                            )?;
+                            if !completed_actions.is_empty() {
+                                return Err(io::Error::other("route admission completed unexpectedly"));
+                            }
+                        } else if args.finite_proxy_check || args.test_proxy_open_count.is_some() {
                             let route = routes.as_ref().and_then(|config| config.routes.first()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proxy check requires a route"))?;
                             let session_id = auth_state.current_session_id(unix_now()).ok_or_else(|| io::Error::other("authenticated session expired"))?;
                             let request_id = request_ids.allocate().map_err(io::Error::other)?;
@@ -1145,6 +1568,100 @@ async fn main() -> io::Result<()> {
                         return Ok(());
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::OutboundFailure { request_id, error: libp2p::request_response::OutboundFailure::ConnectionClosed, .. })) if credential.is_some() => { pending_auth.complete(&request_id); }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Resolve(RequestResponseEvent::OutboundFailure { request_id: outbound_id, error: libp2p::request_response::OutboundFailure::Timeout, .. })) if route_resolve_wires.contains_key(&outbound_id) => {
+                        let (open_id, wire_id, _) = route_resolve_wires.remove(&outbound_id).expect("checked route wire exists");
+                        let request_id = route_owner.as_ref().and_then(|owner| owner.resolve_request_id(open_id)).ok_or_else(|| io::Error::other("route resolve request missing"))?;
+                        let owner = route_owner.as_mut().expect("multi-open owner exists");
+                        let action = owner.resolve_timed_out(open_id, wire_id, std::time::Instant::now());
+                        if matches!(action, Some(route_open::RouteAction::Complete { .. })) {
+                            resolver_state.cancel(request_id);
+                        }
+                        let completed_actions = drive_route_actions(
+                            &mut swarm,
+                            owner,
+                            expected_exchange,
+                            &emitter,
+                            &connections,
+                            &mut route_resolve_wires,
+                            &mut route_proxy_requests,
+                            &mut route_wire_sequence,
+                            action.into_iter().collect(),
+                        )?;
+                        if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
+                            if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
+                            emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                            return Ok(());
+                        }
+                    }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Resolve(RequestResponseEvent::Message { peer: _, message: RequestResponseMessage::Response { request_id: outbound_id, response }, .. })) if route_resolve_wires.contains_key(&outbound_id) => {
+                        let (open_id, wire_id, _) = route_resolve_wires.remove(&outbound_id).expect("checked route wire exists");
+                        let request_id = route_owner.as_ref().and_then(|owner| owner.resolve_request_id(open_id)).ok_or_else(|| io::Error::other("route resolve request missing"))?;
+                        let response_fingerprint = response.canonical_bytes().map(stable_hash).unwrap_or_default();
+                        let resolve_result = route_owner.as_mut().expect("multi-open owner exists").resolve_completed(
+                            &mut resolver_state,
+                            open_id,
+                            wire_id,
+                            response,
+                            unix_now(),
+                        );
+                        let mut actions = Vec::new();
+                        match resolve_result {
+                            Ok(_) => {
+                                emitter.emit(&LifecycleRecord::ResolutionOutcome {
+                                    peer_id: &expected_exchange.to_string(),
+                                    request_id_hash: stable_hash(request_id),
+                                    request_fingerprint: stable_hash(request_id),
+                                    response_fingerprint,
+                                    issuance_count: route_admitted,
+                                    resolved: true,
+                                    ticket_issued: true,
+                                    code: None,
+                                })?;
+                                let (server, capabilities, relay_address, revision, registration_expires_at, deadline) = route_owner.as_ref().expect("multi-open owner exists").path_input(open_id).ok_or_else(|| io::Error::other("resolved route path input missing"))?;
+                                let manager = connection_manager.as_mut().ok_or_else(|| io::Error::other("connection manager missing"))?;
+                                let started = std::time::Instant::now();
+                                let (attempt, path_actions) = manager.begin_path_at_deadline_with_capabilities(server, started, deadline, capabilities).map_err(|code| io::Error::other(code.as_str()))?;
+                                if !manager.track_waiter(server, open_id.0) { return Err(io::Error::other("connection manager rejected route waiter")); }
+                                manager.update_metadata(server, ResolvedPeerMetadata {
+                                    relay_addresses: vec![relay_address],
+                                    capabilities,
+                                    registration_revision: revision,
+                                    registration_expires_at,
+                                }).map_err(|code| io::Error::other(code.as_str()))?;
+                                actions.extend(route_owner.as_mut().expect("multi-open owner exists").begin_path(open_id, attempt, path_actions).ok_or_else(|| io::Error::other("route path admission missing"))?);
+                            }
+                            Err(code) => {
+                                emitter.emit(&LifecycleRecord::ResolutionOutcome {
+                                    peer_id: &expected_exchange.to_string(),
+                                    request_id_hash: stable_hash(request_id),
+                                    request_fingerprint: stable_hash(request_id),
+                                    response_fingerprint,
+                                    issuance_count: route_admitted,
+                                    resolved: false,
+                                    ticket_issued: false,
+                                    code: Some(code.as_str()),
+                                })?;
+                                if let Some(action) = route_owner.as_mut().expect("multi-open owner exists").complete(open_id, Err(code)) { actions.push(action); }
+                            }
+                        }
+                        actions.extend(route_owner.as_mut().expect("multi-open owner exists").promote_waiters(&mut resolver_state));
+                        let completed_actions = drive_route_actions(
+                            &mut swarm,
+                            route_owner.as_mut().expect("multi-open owner exists"),
+                            expected_exchange,
+                            &emitter,
+                            &connections,
+                            &mut route_resolve_wires,
+                            &mut route_proxy_requests,
+                            &mut route_wire_sequence,
+                            actions,
+                        )?;
+                        if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
+                            if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
+                            emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                            return Ok(());
+                        }
+                    }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Resolve(RequestResponseEvent::OutboundFailure { request_id: outbound_id, error: libp2p::request_response::OutboundFailure::Timeout, .. })) if pending_resolve.complete(&outbound_id) => {
                         let now = std::time::Instant::now();
                         resolve_sent_at = None;
@@ -1313,6 +1830,71 @@ async fn main() -> io::Result<()> {
                             }
                         }
                     }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Proxy(ProxyOutput::OutboundOpened { request_id, peer_id: _, connection_id, stream })) if route_proxy_requests.contains_key(&request_id) => {
+                        let open_id = route_proxy_requests.remove(&request_id).expect("checked route proxy request exists");
+                        let attempt_id = route_owner.as_ref().and_then(|owner| owner.path_attempt_id(open_id)).ok_or_else(|| io::Error::other("route path attempt missing"))?;
+                        let next_actions = route_owner.as_mut().expect("multi-open owner exists").path_event(
+                            open_id,
+                            PathEvent {
+                                attempt_id,
+                                now: std::time::Instant::now(),
+                                kind: PathEventKind::ExactOpenSucceeded { request_id: PathRequestId(request_id.0), connection: connection_id },
+                            },
+                        ).unwrap_or_default();
+                        let completed_actions = drive_route_actions(
+                            &mut swarm,
+                            route_owner.as_mut().expect("multi-open owner exists"),
+                            expected_exchange,
+                            &emitter,
+                            &connections,
+                            &mut route_resolve_wires,
+                            &mut route_proxy_requests,
+                            &mut route_wire_sequence,
+                            next_actions,
+                        )?;
+                        if !completed_actions.is_empty() { return Err(io::Error::other("route completed before handshake")); }
+                        let action = route_owner.as_mut().expect("multi-open owner exists").handshake_started(open_id, request_id.0).ok_or_else(|| io::Error::other("route handshake owner missing"))?;
+                        let route_open::RouteAction::StartHandshakeWorker { open, .. } = action else { return Err(io::Error::other("route handshake action mismatch")); };
+                        let deadline = route_owner.as_ref().and_then(|owner| owner.path_input(open_id)).map(|input| input.5).ok_or_else(|| io::Error::other("route deadline missing"))?;
+                        let hold = args.test_hold_proxy_handshake_ms.unwrap_or(0);
+                        if hold > 0 {
+                            emitter.emit(&LifecycleRecord::TestFaultApplied { fault: "hold_client_proxy_handshake" })?;
+                        }
+                        let tx = proxy_result_tx.clone();
+                        tokio::spawn(async move {
+                            if hold > 0 { tokio::time::sleep(std::time::Duration::from_millis(hold)).await; }
+                            let timeout = deadline.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_secs(5));
+                            let result = proxy_open::authorize_empty_stream(stream, &open, timeout).await;
+                            let _ = tx.send(ProxyResult { open_id: Some(open_id), request_id: open.request_id, result }).await;
+                        });
+                    }
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Proxy(ProxyOutput::OutboundFailed { request_id, peer_id: _, connection_id: _, code: _ })) if route_proxy_requests.contains_key(&request_id) => {
+                        let open_id = route_proxy_requests.remove(&request_id).expect("checked route proxy request exists");
+                        let action = route_owner.as_mut().expect("multi-open owner exists").proxy_failed_at(
+                            &mut resolver_state,
+                            open_id,
+                            request_id.0,
+                            route_open::RetryClass::PreHandshake,
+                            unix_now(),
+                            std::time::Instant::now(),
+                        );
+                        let completed_actions = drive_route_actions(
+                            &mut swarm,
+                            route_owner.as_mut().expect("multi-open owner exists"),
+                            expected_exchange,
+                            &emitter,
+                            &connections,
+                            &mut route_resolve_wires,
+                            &mut route_proxy_requests,
+                            &mut route_wire_sequence,
+                            action.into_iter().collect(),
+                        )?;
+                        if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
+                            if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
+                            emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                            return Ok(());
+                        }
+                    }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Proxy(ProxyOutput::OutboundOpened { request_id, peer_id, connection_id, stream })) if pending_proxy == Some(request_id) => {
                         let open = proxy_open.take().ok_or_else(|| io::Error::other("proxy stream opened without grant"))?;
                         if let Some(current) = proxy_attempt.as_mut() {
@@ -1324,7 +1906,13 @@ async fn main() -> io::Result<()> {
                         let tx = proxy_result_tx.clone();
                         tokio::spawn(async move {
                             let result = proxy_open::authorize_empty_stream(stream, &open, timeout).await;
-                            let _ = tx.send(ProxyResult { request_id: open.request_id, result }).await;
+                            let _ = tx
+                                .send(ProxyResult {
+                                    open_id: None,
+                                    request_id: open.request_id,
+                                    result,
+                                })
+                                .await;
                         });
                         let _ = (peer_id, connection_id, selected_proxy_connection, proxy_request_id);
                     }
@@ -1361,6 +1949,33 @@ async fn main() -> io::Result<()> {
                             manager.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?;
                         }
                         connections.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?;
+                        let open_ids = route_owner.as_ref().map_or_else(Vec::new, |owner| owner.open_ids_for_server(peer_id));
+                        if !open_ids.is_empty() {
+                            let mut actions = Vec::new();
+                            for open_id in open_ids {
+                                let attempt_id = route_owner.as_ref().and_then(|owner| owner.path_attempt_id(open_id)).ok_or_else(|| io::Error::other("route path attempt missing"))?;
+                                actions.extend(route_owner.as_mut().expect("multi-open owner exists").path_event(
+                                    open_id,
+                                    PathEvent { attempt_id, now: std::time::Instant::now(), kind: PathEventKind::ConnectionClosed(connection_id) },
+                                ).unwrap_or_default());
+                            }
+                            let completed_actions = drive_route_actions(
+                                &mut swarm,
+                                route_owner.as_mut().expect("multi-open owner exists"),
+                                expected_exchange,
+                                &emitter,
+                                &connections,
+                                &mut route_resolve_wires,
+                                &mut route_proxy_requests,
+                                &mut route_wire_sequence,
+                                actions,
+                            )?;
+                            if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
+                                if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
+                                emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                                return Ok(());
+                            }
+                        }
                         if let Some(current) = proxy_attempt.as_mut()
                             && proxy_server == Some(peer_id)
                         {
@@ -1481,6 +2096,34 @@ async fn main() -> io::Result<()> {
                                             std::time::Instant::now(),
                                         )
                                         .map_err(io::Error::other)?;
+                                    connections.on_dcutr_succeeded(event.remote_peer_id, connection_id, std::time::Instant::now()).map_err(io::Error::other)?;
+                                    let open_ids = route_owner.as_ref().map_or_else(Vec::new, |owner| owner.open_ids_for_server(event.remote_peer_id));
+                                    if !open_ids.is_empty() {
+                                        let mut actions = Vec::new();
+                                        for open_id in open_ids {
+                                            let attempt_id = route_owner.as_ref().and_then(|owner| owner.path_attempt_id(open_id)).ok_or_else(|| io::Error::other("route path attempt missing"))?;
+                                            actions.extend(route_owner.as_mut().expect("multi-open owner exists").path_event(
+                                                open_id,
+                                                PathEvent { attempt_id, now: std::time::Instant::now(), kind: PathEventKind::DirectReady(connection_id) },
+                                            ).unwrap_or_default());
+                                        }
+                                        let completed_actions = drive_route_actions(
+                                            &mut swarm,
+                                            route_owner.as_mut().expect("multi-open owner exists"),
+                                            expected_exchange,
+                                            &emitter,
+                                            &connections,
+                                            &mut route_resolve_wires,
+                                            &mut route_proxy_requests,
+                                            &mut route_wire_sequence,
+                                            actions,
+                                        )?;
+                                        if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
+                                            if let Some(server) = server { release_route_setup(manager, &mut swarm, server, failed_open); }
+                                            emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                                            return Ok(());
+                                        }
+                                    }
                                     if proxy_capabilities
                                     .is_some_and(|capabilities| capabilities.contains(p2x_protocol::Capabilities::DCUTR))
                                     && proxy_server == Some(event.remote_peer_id)
@@ -1494,7 +2137,9 @@ async fn main() -> io::Result<()> {
                                         }
                                     }
                                 }
-                                connections.on_dcutr_succeeded(event.remote_peer_id, connection_id, std::time::Instant::now()).map_err(io::Error::other)?;
+                                if connection_manager.as_ref().is_none_or(|manager| !manager.has_peer(event.remote_peer_id)) {
+                                    connections.on_dcutr_succeeded(event.remote_peer_id, connection_id, std::time::Instant::now()).map_err(io::Error::other)?;
+                                }
                                 if target_peer == Some(event.remote_peer_id)
                                     && forced_path_matches(args.path, ProbePath::Direct)
                                     && (!started || matches!(args.path, Path::Both))
@@ -1511,6 +2156,33 @@ async fn main() -> io::Result<()> {
                                 }
                             }
                             Err(error) => {
+                                let open_ids = route_owner.as_ref().map_or_else(Vec::new, |owner| owner.open_ids_for_server(event.remote_peer_id));
+                                if !open_ids.is_empty() {
+                                    let mut actions = Vec::new();
+                                    for open_id in open_ids {
+                                        let attempt_id = route_owner.as_ref().and_then(|owner| owner.path_attempt_id(open_id)).ok_or_else(|| io::Error::other("route path attempt missing"))?;
+                                        actions.extend(route_owner.as_mut().expect("multi-open owner exists").path_event(
+                                            open_id,
+                                            PathEvent { attempt_id, now: std::time::Instant::now(), kind: PathEventKind::DcutrFailed },
+                                        ).unwrap_or_default());
+                                    }
+                                    let completed_actions = drive_route_actions(
+                                        &mut swarm,
+                                        route_owner.as_mut().expect("multi-open owner exists"),
+                                        expected_exchange,
+                                        &emitter,
+                                        &connections,
+                                        &mut route_resolve_wires,
+                                        &mut route_proxy_requests,
+                                        &mut route_wire_sequence,
+                                        actions,
+                                    )?;
+                                    if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
+                                        if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
+                                        emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                                        return Ok(());
+                                    }
+                                }
                                 if let Some(current) = attempt.as_mut() {
                                     let actions = current.apply(PathEvent { attempt_id: current.id, now: std::time::Instant::now(), kind: PathEventKind::DcutrFailed });
                                     drive_path_actions(probe_mut(&mut swarm)?, current, event.remote_peer_id, &emitter, actions, &mut launched)?;

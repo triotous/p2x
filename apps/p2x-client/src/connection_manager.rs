@@ -1,7 +1,6 @@
 use libp2p::{PeerId, core::ConnectedPoint};
 use p2x_net::{ConnectionBook, ConnectionId, PathAttempt, PathDecision, PathEvent, PathPolicy};
-use p2x_protocol::Capabilities;
-use p2x_protocol::PublicErrorCode;
+use p2x_protocol::{Capabilities, PublicErrorCode, RegistrationRevision};
 use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
@@ -28,6 +27,15 @@ struct PeerState {
     relay_dial_active: bool,
     dcutr_generation: u64,
     waiters: HashSet<u64>,
+    metadata: Option<ResolvedPeerMetadata>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedPeerMetadata {
+    pub relay_addresses: Vec<Vec<u8>>,
+    pub capabilities: Capabilities,
+    pub registration_revision: RegistrationRevision,
+    pub registration_expires_at: i64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectionSetupAction {
@@ -84,6 +92,7 @@ impl ConnectionManager {
                 relay_dial_active: false,
                 dcutr_generation: 0,
                 waiters: HashSet::new(),
+                metadata: None,
             },
         );
         self.pending += 1;
@@ -123,8 +132,52 @@ impl ConnectionManager {
         true
     }
 
+    pub fn relay_connection_ready(&mut self, server: PeerId) -> bool {
+        let Some(state) = self.peers.get_mut(&server) else {
+            return false;
+        };
+        let was_active = state.relay_dial_active;
+        state.relay_dial_active = false;
+        was_active
+    }
+
+    pub fn update_metadata(
+        &mut self,
+        server: PeerId,
+        metadata: ResolvedPeerMetadata,
+    ) -> Result<(), PublicErrorCode> {
+        let state = self
+            .peers
+            .get_mut(&server)
+            .ok_or(PublicErrorCode::LimitPeerConnections)?;
+        if state
+            .metadata
+            .as_ref()
+            .is_some_and(|current| current.registration_revision != metadata.registration_revision)
+        {
+            state.relay_dial_generation = state.relay_dial_generation.saturating_add(1);
+            state.relay_dial_active = false;
+            state.dcutr_generation = state.dcutr_generation.saturating_add(1);
+        }
+        state.metadata = Some(metadata);
+        Ok(())
+    }
+
+    pub fn metadata(&self, server: PeerId, now: i64) -> Option<&ResolvedPeerMetadata> {
+        self.peers
+            .get(&server)
+            .and_then(|state| state.metadata.as_ref())
+            .filter(|metadata| metadata.registration_expires_at > now)
+    }
+
     pub fn begin_dcutr(&mut self, server: PeerId) -> Option<ConnectionSetupAction> {
         let state = self.peers.get_mut(&server)?;
+        if !state.metadata.as_ref().is_some_and(|metadata| {
+            metadata.capabilities.contains(Capabilities::DCUTR)
+                && metadata.capabilities.direct_transport()
+        }) {
+            return None;
+        }
         if state.book.direct(server).is_some() {
             return None;
         }
@@ -144,6 +197,12 @@ impl ConnectionManager {
         self.peers
             .get_mut(&server)
             .is_some_and(|state| state.waiters.remove(&waiter_id))
+    }
+
+    pub fn track_waiter(&mut self, server: PeerId, waiter_id: u64) -> bool {
+        self.peers
+            .get_mut(&server)
+            .is_some_and(|state| state.waiters.insert(waiter_id))
     }
 
     pub fn pool_close_actions(&mut self, server: PeerId) -> Vec<ConnectionSetupAction> {
@@ -339,6 +398,7 @@ impl ConnectionManager {
             now,
             kind: p2x_net::PathEventKind::Begin { relay, direct },
         });
+        let actions = self.coordinate_relay_dial(server, actions);
         Ok((attempt, actions))
     }
 
@@ -400,7 +460,29 @@ impl ConnectionManager {
             now: started,
             kind: p2x_net::PathEventKind::Begin { relay, direct },
         });
+        let actions = self.coordinate_relay_dial(server, actions);
         Ok((attempt, actions))
+    }
+
+    fn coordinate_relay_dial(
+        &mut self,
+        server: PeerId,
+        mut actions: Vec<p2x_net::PathAction>,
+    ) -> Vec<p2x_net::PathAction> {
+        if !actions
+            .iter()
+            .any(|action| matches!(action, p2x_net::PathAction::DialRelay))
+        {
+            return actions;
+        }
+        let state = self.peers.get_mut(&server).expect("admitted peer exists");
+        if state.relay_dial_active {
+            actions.retain(|action| !matches!(action, p2x_net::PathAction::DialRelay));
+        } else {
+            state.relay_dial_generation = state.relay_dial_generation.saturating_add(1);
+            state.relay_dial_active = true;
+        }
+        actions
     }
 
     fn evict(&mut self) -> Result<(), PublicErrorCode> {
@@ -496,6 +578,67 @@ mod tests {
         assert_eq!(manager.waiter_count(server), 2);
         assert!(manager.release_waiter(server, 1));
         assert!(!manager.release_waiter(server, 1));
+    }
+
+    #[test]
+    fn path_setup_emits_one_relay_dial_for_joined_waiters() {
+        let server = PeerId::random();
+        let mut manager = ConnectionManager::new(
+            PeerId::random(),
+            PathPolicy::default(),
+            SetupLimits {
+                max_peer_states: 1,
+                max_pending_setups: 4,
+                max_pending_per_server: 4,
+            },
+        );
+        let (_, first) = manager.begin_path(server, Instant::now()).unwrap();
+        let (_, joined) = manager.begin_path(server, Instant::now()).unwrap();
+        assert!(
+            first
+                .iter()
+                .any(|action| matches!(action, p2x_net::PathAction::DialRelay))
+        );
+        assert!(
+            !joined
+                .iter()
+                .any(|action| matches!(action, p2x_net::PathAction::DialRelay))
+        );
+        assert!(manager.relay_connection_ready(server));
+        assert!(!manager.relay_connection_ready(server));
+    }
+
+    #[test]
+    fn registration_revision_replacement_invalidates_setup_generations() {
+        let server = PeerId::random();
+        let mut manager = ConnectionManager::new(
+            PeerId::random(),
+            PathPolicy::default(),
+            SetupLimits {
+                max_peer_states: 1,
+                max_pending_setups: 4,
+                max_pending_per_server: 4,
+            },
+        );
+        manager.admit(server).unwrap();
+        let first = ResolvedPeerMetadata {
+            relay_addresses: vec![vec![1]],
+            capabilities: Capabilities::RELAY_V2,
+            registration_revision: RegistrationRevision::new(1).unwrap(),
+            registration_expires_at: 10,
+        };
+        manager.update_metadata(server, first.clone()).unwrap();
+        assert_eq!(manager.metadata(server, 9), Some(&first));
+        assert!(manager.metadata(server, 10).is_none());
+        let replacement = ResolvedPeerMetadata {
+            registration_revision: RegistrationRevision::new(2).unwrap(),
+            registration_expires_at: 20,
+            ..first
+        };
+        manager
+            .update_metadata(server, replacement.clone())
+            .unwrap();
+        assert_eq!(manager.metadata(server, 19), Some(&replacement));
     }
 
     #[test]

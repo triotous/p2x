@@ -1,10 +1,6 @@
 #[allow(dead_code)]
 mod availability;
 mod config;
-#[allow(dead_code)]
-mod proxy_open;
-mod ticket_admission;
-
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::{
@@ -36,6 +32,7 @@ use p2x_protocol::{
     AuthRequest, AuthResponse, Capabilities, InstanceId, PublicErrorCode, RegistryRequestV1,
     RegistryResponseV1, Role,
 };
+use p2x_server::{proxy_open, ticket_admission};
 use std::{collections::HashMap, io, path::PathBuf};
 use tokio::sync::mpsc;
 
@@ -641,7 +638,7 @@ async fn main() -> io::Result<()> {
                                             Err(code) => ticket_admission::TicketAdmission::Rejected(code),
                                         };
                                         match admission {
-                                            ticket_admission::TicketAdmission::Authorized(_) => proxy_open::random_stream_id().map(|stream_id| p2x_protocol::ProxyOpenResponseV1::Authorized { request_id: open.request_id, stream_id }).unwrap_or_else(|code| p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: Some(open.request_id), error: p2x_protocol::PublicError::new(code, true) }),
+                                            ticket_admission::TicketAdmission::Authorized(stream_id) => p2x_protocol::ProxyOpenResponseV1::Authorized { request_id: open.request_id, stream_id },
                                             ticket_admission::TicketAdmission::Rejected(code) => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: Some(open.request_id), error: p2x_protocol::PublicError::new(code, matches!(code, PublicErrorCode::RegistryStaleRevision | PublicErrorCode::LimitProxyStreams)) },
                                         }
                                     },

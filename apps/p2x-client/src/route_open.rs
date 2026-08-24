@@ -29,6 +29,11 @@ pub enum RouteAction {
         connection: p2x_net::ConnectionId,
         open: OpenProxyStreamV1,
     },
+    DialRelay {
+        open_id: OpenId,
+        peer: PeerId,
+        address: Vec<u8>,
+    },
     StartHandshakeWorker {
         open_id: OpenId,
         proxy_request_id: u64,
@@ -41,6 +46,7 @@ pub enum RouteAction {
     },
     Complete {
         open_id: OpenId,
+        server: Option<PeerId>,
         result: Result<(), PublicErrorCode>,
     },
 }
@@ -251,6 +257,84 @@ impl RouteOpenSupervisor {
         Some(self.convert_path_actions(open_id, actions))
     }
 
+    pub fn path_input(
+        &self,
+        open_id: OpenId,
+    ) -> Option<(
+        PeerId,
+        p2x_protocol::Capabilities,
+        Vec<u8>,
+        p2x_protocol::RegistrationRevision,
+        i64,
+        Instant,
+    )> {
+        let open = self.opens.get(&open_id)?;
+        let grant = open.grant.as_ref()?;
+        Some((
+            grant.metadata.server_peer_id,
+            grant.metadata.compatible_capabilities,
+            grant.metadata.relay_addresses.first()?.clone(),
+            grant.metadata.registration_revision,
+            grant.metadata.registration_expires_at,
+            open.deadline,
+        ))
+    }
+
+    pub fn resolve_request_id(&self, open_id: OpenId) -> Option<[u8; 16]> {
+        self.opens
+            .get(&open_id)
+            .map(|open| open.resolve_request.resolve_request_id())
+    }
+
+    pub fn selected_connection(&self, open_id: OpenId) -> Option<p2x_net::ConnectionId> {
+        self.opens
+            .get(&open_id)
+            .and_then(|open| open.selected_connection)
+    }
+
+    pub fn proxy_request_id(&self, open_id: OpenId) -> Option<u64> {
+        self.opens
+            .get(&open_id)
+            .and_then(|open| open.proxy_request_id)
+    }
+
+    pub fn open_ids_for_server(&self, server: PeerId) -> Vec<OpenId> {
+        self.opens
+            .iter()
+            .filter_map(|(open_id, open)| {
+                (open.server_peer_id == Some(server) && open.path_attempt.is_some())
+                    .then_some(*open_id)
+            })
+            .collect()
+    }
+
+    pub fn path_attempt_id(&self, open_id: OpenId) -> Option<p2x_net::AttemptId> {
+        self.opens
+            .get(&open_id)
+            .and_then(|open| open.path_attempt.as_ref())
+            .map(|attempt| attempt.id)
+    }
+
+    pub fn tick_paths(&mut self, now: Instant) -> Vec<RouteAction> {
+        let open_ids = self.opens.keys().copied().collect::<Vec<_>>();
+        let mut result = Vec::new();
+        for open_id in open_ids {
+            let Some(open) = self.opens.get_mut(&open_id) else {
+                continue;
+            };
+            let Some(attempt) = open.path_attempt.as_mut() else {
+                continue;
+            };
+            let actions = attempt.apply(PathEvent {
+                attempt_id: attempt.id,
+                now,
+                kind: PathEventKind::DirectDeadlineElapsed,
+            });
+            result.extend(self.convert_path_actions(open_id, actions));
+        }
+        result
+    }
+
     pub fn proxy_queued(
         &mut self,
         open_id: OpenId,
@@ -295,6 +379,25 @@ impl RouteOpenSupervisor {
         class: RetryClass,
         now: i64,
     ) -> Option<RouteAction> {
+        self.proxy_failed_at(
+            resolver,
+            open_id,
+            proxy_request_id,
+            class,
+            now,
+            Instant::now(),
+        )
+    }
+
+    pub fn proxy_failed_at(
+        &mut self,
+        resolver: &mut ResolverState,
+        open_id: OpenId,
+        proxy_request_id: u64,
+        class: RetryClass,
+        now: i64,
+        now_instant: Instant,
+    ) -> Option<RouteAction> {
         let fresh_request_id =
             matches!(class, RetryClass::Ambiguous).then(|| self.next_request_id());
         let open = self.opens.get_mut(&open_id)?;
@@ -306,7 +409,7 @@ impl RouteOpenSupervisor {
             let connection = open.selected_connection?;
             let actions = open.path_attempt.as_mut()?.apply(PathEvent {
                 attempt_id,
-                now: now_as_instant(),
+                now: now_instant,
                 kind: PathEventKind::ExactOpenFailed {
                     request_id: PathRequestId(proxy_request_id),
                     connection,
@@ -319,7 +422,7 @@ impl RouteOpenSupervisor {
                 .into_iter()
                 .next();
         }
-        if open.fresh_ticket_retries == 0 && now_as_instant() < open.deadline {
+        if open.fresh_ticket_retries == 0 && now_instant < open.deadline {
             open.fresh_ticket_retries = 1;
             open.grant = None;
             open.proxy_request_id = None;
@@ -347,6 +450,7 @@ impl RouteOpenSupervisor {
         resolver.cancel(request_id);
         Some(RouteAction::Complete {
             open_id,
+            server: open.server_peer_id,
             result: Err(PublicErrorCode::PeerSetupTimeout),
         })
     }
@@ -411,6 +515,7 @@ impl RouteOpenSupervisor {
                 }),
                 p2x_net::PathAction::Finish(reason) => Some(RouteAction::Complete {
                     open_id,
+                    server: open.server_peer_id,
                     result: Err(match reason {
                         p2x_net::PathFailure::SetupExpired => PublicErrorCode::PeerSetupTimeout,
                         _ => PublicErrorCode::PeerConnectionFailed,
@@ -420,26 +525,39 @@ impl RouteOpenSupervisor {
                     open_id,
                     connection: open.selected_connection?,
                 }),
-                p2x_net::PathAction::CancelOpen { .. } | p2x_net::PathAction::DialRelay => None,
+                p2x_net::PathAction::DialRelay => Some(RouteAction::DialRelay {
+                    open_id,
+                    peer: open.server_peer_id?,
+                    address: open
+                        .grant
+                        .as_ref()?
+                        .metadata
+                        .relay_addresses
+                        .first()?
+                        .clone(),
+                }),
+                p2x_net::PathAction::CancelOpen { .. } => None,
             })
             .collect()
     }
 
     fn finish(&mut self, open_id: OpenId, result: Result<(), PublicErrorCode>) -> RouteAction {
+        let mut server = None;
         if let Some(mut open) = self.opens.remove(&open_id) {
             open.terminal_delivered = true;
+            server = open.server_peer_id;
         }
-        RouteAction::Complete { open_id, result }
+        RouteAction::Complete {
+            open_id,
+            server,
+            result,
+        }
     }
 
     fn next_request_id(&mut self) -> [u8; 16] {
         self.next_request_id = self.next_request_id.saturating_add(1);
         request_id(self.next_request_id)
     }
-}
-
-fn now_as_instant() -> Instant {
-    Instant::now()
 }
 
 fn request_id(counter: u64) -> [u8; 16] {
@@ -510,6 +628,33 @@ mod tests {
         assert!(owner.cancel(&mut resolver, id).is_some());
         assert!(owner.cancel(&mut resolver, id).is_none());
         assert_eq!(owner.len(), 0);
+    }
+
+    #[test]
+    fn concurrent_same_selector_opens_have_distinct_ids_and_one_wire_owner() {
+        let mut owner = RouteOpenSupervisor::new(64);
+        let mut resolver = ResolverState::default();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let mut ids = std::collections::HashSet::new();
+        let mut sends = 0;
+        for _ in 0..64 {
+            let (id, actions) = owner
+                .admit(&mut resolver, binding(), [2; 16], selector(), 1, deadline)
+                .unwrap();
+            assert!(ids.insert(id));
+            sends += actions
+                .iter()
+                .filter(|action| matches!(action, RouteAction::SendResolve { .. }))
+                .count();
+        }
+        assert_eq!(owner.len(), 64);
+        assert_eq!(resolver.waiter_count(), 64);
+        assert_eq!(resolver.pending(), 1);
+        assert_eq!(sends, 1);
+        assert!(matches!(
+            owner.admit(&mut resolver, binding(), [2; 16], selector(), 1, deadline,),
+            Err(PublicErrorCode::LimitProxyStreams)
+        ));
     }
 
     #[test]

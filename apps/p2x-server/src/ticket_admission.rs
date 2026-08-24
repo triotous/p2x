@@ -26,11 +26,11 @@ struct ReplayEntry {
     expires_at: i64,
     owner_fingerprint: [u8; 32],
 }
-#[derive(Debug)]
 pub struct TicketAdmissionLedger {
     capacity: usize,
     clock_skew: i64,
     replay: HashMap<[u8; 16], ReplayEntry>,
+    stream_id_source: Box<dyn FnMut() -> Result<[u8; 16], PublicErrorCode>>,
 }
 impl Default for TicketAdmissionLedger {
     fn default() -> Self {
@@ -46,7 +46,17 @@ impl TicketAdmissionLedger {
             capacity,
             clock_skew,
             replay: HashMap::new(),
+            stream_id_source: Box::new(random_stream_id),
         })
+    }
+
+    #[cfg(test)]
+    fn with_stream_id_source(
+        mut self,
+        source: impl FnMut() -> Result<[u8; 16], PublicErrorCode> + 'static,
+    ) -> Self {
+        self.stream_id_source = Box::new(source);
+        self
     }
     #[allow(dead_code, clippy::too_many_arguments)]
     pub fn authorize_open(
@@ -138,6 +148,10 @@ impl TicketAdmissionLedger {
         if self.replay.len() >= self.capacity {
             return TicketAdmission::Rejected(PublicErrorCode::LimitProxyStreams);
         }
+        let stream_id = match (self.stream_id_source)() {
+            Ok(stream_id) => stream_id,
+            Err(code) => return TicketAdmission::Rejected(code),
+        };
         self.replay.insert(
             candidate.ticket_id,
             ReplayEntry {
@@ -145,7 +159,7 @@ impl TicketAdmissionLedger {
                 owner_fingerprint: candidate.owner_fingerprint,
             },
         );
-        TicketAdmission::Authorized(candidate.ticket_id)
+        TicketAdmission::Authorized(stream_id)
     }
 
     #[allow(dead_code, clippy::too_many_arguments)]
@@ -230,6 +244,10 @@ impl TicketAdmissionLedger {
         self.replay.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.replay.is_empty()
+    }
+
     #[allow(dead_code)]
     pub fn clock_skew(&self) -> i64 {
         self.clock_skew
@@ -243,6 +261,12 @@ impl TicketAdmissionLedger {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+}
+
+fn random_stream_id() -> Result<[u8; 16], PublicErrorCode> {
+    let mut stream_id = [0u8; 16];
+    getrandom::fill(&mut stream_id).map_err(|_| PublicErrorCode::LimitProxyStreams)?;
+    Ok(stream_id)
 }
 #[cfg(test)]
 mod tests {
@@ -285,17 +309,54 @@ mod tests {
             now: 15,
             clock_skew: 0,
         };
-        let mut admission = TicketAdmissionLedger::new(1, 0).unwrap();
+        let mut admission = TicketAdmissionLedger::new(1, 0)
+            .unwrap()
+            .with_stream_id_source(|| Ok([9; 16]));
         assert_eq!(
             admission.validate_and_consume(&ring, envelope.as_bytes(), &expected, [7; 32]),
             TicketAdmission::Rejected(PublicErrorCode::AuthTicketInvalid)
         );
         expected.upstream_id = "orders";
-        assert!(matches!(
+        assert_eq!(
             admission.validate_and_consume(&ring, envelope.as_bytes(), &expected, [7; 32]),
-            TicketAdmission::Authorized([5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5])
-        ));
+            TicketAdmission::Authorized([9; 16])
+        );
         assert_eq!(admission.len(), 1);
+    }
+
+    #[test]
+    fn stream_id_failure_does_not_consume_replay_capacity() {
+        let peer = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = libp2p::PeerId::from_public_key(&peer.public()).to_bytes();
+        let claims = ConnectionTicketClaimsV1::new(
+            peer_id.clone(),
+            "tenant".into(),
+            peer_id.clone(),
+            peer_id,
+            "orders".into(),
+            [4; 32],
+            1,
+            1,
+            p2x_protocol::Scope::OpenProxyStream.bit(),
+            10,
+            20,
+            [5; 16],
+            1,
+        )
+        .unwrap();
+        let candidate = ValidationCandidate {
+            ticket_id: [5; 16],
+            claims,
+            owner_fingerprint: [6; 32],
+        };
+        let mut admission = TicketAdmissionLedger::new(1, 0)
+            .unwrap()
+            .with_stream_id_source(|| Err(PublicErrorCode::LimitProxyStreams));
+        assert_eq!(
+            admission.consume_candidate(candidate, 11),
+            TicketAdmission::Rejected(PublicErrorCode::LimitProxyStreams)
+        );
+        assert_eq!(admission.len(), 0);
     }
 
     #[test]

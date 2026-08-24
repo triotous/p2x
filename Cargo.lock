@@ -2194,6 +2194,7 @@ dependencies = [
  "getrandom 0.3.4",
  "libp2p",
  "p2x-config",
+ "p2x-exchange",
  "p2x-net",
  "p2x-protocol",
  "serde",

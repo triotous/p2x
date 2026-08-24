@@ -1,0 +1,36 @@
+session: 20260824T000000Z
+plan: plan/05a-resolution-and-proxy-executable-closure.md
+status: review started
+baseline: b06f299
+actions:
+- Read the coding-rust instructions and the complete Plan 05a without modifying the plan.
+- Confirmed the worktree was clean and inspected every Plan 05a commit and the prior execution log.
+- Began an evidence-first review of the client route owner, connection manager, server admission split, protocol tests, fuzz corpus, and canonical process runner.
+findings:
+- The client constructs RouteOpenSupervisor only as an unused `_route_owner`; product resolution/proxy dispatch still uses one global resolve request, path attempt, proxy request, selected connection, and terminal state.
+- `--test-proxy-concurrency` is validated but is not consumed by the product proxy state machine. The concurrent-opens case counts 64 sequential opens from one process and therefore does not prove 64 simultaneous independently correlated opens.
+- The new ConnectionManager relay singleflight, DCUtR generation, waiter, and surplus-close APIs are covered by state tests but are not dispatched by client main.
+- The same-process p2x-net resolve/proxy tests still fabricate Resolved and Authorized responses instead of running the exchange resolution and server ticket owners required by Plan 05a section 5.3.
+decision:
+- The previous completed status is not accepted. Correct locally automatable implementation/evidence gaps before re-running the phase gate.
+blockers: none
+
+phase review remediation 1: product multi-open ownership
+- Integrated RouteOpenSupervisor into the real client swarm path for finite multi-open execution instead of constructing it as an unused value.
+- Added independently correlated resolve wire IDs, proxy request IDs, path attempts, handshake workers, absolute deadlines, terminal release, and a bounded owner window.
+- Wired same-selector FIFO promotion, one exact resolve retransmission, path timeout processing, connection event fan-out, direct/relay exact-open dispatch, and worker result correlation.
+- ConnectionManager now stores validated relay/capability/revision/expiry metadata, coordinates one relay dial for joined waiters, owns DCUtR generations, tracks waiter IDs, and dispatches surplus close actions after release.
+- Strengthened concurrent-opens from 64 sequential results to 128 total opens through a real 64-open owner window; the runner requires an observed peak of exactly 64 and all 128 unique Resolve, path, ticket, and stream correlations.
+validation:
+- cargo test -p p2x-client --all-targets --all-features: passed (25 tests).
+- cargo clippy -p p2x-client --all-targets --all-features -- -D warnings: passed.
+- tests/resolution/local.sh --case connection-reuse: passed with real product binaries.
+- tests/resolution/local.sh --case concurrent-opens: passed with 128 total opens and a 64-open owner window.
+
+phase review remediation 2: atomic server admission and owner pipeline
+- Moved stream-ID allocation into TicketAdmissionLedger so live recheck, replay consume, and stream allocation form one owner transition; randomness failure leaves replay capacity untouched.
+- Exposed the server admission modules through the package library and added a same-process integration test that sends a ticket issued by the actual exchange Resolver/Registry through immutable verification, live server admission, stream allocation, and replay rejection.
+validation:
+- cargo test -p p2x-server --all-targets --all-features: passed, including owner_pipeline.
+- server Clippy initially identified the public len/is_empty API requirement after library exposure; is_empty was added and final Clippy will be rerun before commit.
+blockers: none

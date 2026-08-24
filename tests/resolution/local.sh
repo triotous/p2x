@@ -472,8 +472,8 @@ def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathli
     elif case in ("connection-reuse", "concurrent-opens"):
         if len(resolution_client) != len(resolution_exchange) or len(resolution_client) < 2:
             raise CaseFailure(f"multi-open resolution cardinality: client={len(resolution_client)} exchange={len(resolution_exchange)}")
-        if case == "concurrent-opens" and len(resolution_client) != 64:
-            raise CaseFailure(f"concurrent-opens expected 64 resolutions, got {len(resolution_client)}")
+        if case == "concurrent-opens" and len(resolution_client) != 128:
+            raise CaseFailure(f"concurrent-opens expected 128 headroom resolutions, got {len(resolution_client)}")
     elif len(resolution_client) != 1 or len(resolution_exchange) != 1:
         raise CaseFailure(f"resolution outcome cardinality: client={len(resolution_client)} exchange={len(resolution_exchange)}")
     if case not in ("connection-reuse", "concurrent-opens") and resolution_client[0].get("request_id_hash") != resolution_exchange[0].get("request_id_hash"):
@@ -491,11 +491,14 @@ def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathli
             if len({row.get("stream_id_hash") for row in client_auth}) != len(client_auth):
                 raise CaseFailure("multi-open stream IDs were reused")
             if case == "concurrent-opens":
-                if len(client_auth) != 64 or len(resolution_client) != 64:
-                    raise CaseFailure(f"concurrent-opens expected 64 correlated opens, got {len(client_auth)}")
+                if len(client_auth) != 128 or len(resolution_client) != 128:
+                    raise CaseFailure(f"concurrent-opens expected 128 correlated opens, got {len(client_auth)}")
                 selected = [row for row in client_rows if row.get("event") == "path_selected"]
-                if len(selected) != 64 or len({row.get("request_id") for row in selected}) != 64:
+                if len(selected) != 128 or len({row.get("request_id") for row in selected}) != 128:
                     raise CaseFailure("concurrent-opens exact path correlation is incomplete")
+                pending_samples = [row.get("pending_opens", 0) for row in client_rows if row.get("event") == "resources"]
+                if not pending_samples or max(pending_samples) != 64:
+                    raise CaseFailure(f"concurrent-opens did not prove the configured 64-open owner window: {pending_samples}")
             if case == "connection-reuse":
                 selected = [row for row in client_rows if row.get("event") == "path_selected"]
                 if len(selected) != 2 or len({row.get("connection_id_hash") for row in selected}) != 1:
@@ -558,11 +561,13 @@ try:
     client_env = {"P2X_ENABLE_TEST_HOOKS": "1"}
     if case == "idempotent-resolve":
         exchange_args += ["--test-drop-first-resolve-response"]
+    elif case == "concurrent-opens":
+        exchange_args += ["--resolve-limit-per-minute", "256"]
     elif case == "graceful-drain":
         exchange_args += ["--test-hold-resolve-ms", "3000"]
         server_args += ["--test-hold-proxy-handshake-ms", "3000"]
     if case == "concurrent-opens":
-        client_args = ["--test-proxy-open-count", "64", "--test-proxy-concurrency", "64"]
+        client_args = ["--test-proxy-open-count", "128", "--test-proxy-concurrency", "64"]
     elif case == "connection-reuse":
         client_args = ["--test-proxy-open-count", "2", "--test-proxy-concurrency", "1"]
     elif case == "ticket-replay":
