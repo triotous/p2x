@@ -84,6 +84,8 @@ struct Args {
     test_concurrent_registry_requests: bool,
     #[arg(long, hide = true, value_parser = clap::value_parser!(u64).range(0..=10_000))]
     test_hold_proxy_handshake_ms: Option<u64>,
+    #[arg(long, hide = true, value_parser = clap::value_parser!(u64).range(0..=30_000))]
+    test_hold_upstream_dial_ms: Option<u64>,
 }
 
 fn probe_mut(
@@ -294,7 +296,8 @@ async fn main() -> io::Result<()> {
         || args.test_replay_register_response
         || args.test_drop_reservation_after_register
         || args.test_concurrent_registry_requests
-        || args.test_hold_proxy_handshake_ms.is_some())
+        || args.test_hold_proxy_handshake_ms.is_some()
+        || args.test_hold_upstream_dial_ms.is_some())
         && std::env::var("P2X_ENABLE_TEST_HOOKS").ok().as_deref() != Some("1")
     {
         return Err(io::Error::new(
@@ -947,6 +950,7 @@ async fn main() -> io::Result<()> {
                             unix_now(),
                             args.ticket_clock_skew as i64,
                             args.test_hold_proxy_handshake_ms,
+                            args.test_hold_upstream_dial_ms,
                             tx,
                             proxy_release_tx.clone(),
                             proxy_promotion_tx.clone(),

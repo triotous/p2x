@@ -25,3 +25,6 @@
 [validation] workspace tests/clippy/format passed; existing resolution local suite all cases passed except no tunnel canonical suite yet; proxy-limit passed after fixture bounds update.
 [review] Client handoff diff reviewed: ingress maps are bounded by configured route/stream owners, Accepted correlation is checked, local EOF cancels matching Open, and no post-Accept retry is introduced.
 [status] Phase 4.5 ready to commit; canonical tunnel harness and full Definition of Done remain.
+[action] Added bounded test-only upstream dial hold hook guarded by P2X_ENABLE_TEST_HOOKS=1 for deterministic timeout gate.
+[validation] workspace fmt/check/clippy/tests passed after hook addition.
+[review] Hook is hidden, range-limited to 30s, and only delays the already validated immutable upstream path.

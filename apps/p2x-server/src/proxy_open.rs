@@ -49,6 +49,7 @@ pub async fn run_worker(
     now: i64,
     clock_skew: i64,
     hold_handshake_ms: Option<u64>,
+    hold_dial_ms: Option<u64>,
     candidates: mpsc::Sender<Candidate>,
     releases: mpsc::Sender<Release>,
     promotions: mpsc::Sender<AdmissionToken>,
@@ -108,6 +109,9 @@ pub async fn run_worker(
                 release(&releases, peer_id, connection_id, admission).await;
                 return;
             };
+            if let Some(delay) = hold_dial_ms {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             match super::upstream::connect(&upstream).await {
                 Ok(socket) => {
                     let _ = promotions.send(admission).await;
