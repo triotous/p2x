@@ -17,3 +17,7 @@
 [validation] cargo fmt --all -- --check passed; cargo clippy --workspace --all-targets --all-features -- -D warnings passed; cargo test --workspace --all-targets --all-features passed.
 [review] Phase 4.3 diff reviewed: listener route IDs resolve against targets, only loopback nonzero binds accepted; server connect targets are parsed once and excluded from advertisements/hashes.
 [status] Phase 4.3 ready to commit.
+[action] Phase 4.4: extended server ticket admission with non-mutating validation/preflight, added immutable upstream connector, StreamAdmission global/per-client/per-service/dial accounting, final Accepted response after dial, and server-side bounded pump.
+[validation] workspace fmt/check/clippy/tests passed; resolution real-process TCP, QUIC, and proxy-limit cases passed.
+[review] Phase 4.4 server diff reviewed: no destination from client; capacity precedes replay consume; consumed tickets remain consumed on dial failure; admission release is routed once.
+[status] Phase 4.4 server portion ready to commit.

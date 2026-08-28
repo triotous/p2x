@@ -136,17 +136,28 @@ impl TicketAdmissionLedger {
         })
     }
 
+    pub fn preflight_candidate(
+        &mut self,
+        candidate: &ValidationCandidate,
+        now: i64,
+    ) -> Result<(), PublicErrorCode> {
+        self.sweep(now);
+        if self.replay.contains_key(&candidate.ticket_id) {
+            return Err(PublicErrorCode::AuthTicketReplayed);
+        }
+        if self.replay.len() >= self.capacity {
+            return Err(PublicErrorCode::LimitProxyStreams);
+        }
+        Ok(())
+    }
+
     pub fn consume_candidate(
         &mut self,
         candidate: ValidationCandidate,
         now: i64,
     ) -> TicketAdmission {
-        self.sweep(now);
-        if self.replay.contains_key(&candidate.ticket_id) {
-            return TicketAdmission::Rejected(PublicErrorCode::AuthTicketReplayed);
-        }
-        if self.replay.len() >= self.capacity {
-            return TicketAdmission::Rejected(PublicErrorCode::LimitProxyStreams);
+        if let Err(code) = self.preflight_candidate(&candidate, now) {
+            return TicketAdmission::Rejected(code);
         }
         let stream_id = match (self.stream_id_source)() {
             Ok(stream_id) => stream_id,
@@ -163,9 +174,9 @@ impl TicketAdmissionLedger {
     }
 
     #[allow(dead_code, clippy::too_many_arguments)]
-    pub fn authorize_candidate(
-        &mut self,
-        candidate: ValidationCandidate,
+    pub fn validate_candidate(
+        &self,
+        candidate: &ValidationCandidate,
         issuer: PeerId,
         client: PeerId,
         server: PeerId,
@@ -176,17 +187,17 @@ impl TicketAdmissionLedger {
         authorization_revision: u64,
         open: &OpenProxyStreamV1,
         now: i64,
-    ) -> TicketAdmission {
+    ) -> Result<(), PublicErrorCode> {
         let Some(registration_revision) = registration_revision else {
-            return TicketAdmission::Rejected(PublicErrorCode::RegistryStaleRevision);
+            return Err(PublicErrorCode::RegistryStaleRevision);
         };
         if registration_expires_at <= now || service.health() != p2x_protocol::Health::Ready {
-            return TicketAdmission::Rejected(PublicErrorCode::RegistryStaleRevision);
+            return Err(PublicErrorCode::RegistryStaleRevision);
         }
         if open.registration_revision != registration_revision
             || candidate.claims.registration_revision() != registration_revision.get()
         {
-            return TicketAdmission::Rejected(PublicErrorCode::RegistryStaleRevision);
+            return Err(PublicErrorCode::RegistryStaleRevision);
         }
         let selector_fingerprint = service.selector().fingerprint(tenant);
         let issuer_bytes = issuer.to_bytes();
@@ -205,7 +216,40 @@ impl TicketAdmissionLedger {
             || claims.permissions() != p2x_protocol::Scope::OpenProxyStream.bit()
             || claims.max_streams() != 1
         {
-            return TicketAdmission::Rejected(PublicErrorCode::AuthTicketInvalid);
+            return Err(PublicErrorCode::AuthTicketInvalid);
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn authorize_candidate(
+        &mut self,
+        candidate: ValidationCandidate,
+        issuer: PeerId,
+        client: PeerId,
+        server: PeerId,
+        tenant: &Tenant,
+        service: &ServiceAdvertisementV1,
+        registration_revision: Option<RegistrationRevision>,
+        registration_expires_at: i64,
+        authorization_revision: u64,
+        open: &OpenProxyStreamV1,
+        now: i64,
+    ) -> TicketAdmission {
+        if let Err(code) = self.validate_candidate(
+            &candidate,
+            issuer,
+            client,
+            server,
+            tenant,
+            service,
+            registration_revision,
+            registration_expires_at,
+            authorization_revision,
+            open,
+            now,
+        ) {
+            return TicketAdmission::Rejected(code);
         }
         self.consume_candidate(candidate, now)
     }

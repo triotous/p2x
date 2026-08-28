@@ -225,6 +225,14 @@ impl ServiceConfig {
             || proxy.max_upstream_dials > proxy.max_workers
             || !(p2x_proxy::MIN_COPY_BUFFER..=p2x_proxy::MAX_COPY_BUFFER)
                 .contains(&proxy.copy_buffer_bytes)
+            || proxy
+                .copy_buffer_bytes
+                .checked_mul(proxy.max_workers)
+                .and_then(|value| value.checked_mul(2))
+                .is_none()
+            || upstreams
+                .values()
+                .any(|upstream| upstream.concurrency_limit > proxy.max_workers)
             || proxy.max_replay_entries == 0
             || proxy.max_replay_entries > 65_536
             || proxy.ticket_clock_skew > 30

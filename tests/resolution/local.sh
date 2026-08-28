@@ -55,6 +55,7 @@ import pathlib
 import secrets
 import signal
 import socket
+import socketserver
 import subprocess
 import sys
 import tempfile
@@ -155,6 +156,8 @@ class Run:
         self.client2_peer = self.make_identity("client2")
         self.exchange_tcp = free_port(socket.SOCK_STREAM)
         self.exchange_quic = free_port(socket.SOCK_DGRAM)
+        self.upstream_port = free_port(socket.SOCK_STREAM)
+        self.upstream = self.start_upstream()
         self.mode = CASE_PROFILE[case][1]
         self.binding_unit_passed = False
         if case == "ticket-bindings":
@@ -233,6 +236,8 @@ credentials:
         proxy = "" if case != "proxy-limit" else """proxy:
   max_workers: 1
   max_workers_per_client: 1
+  max_upstream_dials: 1
+  copy_buffer_bytes: 32768
   max_replay_entries: 1
   ticket_clock_skew: 5
 """
@@ -244,10 +249,11 @@ registration:
 {proxy}services:
   - upstream_id: orders
     selector:
-      protocol: http
+      protocol: tcp
       metadata: {{service: orders}}
     enabled: {enabled}
-    connect: 127.0.0.1:5432
+    connect: 127.0.0.1:{self.upstream_port}
+    concurrency_limit: 1
 """
         )
         selector = "missing" if case == "unknown-selector" else "orders"
@@ -261,7 +267,7 @@ network:
 targets:
   - route_id: orders
     selector:
-      protocol: http
+      protocol: tcp
       metadata: {{service: {selector}}}
 limits:
   max_peer_states: 64
@@ -269,6 +275,24 @@ limits:
   max_pending_per_server: 64
 """
         )
+
+    def start_upstream(self):
+        class Echo(socketserver.BaseRequestHandler):
+            def handle(self):
+                while True:
+                    data = self.request.recv(65536)
+                    if not data:
+                        return
+                    self.request.sendall(data)
+
+        class Server(socketserver.ThreadingTCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        server = Server(("127.0.0.1", self.upstream_port), Echo)
+        thread = __import__("threading").Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server
 
     def make_identity(self, name: str) -> str:
         path = self.secret / f"{name}.key"
@@ -362,6 +386,8 @@ limits:
                 process.wait()
             if not handle.closed:
                 handle.close()
+        self.upstream.shutdown()
+        self.upstream.server_close()
         self.temp.cleanup()
 
 

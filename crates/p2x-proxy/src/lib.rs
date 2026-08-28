@@ -143,6 +143,35 @@ where
             "idle timeout is zero",
         ));
     }
+    pump_inner(local, remote, buffer_size, Some(idle_timeout), cancel).await
+}
+
+/// Copies both directions without a client-side idle deadline.
+pub async fn pump_no_idle<L, R>(
+    local: L,
+    remote: R,
+    buffer_size: usize,
+    cancel: impl std::future::Future<Output = ()> + Send,
+) -> io::Result<PumpResult>
+where
+    L: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    valid_buffer(buffer_size)?;
+    pump_inner(local, remote, buffer_size, None, cancel).await
+}
+
+async fn pump_inner<L, R>(
+    local: L,
+    remote: R,
+    buffer_size: usize,
+    idle_timeout: Option<Duration>,
+    cancel: impl std::future::Future<Output = ()> + Send,
+) -> io::Result<PumpResult>
+where
+    L: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let started = Instant::now();
     let (activity_tx, mut activity_rx) = watch::channel(started);
     let (local_reader, local_writer) = local.split();
@@ -168,9 +197,12 @@ where
         if local_done.is_some() && remote_done.is_some() {
             break Terminal::Complete;
         }
-        let last_activity = *activity_rx.borrow();
+        let idle_enabled = idle_timeout.is_some();
         let deadline =
-            tokio::time::sleep_until(tokio::time::Instant::from_std(last_activity + idle_timeout));
+            tokio::time::sleep_until(tokio::time::Instant::from_std(idle_timeout.map_or(
+                Instant::now() + Duration::from_secs(60 * 60 * 24 * 365),
+                |timeout| *activity_rx.borrow() + timeout,
+            )));
         tokio::pin!(deadline);
         tokio::select! {
             result = &mut local_result, if local_done.is_none() => {
@@ -196,7 +228,7 @@ where
                     break Terminal::Complete;
                 }
             }
-            _ = &mut deadline => break Terminal::IdleTimeout,
+            _ = &mut deadline, if idle_enabled => break Terminal::IdleTimeout,
             _ = &mut cancel => break Terminal::Cancelled,
         }
     };

@@ -1,6 +1,5 @@
 #[allow(dead_code)]
 mod availability;
-mod config;
 use clap::Parser;
 use futures::StreamExt;
 use libp2p::{
@@ -32,7 +31,7 @@ use p2x_protocol::{
     AuthRequest, AuthResponse, Capabilities, InstanceId, PublicErrorCode, RegistryRequestV1,
     RegistryResponseV1, Role,
 };
-use p2x_server::{proxy_open, ticket_admission};
+use p2x_server::{config, proxy_open, stream_admission, ticket_admission};
 use std::{collections::HashMap, io, path::PathBuf};
 use tokio::sync::mpsc;
 
@@ -442,6 +441,18 @@ async fn main() -> io::Result<()> {
     let (proxy_tx, mut proxy_rx) = mpsc::channel::<proxy_open::Candidate>(proxy_limit);
     let (proxy_release_tx, mut proxy_release_rx) =
         mpsc::channel::<proxy_open::Release>(proxy_limit);
+    let (proxy_promotion_tx, mut proxy_promotion_rx) =
+        mpsc::channel::<stream_admission::AdmissionToken>(proxy_limit);
+    let mut proxy_admission = service_config.as_ref().map_or_else(
+        || stream_admission::StreamAdmission::new(256, 32, 64),
+        |services| {
+            stream_admission::StreamAdmission::new(
+                services.proxy.max_workers,
+                services.proxy.max_workers_per_client,
+                services.proxy.max_upstream_dials,
+            )
+        },
+    );
     let mut proxy_workers = 0usize;
     let mut resource_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut first_probe_dropped = false;
@@ -621,51 +632,124 @@ async fn main() -> io::Result<()> {
             }
             Some(release) = proxy_release_rx.recv() => {
                 if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() { proxy.inbound_release_on(release.peer_id, release.connection_id); }
+                if !release.admission.is_empty() && !proxy_admission.release(release.admission) {
+                    return Err(io::Error::other("proxy stream admission released more than once"));
+                }
                 proxy_workers = proxy_workers.saturating_sub(1);
+            }
+            Some(admission) = proxy_promotion_rx.recv() => {
+                let _ = proxy_admission.promote(admission);
             }
             Some(candidate) = proxy_rx.recv() => {
                 let peer_name = candidate.peer_id.to_string();
-                let response = match candidate.open {
+                let request_id = candidate.open.as_ref().ok().map(|open| open.request_id);
+                let decision = match candidate.open {
                     Ok(open) => {
                         let now = unix_now();
                         match (verification_ring.as_ref(), auth_state.current_session(now), service_config.as_ref(), availability.registration_context(now)) {
                             (Some(_ring), Some(session), Some(services), Some((_, expires_at))) => {
-                                let service = services.service(&open.upstream_id);
-                                match service {
-                                    Some(service) => {
-                                        let admission = match candidate.validation {
-                                            Ok(validation_candidate) => ticket_admission.authorize_candidate(validation_candidate, relay_peer_id.unwrap_or(*swarm.local_peer_id()), candidate.peer_id, *swarm.local_peer_id(), session.tenant(), service, registration_revision, expires_at, session.authorization_revision(), &open, now),
-                                            Err(code) => ticket_admission::TicketAdmission::Rejected(code),
-                                        };
-                                        match admission {
-                                            ticket_admission::TicketAdmission::Authorized(stream_id) => p2x_protocol::ProxyOpenResponseV1::Authorized { request_id: open.request_id, stream_id },
-                                            ticket_admission::TicketAdmission::Rejected(code) => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: Some(open.request_id), error: p2x_protocol::PublicError::new(code, matches!(code, PublicErrorCode::RegistryStaleRevision | PublicErrorCode::LimitProxyStreams)) },
-                                        }
+                                let Some(service) = services.service(&open.upstream_id) else {
+                                    return Err(io::Error::other("advertised service disappeared"));
+                                };
+                                let Some(upstream) = services.upstreams.get(&open.upstream_id).cloned() else {
+                                    return Err(io::Error::other("immutable upstream disappeared"));
+                                };
+                                let reject = |code: PublicErrorCode| proxy_open::ServerDecision::Reject(
+                                    p2x_protocol::ProxyOpenResponseV1::Rejected {
+                                        request_id: Some(open.request_id),
+                                        error: p2x_protocol::PublicError::new(
+                                            code,
+                                            matches!(code, PublicErrorCode::RegistryStaleRevision | PublicErrorCode::LimitProxyStreams | PublicErrorCode::RegistryOffline),
+                                        ),
                                     },
-                                    None => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: Some(open.request_id), error: p2x_protocol::PublicError::new(PublicErrorCode::RegistryStaleRevision, true) },
+                                );
+                                match candidate.validation {
+                                    Ok(validation_candidate) => {
+                                        let preflight = ticket_admission.preflight_candidate(&validation_candidate, now);
+                                        if let Err(code) = preflight {
+                                            reject(code)
+                                        } else if let Err(code) = ticket_admission.validate_candidate(
+                                            &validation_candidate,
+                                            relay_peer_id.unwrap_or(*swarm.local_peer_id()),
+                                            candidate.peer_id,
+                                            *swarm.local_peer_id(),
+                                            session.tenant(),
+                                            service,
+                                            registration_revision,
+                                            expires_at,
+                                            session.authorization_revision(),
+                                            &open,
+                                            now,
+                                        ) {
+                                            reject(code)
+                                        } else if service.selector().protocol() != p2x_protocol::ProtocolClass::Tcp {
+                                            reject(PublicErrorCode::ProtocolCapabilityMismatch)
+                                        } else if upstream.advertisement.health() != p2x_protocol::Health::Ready {
+                                            reject(PublicErrorCode::RegistryOffline)
+                                        } else if let Err(code) = proxy_admission.preflight(candidate.peer_id, &open.upstream_id, upstream.concurrency_limit) {
+                                            reject(code)
+                                        } else {
+                                            match ticket_admission.authorize_candidate(
+                                                validation_candidate,
+                                                relay_peer_id.unwrap_or(*swarm.local_peer_id()),
+                                                candidate.peer_id,
+                                                *swarm.local_peer_id(),
+                                                session.tenant(),
+                                                service,
+                                                registration_revision,
+                                                expires_at,
+                                                session.authorization_revision(),
+                                                &open,
+                                                now,
+                                            ) {
+                                                ticket_admission::TicketAdmission::Authorized(stream_id) => {
+                                                    let admission = stream_admission::AdmissionToken::new(stream_id);
+                                                    match proxy_admission.reserve(admission, candidate.peer_id, open.upstream_id.clone(), upstream.concurrency_limit) {
+                                                        Ok(()) => proxy_open::ServerDecision::Admit {
+                                                            stream_id,
+                                                            admission,
+                                                            upstream,
+                                                            copy_buffer_bytes: services.proxy.copy_buffer_bytes,
+                                                        },
+                                                        Err(code) => reject(code),
+                                                    }
+                                                }
+                                                ticket_admission::TicketAdmission::Rejected(code) => reject(code),
+                                            }
+                                        }
+                                    }
+                                    Err(code) => reject(code),
                                 }
                             }
-                            _ => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: None, error: p2x_protocol::PublicError::new(PublicErrorCode::AuthSessionRequired, false) },
+                            _ => proxy_open::ServerDecision::Reject(
+                                p2x_protocol::ProxyOpenResponseV1::Rejected {
+                                    request_id,
+                                    error: p2x_protocol::PublicError::new(PublicErrorCode::AuthSessionRequired, false),
+                                },
+                            ),
                         }
                     }
-                    Err(code) => p2x_protocol::ProxyOpenResponseV1::Rejected { request_id: None, error: p2x_protocol::PublicError::new(code, false) },
+                    Err(code) => proxy_open::ServerDecision::Reject(
+                        p2x_protocol::ProxyOpenResponseV1::Rejected {
+                            request_id,
+                            error: p2x_protocol::PublicError::new(code, false),
+                        },
+                    ),
                 };
-                let (request_id_hash, stream_id_hash, authorized, code) = match &response {
-                    p2x_protocol::ProxyOpenResponseV1::Authorized {
-                        request_id,
-                        stream_id,
-                    } => (stable_hash(request_id), Some(stable_hash(stream_id)), true, None),
-                    p2x_protocol::ProxyOpenResponseV1::Accepted {
-                        request_id,
-                        stream_id,
-                        ..
-                    } => (stable_hash(request_id), Some(stable_hash(stream_id)), true, None),
-                    p2x_protocol::ProxyOpenResponseV1::Rejected { request_id, error } => (
+                let (request_id_hash, stream_id_hash, authorized, code) = match &decision {
+                    proxy_open::ServerDecision::Admit { stream_id, .. } => (
+                        request_id.map(stable_hash).unwrap_or_default(),
+                        Some(stable_hash(stream_id)),
+                        true,
+                        None,
+                    ),
+                    proxy_open::ServerDecision::Reject(p2x_protocol::ProxyOpenResponseV1::Rejected { request_id, error }) => (
                         request_id.map(stable_hash).unwrap_or_default(),
                         None,
                         false,
                         Some(error.code.as_str()),
                     ),
+                    proxy_open::ServerDecision::Reject(_) => (0, None, false, Some(PublicErrorCode::ProtocolMalformed.as_str())),
                 };
                 emitter.emit(&LifecycleRecord::ProxyAuthorization {
                     peer_id: &peer_name,
@@ -675,7 +759,9 @@ async fn main() -> io::Result<()> {
                     authorized,
                     code,
                 })?;
-                let _ = candidate.decision.send(response);
+                if let Err(proxy_open::ServerDecision::Admit { admission, .. }) = candidate.decision.send(decision) {
+                    let _ = proxy_admission.release(admission);
+                }
             }
             Some(worker) = worker_rx.recv() => {
                 let released = worker_admission.release(worker.peer_id);
@@ -863,6 +949,7 @@ async fn main() -> io::Result<()> {
                             args.test_hold_proxy_handshake_ms,
                             tx,
                             proxy_release_tx.clone(),
+                            proxy_promotion_tx.clone(),
                         ));
                     }
                     SwarmEvent::Behaviour(PeerEvent::Proxy(p2x_net::proxy_stream::behaviour::ProxyOutput::InboundRejected { peer_id, connection_id, stream, code })) => {
@@ -1150,7 +1237,7 @@ async fn main() -> io::Result<()> {
                     authorized: false,
                     code: Some(PublicErrorCode::PeerDraining.as_str()),
                 })?;
-                let _ = candidate.decision.send(
+                let _ = candidate.decision.send(proxy_open::ServerDecision::Reject(
                     p2x_protocol::ProxyOpenResponseV1::Rejected {
                         request_id,
                         error: p2x_protocol::PublicError::new(
@@ -1158,7 +1245,7 @@ async fn main() -> io::Result<()> {
                             true,
                         ),
                     },
-                );
+                ));
             }
             Some(release) = proxy_release_rx.recv() => {
                 if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {

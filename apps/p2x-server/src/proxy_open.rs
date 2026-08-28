@@ -1,15 +1,27 @@
+use crate::{config::LocalUpstream, stream_admission::AdmissionToken};
 use futures::io::{AsyncRead, AsyncWrite};
 use libp2p::{PeerId, swarm::ConnectionId};
 use p2x_config::ticket_key::VerificationKeyRing;
 use p2x_net::proxy_codec;
 use p2x_protocol::{OpenProxyStreamV1, ProxyOpenResponseV1, PublicError, PublicErrorCode};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Release {
     pub peer_id: PeerId,
     pub connection_id: ConnectionId,
+    pub admission: AdmissionToken,
+}
+
+pub enum ServerDecision {
+    Admit {
+        stream_id: [u8; 16],
+        admission: AdmissionToken,
+        upstream: Arc<LocalUpstream>,
+        copy_buffer_bytes: usize,
+    },
+    Reject(ProxyOpenResponseV1),
 }
 
 pub struct Candidate {
@@ -17,16 +29,15 @@ pub struct Candidate {
     pub connection_id: ConnectionId,
     pub open: Result<OpenProxyStreamV1, PublicErrorCode>,
     pub validation: Result<super::ticket_admission::ValidationCandidate, PublicErrorCode>,
-    pub decision: oneshot::Sender<ProxyOpenResponseV1>,
+    pub decision: oneshot::Sender<ServerDecision>,
 }
 
 async fn read_open<T: AsyncRead + Unpin>(
     stream: &mut T,
 ) -> Result<OpenProxyStreamV1, PublicErrorCode> {
-    let open = proxy_codec::read_open(stream)
+    proxy_codec::read_open(stream)
         .await
-        .map_err(|_| PublicErrorCode::ProtocolMalformed)?;
-    Ok(open)
+        .map_err(|_| PublicErrorCode::ProtocolMalformed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -40,6 +51,7 @@ pub async fn run_worker(
     hold_handshake_ms: Option<u64>,
     candidates: mpsc::Sender<Candidate>,
     releases: mpsc::Sender<Release>,
+    promotions: mpsc::Sender<AdmissionToken>,
 ) {
     let (decision, response) = oneshot::channel();
     let open = tokio::time::timeout(Duration::from_secs(5), read_open(&mut stream))
@@ -59,38 +71,90 @@ pub async fn run_worker(
         .expect("worker verification limits are valid")
         .verify_candidate(ring, open.ticket.as_bytes(), now),
         (None, Ok(_)) => Err(PublicErrorCode::AuthSessionRequired),
-        (_, Err(code)) => Err(*code),
+        (_, Err(_)) => Err(PublicErrorCode::ProtocolMalformed),
     };
     if candidates
         .send(Candidate {
             peer_id,
             connection_id,
-            open,
+            open: open.clone(),
             validation,
             decision,
         })
         .await
         .is_err()
     {
-        let _ = releases
-            .send(Release {
-                peer_id,
-                connection_id,
-            })
-            .await;
+        release(&releases, peer_id, connection_id, AdmissionToken::empty()).await;
         return;
     }
-    let response = response
-        .await
-        .unwrap_or_else(|_| ProxyOpenResponseV1::Rejected {
+    let decision = response.await.unwrap_or_else(|_| {
+        ServerDecision::Reject(ProxyOpenResponseV1::Rejected {
             request_id,
             error: PublicError::new(PublicErrorCode::ExchangeOverloaded, true),
-        });
-    let _ = proxy_codec::write_response(&mut stream, &response).await;
+        })
+    });
+    let admission = match decision {
+        ServerDecision::Reject(response) => {
+            let _ = proxy_codec::write_response(&mut stream, &response).await;
+            AdmissionToken::empty()
+        }
+        ServerDecision::Admit {
+            stream_id,
+            admission,
+            upstream,
+            copy_buffer_bytes,
+        } => {
+            let Ok(open) = open.as_ref() else {
+                release(&releases, peer_id, connection_id, admission).await;
+                return;
+            };
+            match super::upstream::connect(&upstream).await {
+                Ok(socket) => {
+                    let _ = promotions.send(admission).await;
+                    let response = ProxyOpenResponseV1::Accepted {
+                        request_id: open.request_id,
+                        stream_id,
+                        selected_upstream_mode: p2x_protocol::UpstreamMode::Tcp,
+                    };
+                    if proxy_codec::write_response(&mut stream, &response)
+                        .await
+                        .is_ok()
+                    {
+                        let _ = p2x_proxy::pump(
+                            stream,
+                            tokio_util::compat::TokioAsyncReadCompatExt::compat(socket),
+                            copy_buffer_bytes,
+                            upstream.idle_timeout,
+                            futures::future::pending(),
+                        )
+                        .await;
+                    }
+                }
+                Err(error) => {
+                    let response = ProxyOpenResponseV1::Rejected {
+                        request_id: Some(open.request_id),
+                        error: PublicError::new(error.code(), true),
+                    };
+                    let _ = proxy_codec::write_response(&mut stream, &response).await;
+                }
+            }
+            admission
+        }
+    };
+    release(&releases, peer_id, connection_id, admission).await;
+}
+
+async fn release(
+    releases: &mpsc::Sender<Release>,
+    peer_id: PeerId,
+    connection_id: ConnectionId,
+    admission: AdmissionToken,
+) {
     let _ = releases
         .send(Release {
             peer_id,
             connection_id,
+            admission,
         })
         .await;
 }
@@ -141,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn open_does_not_require_write_half_close_before_authorization() {
+    fn open_reads_one_frame_without_waiting_for_write_half_close() {
         let mut valid = Cursor::new(framed_open());
         assert_eq!(block_on(read_open(&mut valid)).unwrap(), open());
 
