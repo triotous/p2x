@@ -173,9 +173,17 @@ async fn run_connection(
                     prebuffer.truncate(filled);
                     let local = PrefixedIo::new(prebuffer, socket.compat());
                     let result = p2x_proxy::pump_no_idle(local, stream, copy_buffer_bytes, shutdown.cancelled()).await;
-                    if let Ok(result) = result {
-                        let _ = events.send(IngressEvent::TunnelFinished { id, result }).await;
-                    }
+                    let _ = events.send(IngressEvent::TunnelFinished {
+                        id,
+                        result: result.unwrap_or(p2x_proxy::PumpResult {
+                            local_to_remote_bytes: 0,
+                            remote_to_local_bytes: 0,
+                            local_eof: false,
+                            remote_eof: false,
+                            duration: Duration::ZERO,
+                            terminal: p2x_proxy::Terminal::Cancelled,
+                        }),
+                    }).await;
                     return;
                 }
                 Some(IngressCommand::Reject) | None => return,

@@ -33,3 +33,6 @@
 [action] Phase 4.6/7: added strict live tunnel harness with run-scoped fixtures, direct/forced-relay opaque echo, half-close, idle, refused, timeout, cleanup, and privacy scan; added tunnel lifecycle and fixed accept-time absolute deadline.
 [validation] tunnel cases fixed-tcp-direct, fixed-tcp-relay, half-close-direct, half-close-relay, idle-timeout, upstream-refused, upstream-timeout passed; concurrent-opens regression passed after per-service fixture correction; auth exchange-restart passed on rerun; workspace fmt/clippy/tests passed.
 [blocker] Remaining canonical tunnel names currently exercise the common real-process smoke path rather than the full topology-specific loss/large-RSS/64-stream/shutdown evidence. Owner-executed platform/topology/soak gates remain incomplete per plan.
+[validation] Full tunnel harness run passed all 14 named cases; repeated resolution concurrent-opens passed; auth exchange-restart passed on rerun; workspace fmt/clippy/tests passed.
+[action] Improved ingress terminal reporting on pump errors/cancellation so one terminal event is always emitted and active ownership can release.
+[review] Remaining limitation is evidence quality: large/slow, concurrency, control-loss, path-loss, shutdown case names currently reuse the common local smoke flow and do not prove their full plan-specific scenarios.
