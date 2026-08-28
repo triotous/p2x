@@ -1,0 +1,11 @@
+[session] 2026-02-?? plan 06 started
+[decision] Execute through Definition of Done, preserving the plan; inspect baseline before phase edits.
+[action] Read plan, skill instructions, git status, and repository layout.
+[result] Worktree clean on feat/06-raw-tcp-proxy-tunnel; implementation-ready Plan 06 available.
+[action] Phase 4.1: added PROXY_STREAM_V1, upstream error codes, Accepted-only client handshake, and flush-without-close proxy codec; migrated integration calls and added opaque-byte TCP/QUIC assertions.
+[result] Codec/network tests passed; full check initially found stale client call sites, then they were updated.
+[validation] cargo fmt --all -- --check: passed.
+[validation] cargo clippy --workspace --all-targets --all-features -- -D warnings: passed.
+[validation] cargo test --workspace --all-targets --all-features: passed.
+[review] Phase 4.1 diff confines protocol capability/error/handshake boundary and compatibility fixtures; no plan changes.
+[status] Phase 4.1 ready to commit.

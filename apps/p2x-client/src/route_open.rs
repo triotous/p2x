@@ -119,7 +119,7 @@ impl RouteOpenSupervisor {
             request_id,
             session_id,
             selector: selector.clone(),
-            client_capabilities: p2x_protocol::Capabilities::from_bits(15)
+            client_capabilities: p2x_protocol::Capabilities::from_bits(31)
                 .expect("known capabilities"),
         };
         let actions = resolver

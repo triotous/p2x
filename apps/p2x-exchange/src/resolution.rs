@@ -194,7 +194,9 @@ impl<'a> Resolver<'a> {
         registry: &Registry,
         now: i64,
     ) -> ResolveResponseV1 {
-        if !client_capabilities.contains(Capabilities::RELAY_V2) {
+        if !client_capabilities.contains(Capabilities::RELAY_V2)
+            || !client_capabilities.contains(Capabilities::PROXY_STREAM_V1)
+        {
             return rejected(
                 Some(request_id),
                 PublicErrorCode::ProtocolCapabilityMismatch,
@@ -253,10 +255,15 @@ impl<'a> Resolver<'a> {
         )
         .unwrap_or_else(Capabilities::empty);
         if !client_capabilities.contains(Capabilities::RELAY_V2)
+            || !client_capabilities.contains(Capabilities::PROXY_STREAM_V1)
             || !resolved
                 .server_capabilities
                 .contains(Capabilities::RELAY_V2)
+            || !resolved
+                .server_capabilities
+                .contains(Capabilities::PROXY_STREAM_V1)
             || !compatible.contains(Capabilities::RELAY_V2)
+            || !compatible.contains(Capabilities::PROXY_STREAM_V1)
         {
             return rejected(
                 Some(request_id),
@@ -455,7 +462,7 @@ mod tests {
             session_id: [2; 16],
             instance_id: p2x_protocol::InstanceId::new([3; 16]),
             requested_lease_seconds: 30,
-            capabilities: Capabilities::from_bits(15).unwrap(),
+            capabilities: Capabilities::from_bits(31).unwrap(),
             services,
         };
         registry
@@ -475,7 +482,7 @@ mod tests {
             request_id: [1; 16],
             session_id: [2; 16],
             selector,
-            client_capabilities: Capabilities::RELAY_V2,
+            client_capabilities: Capabilities::from_bits(31).unwrap(),
         };
         let client_session = session(client, Role::Client, Scope::OpenProxyStream.bit());
         let first = resolver.resolve_and_authorize(
@@ -558,6 +565,49 @@ mod tests {
     }
 
     #[test]
+    fn resolution_requires_proxy_stream_capability_on_both_sides() {
+        let key = TicketKey::from_seed([9; 32]);
+        let mut resolver = Resolver::new(PeerId::random(), &key);
+        let client = PeerId::random();
+        let request = ResolveRequestV1::Resolve {
+            request_id: [1; 16],
+            session_id: [2; 16],
+            selector: p2x_protocol::UnscopedSelector::new(
+                p2x_protocol::ProtocolClass::Http,
+                [(
+                    p2x_protocol::MetadataKey::new("service").unwrap(),
+                    p2x_protocol::MetadataValue::new("orders").unwrap(),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap(),
+            client_capabilities: Capabilities::RELAY_V2,
+        };
+        let response = resolver.resolve_and_authorize(
+            client,
+            ConnectionId::new_unchecked(1),
+            &request,
+            "1",
+            Some(&session(client, Role::Client, Scope::OpenProxyStream.bit())),
+            |_| None,
+            |_| false,
+            &Registry::default(),
+            1,
+        );
+        assert!(matches!(
+            response,
+            ResolveResponseV1::Rejected {
+                error: PublicError {
+                    code: PublicErrorCode::ProtocolCapabilityMismatch,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn resolution_requires_relay_capability_on_both_sides() {
         let key = TicketKey::from_seed([9; 32]);
         let mut resolver = Resolver::new(PeerId::random(), &key);
@@ -618,7 +668,7 @@ mod tests {
                 metadata,
             )
             .unwrap(),
-            client_capabilities: Capabilities::RELAY_V2,
+            client_capabilities: Capabilities::from_bits(31).unwrap(),
         };
         let response = resolver.resolve_and_authorize(
             peer,

@@ -140,7 +140,7 @@ impl ResolverState {
             request_id,
             session_id,
             selector,
-            client_capabilities: Capabilities::from_bits(15).expect("known capabilities"),
+            client_capabilities: Capabilities::from_bits(31).expect("known capabilities"),
         };
         self.queued_requests.insert(request_id, request.clone());
         if queue.len() == 1 {
@@ -273,6 +273,7 @@ impl ResolverState {
                 }
                 if selector_fingerprint != selector.fingerprint(&binding.tenant)
                     || !compatible_capabilities.contains(Capabilities::RELAY_V2)
+                    || !compatible_capabilities.contains(Capabilities::PROXY_STREAM_V1)
                 {
                     return Err(p2x_protocol::PublicErrorCode::ProtocolMalformed);
                 }
@@ -593,7 +594,7 @@ mod tests {
             selector_fingerprint: [3; 32],
             registration_revision: RegistrationRevision::new(1).unwrap(),
             relay_addresses: vec![relay],
-            compatible_capabilities: Capabilities::RELAY_V2,
+            compatible_capabilities: Capabilities::from_bits(17).unwrap(),
             registration_expires_at: 20,
             ticket_expires_at: 19,
             ticket: RawTicket::new(vec![7; 16]).unwrap(),
@@ -677,7 +678,7 @@ mod tests {
             selector_fingerprint: selector.fingerprint(&binding.tenant),
             registration_revision: RegistrationRevision::new(1).unwrap(),
             relay_addresses: vec![relay],
-            compatible_capabilities: Capabilities::RELAY_V2,
+            compatible_capabilities: Capabilities::from_bits(17).unwrap(),
             registration_expires_at: 20,
             ticket_expires_at: 19,
             ticket: RawTicket::new(vec![7; 16]).unwrap(),

@@ -3,7 +3,7 @@ use p2x_net::proxy_codec;
 use p2x_protocol::{OpenProxyStreamV1, ProxyOpenResponseV1, PublicErrorCode};
 use std::time::Duration;
 
-pub async fn authorize_empty_stream<T: AsyncRead + AsyncWrite + Unpin>(
+pub async fn open_accepted_stream<T: AsyncRead + AsyncWrite + Unpin>(
     mut stream: T,
     open: &OpenProxyStreamV1,
     timeout: Duration,
@@ -16,11 +16,15 @@ pub async fn authorize_empty_stream<T: AsyncRead + AsyncWrite + Unpin>(
             .await
             .map_err(|_| PublicErrorCode::ProtocolMalformed)?
         {
-            ProxyOpenResponseV1::Authorized {
+            ProxyOpenResponseV1::Accepted {
                 request_id,
                 stream_id,
+                selected_upstream_mode: p2x_protocol::UpstreamMode::Tcp,
             } if request_id == open.request_id => Ok((request_id, stream_id)),
             ProxyOpenResponseV1::Rejected { error, .. } => Err(error.code),
+            ProxyOpenResponseV1::Authorized { .. } => {
+                Err(PublicErrorCode::ProtocolCapabilityMismatch)
+            }
             _ => Err(PublicErrorCode::ProtocolMalformed),
         }
     })

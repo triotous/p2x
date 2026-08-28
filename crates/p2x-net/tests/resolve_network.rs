@@ -23,7 +23,7 @@ fn super_request() -> ResolveRequestV1 {
         session_id: [2; 16],
         selector: p2x_protocol::UnscopedSelector::new(p2x_protocol::ProtocolClass::Http, metadata)
             .unwrap(),
-        client_capabilities: Capabilities::RELAY_V2,
+        client_capabilities: Capabilities::from_bits(31).unwrap(),
     }
 }
 
@@ -81,7 +81,7 @@ async fn run_resolve_over(quic: bool) {
                         selector_fingerprint: [3; 32],
                         registration_revision: RegistrationRevision::new(7).unwrap(),
                         relay_addresses: vec![relay],
-                        compatible_capabilities: Capabilities::RELAY_V2,
+                        compatible_capabilities: Capabilities::from_bits(17).unwrap(),
                         registration_expires_at: 1000,
                         ticket_expires_at: 30,
                         ticket: RawTicket::new(vec![7; 16]).unwrap(),

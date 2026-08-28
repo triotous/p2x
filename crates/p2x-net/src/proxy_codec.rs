@@ -63,9 +63,11 @@ async fn write_frame<T: AsyncWrite + Unpin>(
     io.write_all(body)
         .await
         .map_err(|_| ProxyProtocolError::Malformed)?;
-    io.flush()
-        .await
-        .map_err(|_| ProxyProtocolError::Malformed)?;
+    io.flush().await.map_err(|_| ProxyProtocolError::Malformed)
+}
+
+/// Explicitly closes the write half for diagnostics that require EOF.
+pub async fn close<T: AsyncWrite + Unpin>(io: &mut T) -> Result<(), ProxyProtocolError> {
     io.close().await.map_err(|_| ProxyProtocolError::Malformed)
 }
 pub fn io_error(error: ProxyProtocolError) -> io::Error {
@@ -89,12 +91,16 @@ mod tests {
         }
     }
     #[test]
-    fn opened_stream_codec_round_trips() {
+    fn opened_stream_codec_round_trips_without_closing() {
         let mut bytes = Vec::new();
-        block_on(write_open(&mut AllowStdIo::new(&mut bytes), &open())).unwrap();
+        let mut io = AllowStdIo::new(&mut bytes);
+        block_on(write_open(&mut io, &open())).unwrap();
+        block_on(io.write_all(b"opaque")).unwrap();
+        let frame_len = bytes.len() - 6;
         assert_eq!(
-            block_on(read_open(&mut Cursor::new(bytes))).unwrap(),
+            block_on(read_open(&mut Cursor::new(bytes[..frame_len].to_vec()))).unwrap(),
             open()
         );
+        assert_eq!(&bytes[frame_len..], b"opaque");
     }
 }

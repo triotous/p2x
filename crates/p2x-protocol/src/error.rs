@@ -38,6 +38,9 @@ pub enum PublicErrorCode {
     PeerConnectionFailed,
     PeerSetupTimeout,
     PeerDraining,
+    UpstreamConnectTimeout,
+    UpstreamConnectFailed,
+    UpstreamIdleTimeout,
 }
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[error("unknown public error code")]
@@ -79,6 +82,9 @@ impl PublicErrorCode {
         Self::PeerConnectionFailed,
         Self::PeerSetupTimeout,
         Self::PeerDraining,
+        Self::UpstreamConnectTimeout,
+        Self::UpstreamConnectFailed,
+        Self::UpstreamIdleTimeout,
     ];
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -116,6 +122,9 @@ impl PublicErrorCode {
             Self::PeerConnectionFailed => "peer.connection_failed",
             Self::PeerSetupTimeout => "peer.setup_timeout",
             Self::PeerDraining => "peer.draining",
+            Self::UpstreamConnectTimeout => "upstream.connect_timeout",
+            Self::UpstreamConnectFailed => "upstream.connect_failed",
+            Self::UpstreamIdleTimeout => "upstream.idle_timeout",
         }
     }
     pub fn try_from_wire(value: &str) -> Result<Self, UnknownPublicErrorCode> {
@@ -162,6 +171,9 @@ impl PublicErrorCode {
             "peer.connection_failed" => Self::PeerConnectionFailed,
             "peer.setup_timeout" => Self::PeerSetupTimeout,
             "peer.draining" => Self::PeerDraining,
+            "upstream.connect_timeout" => Self::UpstreamConnectTimeout,
+            "upstream.connect_failed" => Self::UpstreamConnectFailed,
+            "upstream.idle_timeout" => Self::UpstreamIdleTimeout,
             _ => Self::ProtocolMalformed,
         }
     }
@@ -179,6 +191,17 @@ impl PublicError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn upstream_codes_round_trip_with_retryability() {
+        for code in [
+            PublicErrorCode::UpstreamConnectTimeout,
+            PublicErrorCode::UpstreamConnectFailed,
+            PublicErrorCode::UpstreamIdleTimeout,
+        ] {
+            assert_eq!(PublicErrorCode::parse(code.as_str()), code);
+            assert_eq!(PublicErrorCode::try_from_wire(code.as_str()), Ok(code));
+        }
+    }
     #[test]
     fn codes_round_trip() {
         for code in [

@@ -13,6 +13,7 @@ impl Capabilities {
     pub const DIRECT_TCP: Self = Self(2);
     pub const DIRECT_QUIC: Self = Self(4);
     pub const DCUTR: Self = Self(8);
+    pub const PROXY_STREAM_V1: Self = Self(16);
     pub const fn empty() -> Self {
         Self(0)
     }
@@ -20,7 +21,12 @@ impl Capabilities {
         self.0
     }
     pub const fn from_bits(bits: u32) -> Option<Self> {
-        if bits & !(Self::RELAY_V2.0 | Self::DIRECT_TCP.0 | Self::DIRECT_QUIC.0 | Self::DCUTR.0)
+        if bits
+            & !(Self::RELAY_V2.0
+                | Self::DIRECT_TCP.0
+                | Self::DIRECT_QUIC.0
+                | Self::DCUTR.0
+                | Self::PROXY_STREAM_V1.0)
             == 0
         {
             Some(Self(bits))
@@ -268,7 +274,12 @@ mod tests {
     }
     #[test]
     fn capabilities_are_closed() {
-        assert!(Capabilities::from_bits(16).is_none());
+        assert!(
+            Capabilities::from_bits(16)
+                .unwrap()
+                .contains(Capabilities::PROXY_STREAM_V1)
+        );
+        assert!(Capabilities::from_bits(32).is_none());
         assert!(Capabilities::from_bits(7).unwrap().direct_transport());
     }
 }

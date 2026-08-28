@@ -1891,7 +1891,7 @@ async fn main() -> io::Result<()> {
                         tokio::spawn(async move {
                             if hold > 0 { tokio::time::sleep(std::time::Duration::from_millis(hold)).await; }
                             let timeout = deadline.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_secs(5));
-                            let result = proxy_open::authorize_empty_stream(stream, &open, timeout).await;
+                            let result = proxy_open::open_accepted_stream(stream, &open, timeout).await;
                             let _ = tx.send(ProxyResult { open_id: Some(open_id), request_id: open.request_id, result }).await;
                         });
                     }
@@ -1932,7 +1932,7 @@ async fn main() -> io::Result<()> {
                             .unwrap_or_else(|| std::time::Duration::from_secs(5));
                         let tx = proxy_result_tx.clone();
                         tokio::spawn(async move {
-                            let result = proxy_open::authorize_empty_stream(stream, &open, timeout).await;
+                            let result = proxy_open::open_accepted_stream(stream, &open, timeout).await;
                             let _ = tx
                                 .send(ProxyResult {
                                     open_id: None,

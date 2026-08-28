@@ -118,7 +118,7 @@ mod tests {
             request_id: [1; 16],
             session_id: [2; 16],
             selector: p2x_protocol::UnscopedSelector::new(ProtocolClass::Http, metadata).unwrap(),
-            client_capabilities: Capabilities::RELAY_V2,
+            client_capabilities: Capabilities::from_bits(31).unwrap(),
         }
     }
 

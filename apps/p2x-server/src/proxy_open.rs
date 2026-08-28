@@ -1,4 +1,4 @@
-use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use futures::io::{AsyncRead, AsyncWrite};
 use libp2p::{PeerId, swarm::ConnectionId};
 use p2x_config::ticket_key::VerificationKeyRing;
 use p2x_net::proxy_codec;
@@ -20,21 +20,12 @@ pub struct Candidate {
     pub decision: oneshot::Sender<ProxyOpenResponseV1>,
 }
 
-async fn read_open_and_require_half_close<T: AsyncRead + Unpin>(
+async fn read_open<T: AsyncRead + Unpin>(
     stream: &mut T,
 ) -> Result<OpenProxyStreamV1, PublicErrorCode> {
     let open = proxy_codec::read_open(stream)
         .await
         .map_err(|_| PublicErrorCode::ProtocolMalformed)?;
-    let mut early_application_byte = [0; 1];
-    if stream
-        .read(&mut early_application_byte)
-        .await
-        .map_err(|_| PublicErrorCode::ProtocolMalformed)?
-        != 0
-    {
-        return Err(PublicErrorCode::ProtocolMalformed);
-    }
     Ok(open)
 }
 
@@ -51,14 +42,11 @@ pub async fn run_worker(
     releases: mpsc::Sender<Release>,
 ) {
     let (decision, response) = oneshot::channel();
-    let open = tokio::time::timeout(
-        Duration::from_secs(5),
-        read_open_and_require_half_close(&mut stream),
-    )
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .ok_or(PublicErrorCode::ProtocolMalformed);
+    let open = tokio::time::timeout(Duration::from_secs(5), read_open(&mut stream))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or(PublicErrorCode::ProtocolMalformed);
     let request_id = open.as_ref().ok().map(|open| open.request_id);
     if let Some(delay) = hold_handshake_ms {
         tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -153,20 +141,18 @@ mod tests {
     }
 
     #[test]
-    fn open_requires_write_half_close_before_authorization() {
+    fn open_does_not_require_write_half_close_before_authorization() {
         let mut valid = Cursor::new(framed_open());
         assert_eq!(
-            block_on(read_open_and_require_half_close(&mut valid)).unwrap(),
+            block_on(read_open(&mut valid)).unwrap(),
             open()
         );
 
         let mut early_data = framed_open();
         early_data.push(0x42);
         assert_eq!(
-            block_on(read_open_and_require_half_close(&mut Cursor::new(
-                early_data
-            ))),
-            Err(PublicErrorCode::ProtocolMalformed)
+            block_on(read_open(&mut Cursor::new(early_data))).unwrap(),
+            open()
         );
     }
 }

@@ -209,7 +209,7 @@ fn new_register(
         session_id,
         instance_id,
         requested_lease_seconds: services.requested_lease_seconds,
-        capabilities: Capabilities::from_bits(15).expect("known capabilities"),
+        capabilities: Capabilities::from_bits(31).expect("known capabilities"),
         services: services.services.clone(),
     };
     Ok(RegistryOperation {

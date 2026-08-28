@@ -24,10 +24,12 @@ pub enum UpstreamMode {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProxyOpenResponseV1 {
+    /// Legacy pre-data authorization response; Phase 4 never emits or accepts it as success.
     Authorized {
         request_id: [u8; 16],
         stream_id: [u8; 16],
     },
+    /// Final success response. Opaque application bytes follow this frame on the same stream.
     Accepted {
         request_id: [u8; 16],
         stream_id: [u8; 16],

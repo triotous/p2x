@@ -50,7 +50,7 @@ fn actual_resolution_ticket_flows_through_server_owner_once() {
         selector.clone(),
         Health::Ready,
     );
-    let capabilities = Capabilities::from_bits(15).unwrap();
+    let capabilities = Capabilities::from_bits(31).unwrap();
 
     let mut registry = Registry::default();
     registry.set_advertise_addresses(vec![format!("/ip4/127.0.0.1/tcp/1/p2p/{exchange}")]);

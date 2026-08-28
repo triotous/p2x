@@ -1,4 +1,4 @@
-use futures::StreamExt;
+use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
 use libp2p::swarm::SwarmEvent;
 use p2x_net::{
     builder::{PeerEvent, PeerSurface, PeerSwarmConfig, build_peer_swarm, start_peer_listeners},
@@ -63,7 +63,11 @@ async fn run_proxy_over(quic: bool) {
                     SwarmEvent::Behaviour(PeerEvent::Proxy(ProxyOutput::OutboundOpened { request_id, mut stream, .. })) if Some(request_id) == opened => {
                         proxy_codec::write_open(&mut stream, &open()).await.unwrap();
                         let response = proxy_codec::read_response(&mut stream).await.unwrap();
-                        assert_eq!(response, ProxyOpenResponseV1::Authorized { request_id: [1; 16], stream_id: [2; 16] });
+                        assert_eq!(response, ProxyOpenResponseV1::Accepted { request_id: [1; 16], stream_id: [2; 16], selected_upstream_mode: p2x_protocol::UpstreamMode::Tcp });
+                        stream.write_all(b"client").await.unwrap();
+                        let mut echoed = [0; 6];
+                        stream.read_exact(&mut echoed).await.unwrap();
+                        assert_eq!(&echoed, b"server");
                         return;
                     }
                     SwarmEvent::Behaviour(PeerEvent::Proxy(ProxyOutput::OutboundFailed { code, .. })) => panic!("proxy open failed: {code}"),
@@ -76,7 +80,11 @@ async fn run_proxy_over(quic: bool) {
                         tokio::spawn(async move {
                             let received = proxy_codec::read_open(&mut stream).await.unwrap();
                             assert_eq!(received, open());
-                            proxy_codec::write_response(&mut stream, &ProxyOpenResponseV1::Authorized { request_id: [1; 16], stream_id: [2; 16] }).await.unwrap();
+                            proxy_codec::write_response(&mut stream, &ProxyOpenResponseV1::Accepted { request_id: [1; 16], stream_id: [2; 16], selected_upstream_mode: p2x_protocol::UpstreamMode::Tcp }).await.unwrap();
+                            let mut received_data = [0; 6];
+                            stream.read_exact(&mut received_data).await.unwrap();
+                            assert_eq!(&received_data, b"client");
+                            stream.write_all(b"server").await.unwrap();
                         });
                     }
                     SwarmEvent::ConnectionEstablished { .. } => {}

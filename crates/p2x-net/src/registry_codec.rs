@@ -493,7 +493,7 @@ mod tests {
             session_id: [2; 16],
             instance_id: InstanceId::new([3; 16]),
             requested_lease_seconds: 30,
-            capabilities: Capabilities::from_bits(7).unwrap(),
+            capabilities: Capabilities::from_bits(23).unwrap(),
             services: ServiceSet::new(vec![service]).unwrap(),
         }
     }
