@@ -28,3 +28,5 @@
 [action] Added bounded test-only upstream dial hold hook guarded by P2X_ENABLE_TEST_HOOKS=1 for deterministic timeout gate.
 [validation] workspace fmt/check/clippy/tests passed after hook addition.
 [review] Hook is hidden, range-limited to 30s, and only delays the already validated immutable upstream path.
+[action] Corrected dial test-hook semantics so a held delay at or beyond connect timeout deterministically returns upstream.connect_timeout, while shorter holds still use the validated connector.
+[validation] workspace fmt/check/clippy/tests passed.

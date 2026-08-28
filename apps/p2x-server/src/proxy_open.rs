@@ -109,10 +109,18 @@ pub async fn run_worker(
                 release(&releases, peer_id, connection_id, admission).await;
                 return;
             };
-            if let Some(delay) = hold_dial_ms {
-                tokio::time::sleep(Duration::from_millis(delay)).await;
-            }
-            match super::upstream::connect(&upstream).await {
+            let dial = match hold_dial_ms {
+                Some(delay) if delay >= upstream.connect_timeout.as_millis() as u64 => {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    Err(super::upstream::ConnectError::Timeout)
+                }
+                Some(delay) => {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    super::upstream::connect(&upstream).await
+                }
+                None => super::upstream::connect(&upstream).await,
+            };
+            match dial {
                 Ok(socket) => {
                     let _ = promotions.send(admission).await;
                     let response = ProxyOpenResponseV1::Accepted {
