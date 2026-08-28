@@ -109,6 +109,7 @@ services:
       protocol: http
       metadata: {service: orders}
     enabled: true
+    connect: 127.0.0.1:5432
 EOF
 cat > "$routes_file" <<'EOF'
 schema_version: 1

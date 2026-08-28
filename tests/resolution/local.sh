@@ -247,6 +247,7 @@ registration:
       protocol: http
       metadata: {{service: orders}}
     enabled: {enabled}
+    connect: 127.0.0.1:5432
 """
         )
         selector = "missing" if case == "unknown-selector" else "orders"

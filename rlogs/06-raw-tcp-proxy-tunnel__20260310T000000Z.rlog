@@ -13,3 +13,7 @@
 [validation] p2x-proxy tests and clippy passed; workspace check passed.
 [review] Phase 4.2 diff reviewed against §3.7: no framing/retry/payload buffering; direction counters increment after write; spawned tasks are joined or aborted.
 [status] Phase 4.2 ready to commit.
+[action] Phase 4.3: added client raw_tcp listener schema/validation, ingress/per-server/buffer limits, server immutable LocalUpstream routing with redacted Debug, strict socket/timeout/concurrency bounds, and updated generated service fixtures.
+[validation] cargo fmt --all -- --check passed; cargo clippy --workspace --all-targets --all-features -- -D warnings passed; cargo test --workspace --all-targets --all-features passed.
+[review] Phase 4.3 diff reviewed: listener route IDs resolve against targets, only loopback nonzero binds accepted; server connect targets are parsed once and excluded from advertisements/hashes.
+[status] Phase 4.3 ready to commit.

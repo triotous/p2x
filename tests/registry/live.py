@@ -79,7 +79,7 @@ class Harness:
         for index in range(count):
             selector = "shared" if shared else f"{name}-{index}"
             self.private_markers.extend((selector, f"upstream-{index}"))
-            lines += [f"  - upstream_id: upstream-{index}", "    selector:", "      protocol: http", f"      metadata: {{service: {selector}}}", "    enabled: true"]
+            lines += [f"  - upstream_id: upstream-{index}", "    selector:", "      protocol: http", f"      metadata: {{service: {selector}}}", "    enabled: true", "    connect: 127.0.0.1:5432"]
         path.write_text("\n".join(lines) + "\n"); return path
 
     def spawn(self, name, argv, env=None):
