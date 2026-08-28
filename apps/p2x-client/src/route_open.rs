@@ -19,6 +19,13 @@ pub enum RetryClass {
 }
 
 #[derive(Debug)]
+pub struct TunnelHandoff {
+    pub server: PeerId,
+    pub connection: p2x_net::ConnectionId,
+    pub request_id: [u8; 16],
+    pub stream_id: [u8; 16],
+}
+
 pub enum RouteAction {
     SendResolve {
         open_id: OpenId,
@@ -471,6 +478,34 @@ impl RouteOpenSupervisor {
         })
     }
 
+    pub fn accepted(
+        &mut self,
+        open_id: OpenId,
+        proxy_request_id: u64,
+        request_id: [u8; 16],
+        stream_id: [u8; 16],
+    ) -> Option<TunnelHandoff> {
+        let open = self.opens.get(&open_id)?;
+        if open.proxy_request_id != Some(proxy_request_id)
+            || open.resolve_request.resolve_request_id() != request_id
+            || stream_id == [0; 16]
+            || open.terminal_delivered
+            || !open.handshake_started
+        {
+            return None;
+        }
+        let server = open.server_peer_id?;
+        let connection = open.selected_connection?;
+        let removed = self.opens.remove(&open_id)?;
+        let _ = removed;
+        Some(TunnelHandoff {
+            server,
+            connection,
+            request_id,
+            stream_id,
+        })
+    }
+
     pub fn complete(
         &mut self,
         open_id: OpenId,
@@ -495,6 +530,9 @@ impl RouteOpenSupervisor {
 
     pub fn len(&self) -> usize {
         self.opens.len()
+    }
+    pub fn contains(&self, open_id: OpenId) -> bool {
+        self.opens.contains_key(&open_id)
     }
     pub fn pending(&self) -> usize {
         self.opens
@@ -721,6 +759,51 @@ mod tests {
             Err(PublicErrorCode::PeerSetupTimeout)
         ));
         assert_eq!(resolver.pending(), 0);
+    }
+
+    #[test]
+    fn accepted_handoff_removes_setup_and_rejects_late_events() {
+        let mut owner = RouteOpenSupervisor::new(1);
+        let mut resolver = ResolverState::default();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let (id, _) = owner
+            .admit(&mut resolver, binding(), [2; 16], selector(), 1, deadline)
+            .unwrap();
+        assert!(owner.proxy_queued(id, 7, p2x_net::ConnectionId::new_unchecked(1)));
+        let server = PeerId::random();
+        owner.opens.get_mut(&id).unwrap().server_peer_id = Some(server);
+        owner.opens.get_mut(&id).unwrap().registration_revision =
+            Some(p2x_protocol::RegistrationRevision::new(1).unwrap());
+        owner.opens.get_mut(&id).unwrap().grant = Some(AuthorizationGrant {
+            metadata: crate::resolver::ResolvedServiceMetadata {
+                server_peer_id: server,
+                upstream_id: p2x_protocol::UpstreamId::new("orders").unwrap(),
+                selector_fingerprint: [0; 32],
+                registration_revision: p2x_protocol::RegistrationRevision::new(1).unwrap(),
+                relay_addresses: Vec::new(),
+                compatible_capabilities: p2x_protocol::Capabilities::from_bits(17).unwrap(),
+                registration_expires_at: 100,
+            },
+            ticket: p2x_protocol::RawTicket::new(vec![1; 16]).unwrap(),
+            ticket_expires_at: 100,
+        });
+        assert!(owner.handshake_started(id, 7).is_some());
+        let handoff = owner.accepted(id, 7, request_id(1), [4; 16]).unwrap();
+        assert_eq!(handoff.request_id, request_id(1));
+        assert!(!owner.contains(id));
+        assert!(owner.accepted(id, 7, [3; 16], [4; 16]).is_none());
+        assert!(
+            owner
+                .path_event(
+                    id,
+                    PathEvent {
+                        attempt_id: p2x_net::AttemptId(1),
+                        now: Instant::now(),
+                        kind: PathEventKind::PayloadAccepted,
+                    },
+                )
+                .is_none()
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ pub async fn open_accepted_stream<T: AsyncRead + AsyncWrite + Unpin>(
     mut stream: T,
     open: &OpenProxyStreamV1,
     timeout: Duration,
-) -> Result<([u8; 16], [u8; 16]), PublicErrorCode> {
+) -> Result<([u8; 16], [u8; 16], T), PublicErrorCode> {
     tokio::time::timeout(timeout, async {
         proxy_codec::write_open(&mut stream, open)
             .await
@@ -20,8 +20,13 @@ pub async fn open_accepted_stream<T: AsyncRead + AsyncWrite + Unpin>(
                 request_id,
                 stream_id,
                 selected_upstream_mode: p2x_protocol::UpstreamMode::Tcp,
-            } if request_id == open.request_id => Ok((request_id, stream_id)),
-            ProxyOpenResponseV1::Rejected { error, .. } => Err(error.code),
+            } if request_id == open.request_id => Ok((request_id, stream_id, stream)),
+            ProxyOpenResponseV1::Rejected { request_id, error }
+                if request_id == Some(open.request_id) || request_id.is_none() =>
+            {
+                Err(error.code)
+            }
+            ProxyOpenResponseV1::Rejected { .. } => Err(PublicErrorCode::ProtocolMalformed),
             ProxyOpenResponseV1::Authorized { .. } => {
                 Err(PublicErrorCode::ProtocolCapabilityMismatch)
             }

@@ -21,3 +21,7 @@
 [validation] workspace fmt/check/clippy/tests passed; resolution real-process TCP, QUIC, and proxy-limit cases passed.
 [review] Phase 4.4 server diff reviewed: no destination from client; capacity precedes replay consume; consumed tickets remain consumed on dial failure; admission release is routed once.
 [status] Phase 4.4 server portion ready to commit.
+[action] Phase 4.5: added long-running client fixed-TCP ingress tasks with bounded pre-Accept buffering and accept-time deadline, routed ingress through RouteOpenSupervisor, returned accepted libp2p streams, promoted connection-manager active state, and released active resources on tunnel terminal.
+[validation] workspace tests/clippy/format passed; existing resolution local suite all cases passed except no tunnel canonical suite yet; proxy-limit passed after fixture bounds update.
+[review] Client handoff diff reviewed: ingress maps are bounded by configured route/stream owners, Accepted correlation is checked, local EOF cancels matching Open, and no post-Accept retry is introduced.
+[status] Phase 4.5 ready to commit; canonical tunnel harness and full Definition of Done remain.

@@ -16,6 +16,7 @@ pub struct SetupLimits {
     pub max_peer_states: usize,
     pub max_pending_setups: usize,
     pub max_pending_per_server: usize,
+    pub max_streams_per_server: usize,
 }
 struct PeerState {
     book: ConnectionBook,
@@ -70,7 +71,10 @@ impl ConnectionManager {
             return Err(PublicErrorCode::LimitPeerConnections);
         }
         if let Some(state) = self.peers.get_mut(&server) {
-            if state.draining || state.pending >= self.limits.max_pending_per_server {
+            if state.draining
+                || state.pending >= self.limits.max_pending_per_server
+                || state.pending.saturating_add(state.active) >= self.limits.max_streams_per_server
+            {
                 return Err(PublicErrorCode::LimitPeerConnections);
             }
             state.pending += 1;
@@ -517,6 +521,7 @@ mod tests {
                 max_peer_states: 1,
                 max_pending_setups: 2,
                 max_pending_per_server: 1,
+                max_streams_per_server: 1,
             },
         );
         let first = PeerId::random();
@@ -542,6 +547,7 @@ mod tests {
                 max_peer_states: 1,
                 max_pending_setups: 1,
                 max_pending_per_server: 2,
+                max_streams_per_server: 2,
             },
         );
         let server = PeerId::random();
@@ -563,6 +569,7 @@ mod tests {
                 max_peer_states: 1,
                 max_pending_setups: 4,
                 max_pending_per_server: 4,
+                max_streams_per_server: 4,
             },
         );
         assert_eq!(
@@ -590,6 +597,7 @@ mod tests {
                 max_peer_states: 1,
                 max_pending_setups: 4,
                 max_pending_per_server: 4,
+                max_streams_per_server: 4,
             },
         );
         let (_, first) = manager.begin_path(server, Instant::now()).unwrap();
@@ -618,6 +626,7 @@ mod tests {
                 max_peer_states: 1,
                 max_pending_setups: 4,
                 max_pending_per_server: 4,
+                max_streams_per_server: 4,
             },
         );
         manager.admit(server).unwrap();
@@ -651,6 +660,7 @@ mod tests {
                 max_peer_states: 1,
                 max_pending_setups: 2,
                 max_pending_per_server: 2,
+                max_streams_per_server: 2,
             },
         );
         assert!(manager.begin_relay_setup(server, 1).is_ok());
@@ -669,6 +679,7 @@ mod tests {
                 max_peer_states: 2,
                 max_pending_setups: 2,
                 max_pending_per_server: 2,
+                max_streams_per_server: 2,
             },
         );
         manager.admit(server).unwrap();
@@ -722,6 +733,7 @@ mod tests {
                 max_peer_states: 1,
                 max_pending_setups: 2,
                 max_pending_per_server: 2,
+                max_streams_per_server: 2,
             },
         );
         manager.admit(server).unwrap();
@@ -758,6 +770,7 @@ mod tests {
                 max_peer_states: 1,
                 max_pending_setups: 1,
                 max_pending_per_server: 1,
+                max_streams_per_server: 1,
             },
         );
         let now = Instant::now();
@@ -807,6 +820,7 @@ mod tests {
                 max_peer_states: 1,
                 max_pending_setups: 1,
                 max_pending_per_server: 1,
+                max_streams_per_server: 1,
             },
         );
         let deadline = now + Duration::from_millis(250);
