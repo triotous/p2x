@@ -638,6 +638,31 @@ async fn main() -> io::Result<()> {
                 if !release.admission.is_empty() && !proxy_admission.release(release.admission) {
                     return Err(io::Error::other("proxy stream admission released more than once"));
                 }
+                let peer = release.peer_id.to_string();
+                if release.accepted {
+                    emitter.emit(&LifecycleRecord::TunnelTerminal {
+                        peer_id: &peer,
+                        connection_id_hash: stable_hash(release.connection_id),
+                        request_id_hash: release.request_id_hash,
+                        stream_id_hash: release.stream_id_hash,
+                        accepted: true,
+                        code: release.code.map(PublicErrorCode::as_str),
+                        local_to_remote_bytes: release.pump.map_or(0, |result| result.local_to_remote_bytes),
+                        remote_to_local_bytes: release.pump.map_or(0, |result| result.remote_to_local_bytes),
+                        local_eof: release.pump.is_some_and(|result| result.local_eof),
+                        remote_eof: release.pump.is_some_and(|result| result.remote_eof),
+                        duration_ms: release.pump.map_or(0, |result| result.duration.as_millis()),
+                    })?;
+                } else if let Some(code) = release.code {
+                    emitter.emit(&LifecycleRecord::ProxyAuthorization {
+                        peer_id: &peer,
+                        connection_id_hash: stable_hash(release.connection_id),
+                        request_id_hash: release.request_id_hash,
+                        stream_id_hash: release.stream_id_hash,
+                        authorized: false,
+                        code: Some(code.as_str()),
+                    })?;
+                }
                 proxy_workers = proxy_workers.saturating_sub(1);
             }
             Some(admission) = proxy_promotion_rx.recv() => {

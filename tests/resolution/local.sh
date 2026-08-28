@@ -253,7 +253,7 @@ registration:
       metadata: {{service: orders}}
     enabled: {enabled}
     connect: 127.0.0.1:{self.upstream_port}
-    concurrency_limit: 1
+    concurrency_limit: {1 if case == "proxy-limit" else 64}
 """
         )
         selector = "missing" if case == "unknown-selector" else "orders"

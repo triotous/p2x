@@ -73,7 +73,11 @@ impl ConnectionManager {
         if let Some(state) = self.peers.get_mut(&server) {
             if state.draining
                 || state.pending >= self.limits.max_pending_per_server
-                || state.pending.saturating_add(state.active) >= self.limits.max_streams_per_server
+                || state.pending.saturating_add(state.active)
+                    >= self
+                        .limits
+                        .max_streams_per_server
+                        .max(self.limits.max_pending_per_server)
             {
                 return Err(PublicErrorCode::LimitPeerConnections);
             }
@@ -411,6 +415,29 @@ impl ConnectionManager {
         if selected.is_some() {
             self.mark_active(server);
         }
+    }
+
+    pub fn admit_stream(&mut self, server: PeerId) -> Result<(), PublicErrorCode> {
+        let state = self
+            .peers
+            .get_mut(&server)
+            .ok_or(PublicErrorCode::LimitPeerConnections)?;
+        if state.active >= self.limits.max_streams_per_server {
+            return Err(PublicErrorCode::LimitProxyStreams);
+        }
+        state.active += 1;
+        Ok(())
+    }
+
+    pub fn release_stream(&mut self, server: PeerId) -> bool {
+        let Some(state) = self.peers.get_mut(&server) else {
+            return false;
+        };
+        if state.active == 0 {
+            return false;
+        }
+        state.active -= 1;
+        true
     }
 
     pub fn setup_deadline(&self, started: Instant) -> Instant {

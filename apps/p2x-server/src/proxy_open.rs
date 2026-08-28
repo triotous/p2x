@@ -12,6 +12,11 @@ pub struct Release {
     pub peer_id: PeerId,
     pub connection_id: ConnectionId,
     pub admission: AdmissionToken,
+    pub request_id_hash: u64,
+    pub stream_id_hash: Option<u64>,
+    pub accepted: bool,
+    pub code: Option<PublicErrorCode>,
+    pub pump: Option<p2x_proxy::PumpResult>,
 }
 
 pub enum ServerDecision {
@@ -85,7 +90,20 @@ pub async fn run_worker(
         .await
         .is_err()
     {
-        release(&releases, peer_id, connection_id, AdmissionToken::empty()).await;
+        release(
+            &releases,
+            peer_id,
+            connection_id,
+            AdmissionToken::empty(),
+            request_id
+                .map(p2x_net::lifecycle::stable_hash)
+                .unwrap_or_default(),
+            None,
+            false,
+            None,
+            None,
+        )
+        .await;
         return;
     }
     let decision = response.await.unwrap_or_else(|_| {
@@ -94,8 +112,18 @@ pub async fn run_worker(
             error: PublicError::new(PublicErrorCode::ExchangeOverloaded, true),
         })
     });
+    let request_id_hash = request_id
+        .map(p2x_net::lifecycle::stable_hash)
+        .unwrap_or_default();
+    let mut stream_id_hash = None;
+    let mut accepted = false;
+    let mut code = None;
+    let mut pump = None;
     let admission = match decision {
         ServerDecision::Reject(response) => {
+            if let ProxyOpenResponseV1::Rejected { error, .. } = &response {
+                code = Some(error.code);
+            }
             let _ = proxy_codec::write_response(&mut stream, &response).await;
             AdmissionToken::empty()
         }
@@ -105,8 +133,20 @@ pub async fn run_worker(
             upstream,
             copy_buffer_bytes,
         } => {
+            stream_id_hash = Some(p2x_net::lifecycle::stable_hash(stream_id));
             let Ok(open) = open.as_ref() else {
-                release(&releases, peer_id, connection_id, admission).await;
+                release(
+                    &releases,
+                    peer_id,
+                    connection_id,
+                    admission,
+                    request_id_hash,
+                    stream_id_hash,
+                    false,
+                    None,
+                    None,
+                )
+                .await;
                 return;
             };
             let dial = match hold_dial_ms {
@@ -132,17 +172,27 @@ pub async fn run_worker(
                         .await
                         .is_ok()
                     {
-                        let _ = p2x_proxy::pump(
+                        accepted = true;
+                        pump = p2x_proxy::pump(
                             stream,
                             tokio_util::compat::TokioAsyncReadCompatExt::compat(socket),
                             copy_buffer_bytes,
                             upstream.idle_timeout,
                             futures::future::pending(),
                         )
-                        .await;
+                        .await
+                        .ok();
+                        if pump.as_ref().is_some_and(|result| {
+                            result.terminal == p2x_proxy::Terminal::IdleTimeout
+                        }) {
+                            code = Some(PublicErrorCode::UpstreamIdleTimeout);
+                        }
+                    } else {
+                        code = Some(PublicErrorCode::ProtocolMalformed);
                     }
                 }
                 Err(error) => {
+                    code = Some(error.code());
                     let response = ProxyOpenResponseV1::Rejected {
                         request_id: Some(open.request_id),
                         error: PublicError::new(error.code(), true),
@@ -153,20 +203,42 @@ pub async fn run_worker(
             admission
         }
     };
-    release(&releases, peer_id, connection_id, admission).await;
+    release(
+        &releases,
+        peer_id,
+        connection_id,
+        admission,
+        request_id_hash,
+        stream_id_hash,
+        accepted,
+        code,
+        pump,
+    )
+    .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn release(
     releases: &mpsc::Sender<Release>,
     peer_id: PeerId,
     connection_id: ConnectionId,
     admission: AdmissionToken,
+    request_id_hash: u64,
+    stream_id_hash: Option<u64>,
+    accepted: bool,
+    code: Option<PublicErrorCode>,
+    pump: Option<p2x_proxy::PumpResult>,
 ) {
     let _ = releases
         .send(Release {
             peer_id,
             connection_id,
             admission,
+            request_id_hash,
+            stream_id_hash,
+            accepted,
+            code,
+            pump,
         })
         .await;
 }

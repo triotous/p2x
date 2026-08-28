@@ -66,6 +66,15 @@ pub enum LifecycleRecord<'a> {
         authorized: bool,
         code: Option<&'a str>,
     },
+    IngressAccepted {
+        route_id_hash: u64,
+        ingress_id: u64,
+    },
+    IngressRejected {
+        route_id_hash: u64,
+        ingress_id: u64,
+        code: &'a str,
+    },
     TunnelTerminal {
         peer_id: &'a str,
         connection_id_hash: u64,

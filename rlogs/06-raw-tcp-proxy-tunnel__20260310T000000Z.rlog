@@ -30,3 +30,6 @@
 [review] Hook is hidden, range-limited to 30s, and only delays the already validated immutable upstream path.
 [action] Corrected dial test-hook semantics so a held delay at or beyond connect timeout deterministically returns upstream.connect_timeout, while shorter holds still use the validated connector.
 [validation] workspace fmt/check/clippy/tests passed.
+[action] Phase 4.6/7: added strict live tunnel harness with run-scoped fixtures, direct/forced-relay opaque echo, half-close, idle, refused, timeout, cleanup, and privacy scan; added tunnel lifecycle and fixed accept-time absolute deadline.
+[validation] tunnel cases fixed-tcp-direct, fixed-tcp-relay, half-close-direct, half-close-relay, idle-timeout, upstream-refused, upstream-timeout passed; concurrent-opens regression passed after per-service fixture correction; auth exchange-restart passed on rerun; workspace fmt/clippy/tests passed.
+[blocker] Remaining canonical tunnel names currently exercise the common real-process smoke path rather than the full topology-specific loss/large-RSS/64-stream/shutdown evidence. Owner-executed platform/topology/soak gates remain incomplete per plan.

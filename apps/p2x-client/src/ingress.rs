@@ -137,6 +137,7 @@ async fn accept_loop(
             commands,
             permit,
             copy_buffer_bytes,
+            Instant::now() + setup_timeout,
             events,
             shutdown,
         ));
@@ -151,13 +152,21 @@ async fn run_connection(
     mut commands: mpsc::Receiver<IngressCommand>,
     _permit: tokio::sync::OwnedSemaphorePermit,
     copy_buffer_bytes: usize,
+    deadline_at: Instant,
     events: mpsc::Sender<IngressEvent>,
     shutdown: CancellationToken,
 ) {
     let mut prebuffer = vec![0; copy_buffer_bytes];
     let mut filled = 0;
+    let mut local_eof = false;
+    let deadline = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline_at));
+    tokio::pin!(deadline);
     loop {
         tokio::select! {
+            _ = &mut deadline => {
+                let _ = events.send(IngressEvent::Closed { id }).await;
+                return;
+            },
             _ = shutdown.cancelled() => return,
             command = commands.recv() => match command {
                 Some(IngressCommand::StartTunnel { stream }) => {
@@ -171,10 +180,9 @@ async fn run_connection(
                 }
                 Some(IngressCommand::Reject) | None => return,
             },
-            read = socket.read(&mut prebuffer[filled..]), if filled < prebuffer.len() => match read {
+            read = socket.read(&mut prebuffer[filled..]), if filled < prebuffer.len() && !local_eof => match read {
                 Ok(0) => {
-                    let _ = events.send(IngressEvent::Closed { id }).await;
-                    return;
+                    local_eof = true;
                 }
                 Ok(count) => filled += count,
                 Err(_) => {
@@ -212,6 +220,7 @@ mod tests {
             commands,
             permits.try_acquire_owned().unwrap(),
             p2x_proxy::MIN_COPY_BUFFER,
+            Instant::now() + Duration::from_secs(1),
             events,
             shutdown.clone(),
         ));
