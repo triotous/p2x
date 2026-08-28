@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/p2x-protocol", "crates/p2x-config", "crates/p2x-net", "apps/p2x-exchange", "apps/p2x-client", "apps/p2x-server"]
+members = ["crates/p2x-protocol", "crates/p2x-config", "crates/p2x-net", "crates/p2x-proxy", "apps/p2x-exchange", "apps/p2x-client", "apps/p2x-server"]
 
 [workspace.package]
 edition = "2024"
@@ -28,6 +28,7 @@ web-time = "1"
 thiserror = "2"
 yaml-rust2 = "0.11"
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

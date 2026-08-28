@@ -1,0 +1,15 @@
+[package]
+name = "p2x-proxy"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+futures.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio-util.workspace = true

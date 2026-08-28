@@ -143,10 +143,7 @@ mod tests {
     #[test]
     fn open_does_not_require_write_half_close_before_authorization() {
         let mut valid = Cursor::new(framed_open());
-        assert_eq!(
-            block_on(read_open(&mut valid)).unwrap(),
-            open()
-        );
+        assert_eq!(block_on(read_open(&mut valid)).unwrap(), open());
 
         let mut early_data = framed_open();
         early_data.push(0x42);

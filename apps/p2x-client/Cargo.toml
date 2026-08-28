@@ -16,4 +16,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
+p2x-proxy = { path = "../../crates/p2x-proxy" }
 tracing-subscriber.workspace = true
