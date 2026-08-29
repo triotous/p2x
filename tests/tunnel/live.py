@@ -249,11 +249,14 @@ credentials:
         concurrent = base_case == "concurrent-streams" or base_case == "resource-baseline"
         limited = base_case == "stream-limits" or self.case == "per-ingress-failure-recovery/path-capacity"
         max_workers = 1 if self.case in {"per-ingress-failure-recovery/path-capacity", "stream-limits/server-global"} else 2 if base_case == "stream-limits" else 256
-        max_workers_per_client = 1 if self.case == "stream-limits/server-client" else 1 if limited else 128 if concurrent else 32
-        max_upstream_dials = 1 if self.case in {"per-ingress-failure-recovery/path-capacity", "stream-limits/server-dial"} else 128 if concurrent else 64
-        concurrency_limit = 1 if self.case == "stream-limits/server-service" else 1 if limited else 128 if concurrent else 64
+        max_workers_per_client = 1 if self.case in {"stream-limits", "stream-limits/server-client"} else 2 if self.case in {"stream-limits/client-server", "stream-limits/server-global", "stream-limits/server-service", "stream-limits/server-dial"} else 128 if concurrent else 32
+        max_upstream_dials = 1 if self.case in {"per-ingress-failure-recovery/path-capacity", "stream-limits/server-dial", "stream-limits"} else 2 if self.case in {"stream-limits/client-server", "stream-limits/server-client", "stream-limits/server-global", "stream-limits/server-service"} else 128 if concurrent else 64
+        concurrency_limit = 1 if self.case in {"stream-limits", "stream-limits/server-service"} else 2 if self.case in {"stream-limits/client-server", "stream-limits/server-client", "stream-limits/server-global", "stream-limits/server-dial"} else 128 if concurrent else 64
         if self.case == "stream-limits/server-global":
-            max_workers_per_client = max_upstream_dials = concurrency_limit = 128
+            max_workers = max_upstream_dials = concurrency_limit = 2
+            max_workers_per_client = 128
+        if self.case == "stream-limits/client-ingress":
+            max_workers = max_workers_per_client = max_upstream_dials = concurrency_limit = 2
         self.services.write_text(
             f"""schema_version: 1
 registration:
@@ -279,6 +282,8 @@ proxy:
 """
         )
         direct = 0 if base_case.endswith("-relay") else 5000 if base_case == "control-loss-direct" else 1500
+        if self.case == "deadline-stages":
+            direct = 0
         setup_timeout = 1_000 if self.case == "deadline-stages" else 20_000
         self.routes = self.secret / "routes.yaml"
         self.routes.write_text(
@@ -388,7 +393,7 @@ limits:
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
         elif self.case.split("/", 1)[0] == "stream-limits" or self.case == "per-ingress-failure-recovery/path-capacity":
             if self.case == "stream-limits/server-dial":
-                args += ["--test-hold-upstream-dial-ms", "3000"]
+                args += ["--test-hold-upstream-dial-ms", "1000"]
             else:
                 args += ["--test-hold-proxy-handshake-ms", "1000"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
@@ -481,7 +486,10 @@ def wait_for_eof(peer: socket.socket, timeout: float = 10.0) -> None:
         ready, _, _ = select.select([peer], [], [], min(0.2, end - time.monotonic()))
         if not ready:
             continue
-        if not peer.recv(65536):
+        try:
+            if not peer.recv(65536):
+                return
+        except ConnectionResetError:
             return
     raise Failure("socket did not close after local ingress rejection")
 
@@ -503,9 +511,45 @@ def assert_final_resources(path: pathlib.Path) -> bool:
         raise Failure(f"{path.name}: final resources are not zero: {final}")
     return True
 
+def assert_final_exchange_resources(path: pathlib.Path) -> bool:
+    rows = [row for row in read_rows(path) if row.get("event") == "exchange_resources"]
+    if not rows:
+        raise Failure(f"{path.name}: no exchange resource record")
+    final = rows[-1]
+    fields = ("sessions", "relay_admissions", "reservations", "circuits", "registrations", "selector_owners", "auth_requests", "registry_requests")
+    if any(final.get(field, 0) != 0 for field in fields):
+        raise Failure(f"{path.name}: final exchange resources are not zero: {final}")
+    return True
+
+def assert_resource_profile(run: Run, client_rows: list[dict], server_rows: list[dict], target: int) -> bool:
+    required = ("before", "128_headroom", "after_release")
+    if any(mark not in run.resource_marks for mark in required):
+        raise Failure(f"resource profile is missing marks: {run.resource_marks}")
+    for component in ("p2x-client", "p2x-server"):
+        before = run.resource_marks["before"]
+        peak = run.resource_marks["128_headroom"]
+        after = run.resource_marks["after_release"]
+        values = [(mark, snapshot.get(f"rss_{component}"), snapshot.get(f"fds_{component}")) for mark, snapshot in (("before", before), ("peak", peak), ("after", after))]
+        if any(rss is None or fds is None for _, rss, fds in values):
+            raise Failure(f"resource profile missing {component} sample: {values}")
+        _, before_rss, before_fds = values[0]
+        _, peak_rss, peak_fds = values[1]
+        _, after_rss, after_fds = values[2]
+        if peak_rss - before_rss > 64 * 1024 * 1024 or abs(after_rss - before_rss) > 64 * 1024 * 1024:
+            raise Failure(f"{component} RSS exceeded declared tolerance: {values}")
+        if peak_fds - before_fds > target + 32 or after_fds > before_fds + 32:
+            raise Failure(f"{component} FD profile did not drain: {values}")
+    if max((row.get("workers", 0) for row in client_rows if row.get("event") == "resources"), default=0) < target:
+        raise Failure("client logical worker peak did not reach the target")
+    if max((row.get("workers", 0) for row in server_rows if row.get("event") == "resources"), default=0) < target:
+        raise Failure("server logical worker peak did not reach the target")
+    if run.upstream is None or run.upstream.accepted_connections < target:
+        raise Failure(f"upstream did not expose {target} independent sockets: {run.upstream and run.upstream.accepted_connections}")
+    return True
+
 def assert_privacy(run: Run, paths: list[pathlib.Path]) -> bool:
-    output = "\\n".join(path.read_text(errors="replace") for path in paths)
-    markers = [run.client_token, run.server_token, *run.private, run.payload_sentinel, f"127.0.0.1:{run.upstream_port}"]
+    output = "\n".join(path.read_text(errors="replace") for path in paths)
+    markers = [run.client_token, run.client2_token, run.server_token, *run.private, run.payload_sentinel, f"127.0.0.1:{run.upstream_port}"]
     for marker in markers:
         if marker in output:
             raise Failure(f"privacy scan found exact run marker {marker}")
@@ -519,15 +563,51 @@ def assert_named_contract(requested_case: str, client_rows: list[dict], server_r
             raise Failure(f"{requested_case} did not observe per-ingress rejection")
         if not any(row.get("event") == "started" for row in client_rows):
             raise Failure(f"{requested_case} did not keep client alive")
-        if requested_case == "per-ingress-failure-recovery/upstream":
+        if sum(row.get("event") == "ingress_accepted" for row in client_rows) < 2:
+            raise Failure(f"{requested_case} did not accept a later ingress")
+        if requested_case == "per-ingress-failure-recovery/resolve":
+            if not any(row.get("event") == "test_fault_applied" and row.get("fault") == "fail_first_resolve" for row in client_rows):
+                raise Failure("resolve recovery did not apply the resolve fault")
+        elif requested_case == "per-ingress-failure-recovery/path-capacity":
+            if not any(row.get("event") == "ingress_rejected" and row.get("code") == "limit.proxy_streams" for row in client_rows):
+                raise Failure("path-capacity did not reject only the overflow ingress")
+        elif requested_case == "per-ingress-failure-recovery/upstream":
             if not any(row.get("event") == "proxy_authorization" and row.get("code") == "upstream.connect_failed" and not row.get("authorized") for row in server_rows):
                 raise Failure("upstream recovery did not classify the failed ingress")
-            if sum(row.get("event") == "tunnel_accepted" for row in client_rows) < 1:
-                raise Failure("upstream recovery did not accept the later ingress")
+        elif requested_case == "per-ingress-failure-recovery/pre-accept-eof":
+            if not any(row.get("event") == "ingress_rejected" and row.get("code") == "peer.connection_failed" for row in client_rows):
+                raise Failure("pre-accept EOF did not reject the exact ingress")
         return "per_ingress_failure_recovery"
     if requested_case.startswith("stream-limits/"):
-        if not any(row.get("code") == "limit.proxy_streams" and not row.get("authorized") for row in server_rows):
-            raise Failure(f"{requested_case} did not observe server N+1 rejection")
+        client_rejections = [row for row in client_rows if row.get("event") == "ingress_rejected"]
+        server_rejections = [row for row in server_rows if row.get("event") == "proxy_authorization" and not row.get("authorized")]
+        if requested_case == "stream-limits/client-ingress":
+            if not any(row.get("code") == "limit.proxy_streams" for row in client_rejections):
+                raise Failure("client-ingress did not reject N+1 at the local ingress")
+            if len([row for row in server_rows if row.get("event") == "tunnel_accepted"]) != 2:
+                raise Failure("client-ingress did not reuse released capacity")
+        elif requested_case == "stream-limits/client-server":
+            if not any(row.get("code") in {"limit.proxy_streams", "limit.peer_connections"} for row in client_rejections):
+                raise Failure("client-server did not reject N+1 at the client")
+            if server_rejections:
+                raise Failure("client-server sent its local-only overflow to the server")
+        elif requested_case == "stream-limits/server-global":
+            if not any(row.get("code") == "limit.proxy_streams" for row in server_rejections):
+                raise Failure("server-global did not reject N+1 globally")
+        elif requested_case == "stream-limits/server-client":
+            if len([row for row in server_rows if row.get("event") == "tunnel_accepted"]) != 2:
+                raise Failure("server-client did not admit the second authenticated client")
+        elif requested_case == "stream-limits/server-service":
+            if not any(row.get("code") == "limit.proxy_streams" for row in server_rejections):
+                raise Failure("server-service did not reject N+1 at service capacity")
+        elif requested_case == "stream-limits/server-dial":
+            if not any(row.get("code") == "limit.proxy_streams" for row in server_rejections):
+                raise Failure("server-dial did not reject N+1 before ticket consume")
+            if not any(row.get("event") == "resources" and row.get("tasks") == 0 for row in server_rows):
+                raise Failure("server-dial did not return dialing entries to zero")
+        else:
+            if not any(row.get("code") == "limit.proxy_streams" for row in server_rejections):
+                raise Failure(f"{requested_case} did not observe server N+1 rejection")
         return "stream_limit_boundary"
     if requested_case.startswith("shutdown/"):
         if not any(row.get("event") == "terminal" and row.get("code") == "shutdown" for row in client_rows + server_rows):
@@ -541,6 +621,18 @@ def assert_named_contract(requested_case: str, client_rows: list[dict], server_r
         if not client_terminals or not server_terminals:
             raise Failure("terminal-correlation did not observe both terminal sides")
         return "terminal_correlation"
+    if requested_case == "idle-timeout":
+        if not any(row.get("terminal_class") == "idle_timeout" for row in server_terminals):
+            raise Failure("idle-timeout did not terminate the isolated idle stream")
+        if len(client_terminals) != 2 or len(server_terminals) != 2:
+            raise Failure("idle-timeout did not terminate both isolated and active streams")
+        return "idle_isolation"
+    if requested_case == "deadline-stages":
+        if not any(row.get("event") == "ingress_rejected" and row.get("code") == "peer.setup_timeout" for row in client_rows):
+            raise Failure("deadline-stages did not reject at the original accept deadline")
+        if not any(row.get("event") == "resources" and row.get("pending_opens") == 0 and row.get("workers") == 0 for row in client_rows):
+            raise Failure("deadline-stages did not drain client setup owners")
+        return "deadline_stage_timeout"
     if requested_case == "concurrent-streams/64-sustained":
         if len(client_terminals) != 64 or len(server_terminals) != 64:
             raise Failure("64-sustained did not finish exactly 64 tunnels")
@@ -621,7 +713,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
     exchange_log = server_log = client_log = None
     try:
         if profile not in {"upstream-refused", "upstream-timeout"} and requested_case != "per-ingress-failure-recovery/upstream":
-            mode = "half-close" if profile.startswith("half-close") else "idle" if profile == "idle-timeout" else "hold" if profile in {"path-loss-recovery", "shutdown-cancellation", "shutdown", "concurrent-streams", "resource-baseline"} else "slow-first" if profile.startswith("large-slow") else "echo"
+            mode = "half-close" if profile.startswith("half-close") else "idle-first" if profile == "idle-timeout" else "hold" if profile in {"path-loss-recovery", "shutdown-cancellation", "shutdown", "concurrent-streams", "resource-baseline"} else "slow-first" if profile.startswith("large-slow") else "echo"
             run.upstream = Upstream(run.upstream_port, mode)
             run.upstream.start()
         exchange_log = run.start_exchange()
@@ -633,14 +725,24 @@ def run_case(root: pathlib.Path, case: str) -> None:
         client_log = run.start_client(exchange)
         wait_for(client_log, lambda row: row.get("event") == "started", 20)
         wait_for(client_log, lambda row: row.get("event") == "auth_readiness" and row.get("ready") is True, 45)
+        client2_log = None
+        if requested_case == "stream-limits/server-client":
+            client2_log = run.start_client(exchange, "client2", second=True)
+            wait_for(client2_log, lambda row: row.get("event") == "started", 20)
+            wait_for(client2_log, lambda row: row.get("event") == "auth_readiness" and row.get("ready") is True, 45)
         run.start_sampler()
         client = None if profile in {"concurrent-streams", "resource-baseline"} else socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+        client2 = None
         if client is not None:
             client.settimeout(900 if profile.startswith("large-slow") else 60)
             if profile not in {"upstream-refused", "upstream-timeout", "idle-timeout"} and requested_case not in {
+                "stream-limits/client-ingress",
+                "stream-limits/client-server",
+                "stream-limits/server-dial",
                 "per-ingress-failure-recovery/resolve",
                 "per-ingress-failure-recovery/upstream",
                 "per-ingress-failure-recovery/pre-accept-eof",
+                "deadline-stages",
                 "shutdown/client-setup",
                 "shutdown/server-setup",
             }:
@@ -669,6 +771,12 @@ def run_case(root: pathlib.Path, case: str) -> None:
             second.close()
             client.close()
             client = None
+            later = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            later.settimeout(20)
+            later.sendall(b"capacity-reused")
+            if recv_exact(later, len(b"capacity-reused")) != b"capacity-reused":
+                raise Failure("path-capacity did not reuse released capacity")
+            later.close()
         elif requested_case == "per-ingress-failure-recovery/upstream":
             assert client is not None
             wait_for(server_log, lambda row: row.get("event") == "proxy_authorization" and row.get("code") == "upstream.connect_failed", 45)
@@ -700,6 +808,136 @@ def run_case(root: pathlib.Path, case: str) -> None:
             if recv_exact(later, len(payload)) != payload:
                 raise Failure("pre-accept EOF did not promote a later ingress")
             later.close()
+        elif requested_case == "idle-timeout":
+            assert client is not None
+            second = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            second.settimeout(10)
+            payload = b"idle-isolation"
+            started = time.monotonic()
+            second.sendall(payload)
+            if recv_exact(second, len(payload)) != payload or time.monotonic() - started >= 5:
+                raise Failure("idle-timeout blocked unrelated active traffic")
+            second.close()
+            wait_for_eof(client, 5)
+            client.close()
+            client = None
+        elif requested_case == "deadline-stages":
+            assert client is not None
+            started = time.monotonic()
+            client.sendall(b"deadline-stage")
+            wait_for(client_log, lambda row: row.get("event") == "ingress_rejected" and row.get("code") == "peer.setup_timeout", 10)
+            wait_for_eof(client, 10)
+            if time.monotonic() - started >= 5:
+                raise Failure("deadline-stages exceeded the five-second setup bound")
+            client.close()
+            client = None
+        elif requested_case == "stream-limits/client-ingress":
+            assert client is not None
+            client.sendall(b"held-client-ingress")
+            wait_for(client_log, lambda row: row.get("event") == "tunnel_accepted", 60)
+            overflow = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            overflow.settimeout(20)
+            overflow.sendall(b"client-ingress-overflow")
+            wait_for(client_log, lambda row: row.get("event") == "ingress_rejected", 20)
+            wait_for_eof(overflow)
+            overflow.close()
+            client.close()
+            client = None
+            reusable = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            reusable.settimeout(20)
+            reusable.sendall(b"client-ingress-reused")
+            if recv_exact(reusable, len(b"client-ingress-reused")) != b"client-ingress-reused":
+                raise Failure("client-ingress did not reuse released capacity")
+            reusable.close()
+        elif requested_case == "stream-limits/client-server":
+            assert client is not None
+            client.sendall(b"held-client-server")
+            wait_for(client_log, lambda row: row.get("event") == "tunnel_accepted", 60)
+            overflow = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            overflow.settimeout(20)
+            overflow.sendall(b"client-server-overflow")
+            wait_for(client_log, lambda row: row.get("event") == "ingress_rejected", 20)
+            wait_for_eof(overflow)
+            overflow.close()
+            client.close()
+            client = None
+            reusable = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            reusable.settimeout(20)
+            reusable.sendall(b"client-server-reused")
+            if recv_exact(reusable, len(b"client-server-reused")) != b"client-server-reused":
+                raise Failure("client-server did not reuse released capacity")
+            reusable.close()
+        elif requested_case == "stream-limits/server-global":
+            assert client is not None
+            held_second = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            held_second.settimeout(30)
+            client.sendall(b"held-server-global-1")
+            held_second.sendall(b"held-server-global-2")
+            wait_for_count(server_log, lambda row: row.get("event") == "tunnel_accepted", 2, 60)
+            overflow = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            overflow.settimeout(20)
+            overflow.sendall(b"server-global-overflow")
+            wait_for(server_log, lambda row: row.get("event") == "proxy_authorization" and row.get("authorized") is False and row.get("code") == "limit.proxy_streams", 30)
+            wait_for_eof(overflow)
+            overflow.close()
+            client.close()
+            held_second.close()
+            client = None
+            wait_for_count(server_log, lambda row: row.get("event") == "tunnel_terminal", 2, 30)
+            reusable = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            reusable.settimeout(20)
+            reusable.sendall(b"server-global-reused")
+            if recv_exact(reusable, len(b"server-global-reused")) != b"server-global-reused":
+                raise Failure("server-global did not reuse released global capacity")
+            reusable.close()
+        elif requested_case == "stream-limits/server-service":
+            assert client is not None
+            client.sendall(b"held-server-limit")
+            wait_for(server_log, lambda row: row.get("event") == "tunnel_accepted", 60)
+            overflow = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            overflow.settimeout(20)
+            overflow.sendall(b"server-limit-overflow")
+            wait_for(server_log, lambda row: row.get("event") == "proxy_authorization" and row.get("authorized") is False and row.get("code") == "limit.proxy_streams", 30)
+            wait_for_eof(overflow)
+            overflow.close()
+            client.close()
+            client = None
+            wait_for(server_log, lambda row: row.get("event") == "tunnel_terminal", 30)
+            reusable = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            reusable.settimeout(20)
+            reusable.sendall(b"server-limit-reused")
+            if recv_exact(reusable, len(b"server-limit-reused")) != b"server-limit-reused":
+                raise Failure(f"{requested_case} did not reuse released service capacity")
+            reusable.close()
+        elif requested_case == "stream-limits/server-dial":
+            assert client is not None
+            client.sendall(b"held-server-dial")
+            wait_for(server_log, lambda row: row.get("event") == "resources" and row.get("tasks", 0) >= 1, 30)
+            overflow = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            overflow.settimeout(20)
+            overflow.sendall(b"server-dial-overflow")
+            wait_for(server_log, lambda row: row.get("event") == "proxy_authorization" and row.get("authorized") is False and row.get("code") == "limit.proxy_streams", 30)
+            wait_for_eof(overflow)
+            overflow.close()
+            wait_for(server_log, lambda row: row.get("event") == "tunnel_accepted", 10)
+            wait_for(client_log, lambda row: row.get("event") == "tunnel_accepted", 10)
+            client.close()
+            client = None
+            wait_for(server_log, lambda row: row.get("event") == "resources" and row.get("tasks") == 0, 30)
+        elif requested_case == "stream-limits/server-client":
+            assert client is not None and client2_log is not None
+            client.sendall(b"server-client-held")
+            wait_for_count(server_log, lambda row: row.get("event") == "tunnel_accepted", 1, 60)
+            client2 = socket.create_connection(("127.0.0.1", run.local_port2), timeout=20)
+            client2.settimeout(30)
+            client2.sendall(b"server-client-second")
+            if recv_exact(client2, len(b"server-client-second")) != b"server-client-second":
+                raise Failure("server-client second authenticated client did not progress")
+            client2.close()
+            client2 = None
+            wait_for(client2_log, lambda row: row.get("event") == "tunnel_accepted", 60)
+            client.close()
+            client = None
         elif profile == "stream-limits":
             assert client is not None
             held = [client]
@@ -808,6 +1046,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
                 target = 64 if requested_case == "concurrent-streams/64-sustained" else 128
                 peers: list[socket.socket] = []
                 expected_payloads: list[bytes] = []
+                run.mark_resources("before")
                 try:
                     for index in range(target):
                         peer = socket.create_connection(("127.0.0.1", run.local_port), timeout=60)
@@ -840,8 +1079,8 @@ def run_case(root: pathlib.Path, case: str) -> None:
                     "max_active_streams": target,
                     "direction_buffers_per_component": 2,
                     "pending_client_preaccept_buffers": 1,
-                    "declared_user_buffers": 9,
-                    "declared_bytes": 9 * 32768,
+                    "declared_user_buffers": target * 4 + 1,
+                    "declared_bytes": (target * 4 + 1) * 32768,
                     "rss_delta_limit": 64 * 1024 * 1024,
                 }, sort_keys=True) + "\n")
             else:
@@ -925,6 +1164,8 @@ def run_case(root: pathlib.Path, case: str) -> None:
                     raise Failure(f"{requested_case} did not produce {target} accepted stream correlations")
         if client is not None:
             client.close()
+        if client2 is not None:
+            client2.close()
         time.sleep(0.3)
         if profile == "shutdown-cancellation" or requested_case.startswith("shutdown/"):
             if requested_case in {"shutdown/client-setup", "shutdown/server-setup"}:
@@ -947,8 +1188,10 @@ def run_case(root: pathlib.Path, case: str) -> None:
             if not any(row.get("event") == "connection_observed" and row.get("state") == "closed" for row in read_rows(client_log)):
                 raise Failure("path-loss-recovery did not observe selected path loss")
         client_rows = read_rows(client_log)
+        if client2_log is not None:
+            client_rows.extend(read_rows(client2_log))
         server_rows = read_rows(server_log)
-        if requested_case in {"shutdown/client-setup", "shutdown/server-setup"}:
+        if requested_case in {"shutdown/client-setup", "shutdown/server-setup", "deadline-stages"}:
             lifecycle_assertions = {
                 "accepted": False,
                 "terminal_correlation": False,
@@ -963,15 +1206,19 @@ def run_case(root: pathlib.Path, case: str) -> None:
             target = 64 if requested_case == "concurrent-streams/64-sustained" else 128
             if sum(row.get("authorized") is True for row in server_rows if row.get("event") == "proxy_authorization") < target:
                 raise Failure(f"{requested_case} did not authorize {target} independent streams")
-        if profile == "stream-limits" and not any(row.get("code") == "limit.proxy_streams" and not row.get("authorized") for row in server_rows):
+        if requested_case == "stream-limits" and not any(row.get("code") == "limit.proxy_streams" and not row.get("authorized") for row in server_rows):
             raise Failure("stream-limits did not observe N+1 rejection")
         if profile in {"concurrent-streams", "resource-baseline"}:
             mark = "64_sustained" if requested_case == "concurrent-streams/64-sustained" else "128_headroom"
-            if mark not in run.resource_marks or "after_release" not in run.resource_marks:
+            if mark not in run.resource_marks or "before" not in run.resource_marks or "after_release" not in run.resource_marks:
                 raise Failure(f"{requested_case} did not capture before/peak/after resource marks")
-        if profile == "stream-limits" and sum(row.get("authorized") is True for row in server_rows if row.get("event") == "proxy_authorization") < 1:
+            if requested_case == "resource-baseline/128":
+                resource_profile = assert_resource_profile(run, client_rows, server_rows, 128)
+            else:
+                resource_profile = True
+        if requested_case == "stream-limits" and sum(row.get("authorized") is True for row in server_rows if row.get("event") == "proxy_authorization") < 1:
             raise Failure("stream-limits did not authorize the held stream")
-        if profile == "stream-limits" and not any(row.get("event") == "resources" and row.get("workers", 0) >= 1 for row in server_rows):
+        if requested_case == "stream-limits" and not any(row.get("event") == "resources" and row.get("workers", 0) >= 1 for row in server_rows):
             raise Failure("stream-limits did not observe a held active worker")
         if profile == "shutdown-cancellation":
             for path in (client_log, server_log):
@@ -1006,20 +1253,26 @@ def run_case(root: pathlib.Path, case: str) -> None:
             raise Failure("upstream timeout was not classified")
         accepted = [row for row in read_rows(client_log) if row.get("event") == "tunnel_accepted"]
         terminals = [row for row in read_rows(client_log) if row.get("event") == "tunnel_terminal"]
-        if profile not in {"upstream-refused", "upstream-timeout", "idle-timeout"} and not accepted and not requested_case.startswith("shutdown/"):
+        if profile not in {"upstream-refused", "upstream-timeout", "idle-timeout"} and not accepted and not requested_case.startswith(("shutdown/", "deadline-stages")):
             raise Failure(f"{case} did not observe tunnel acceptance")
         if len(terminals) > len(accepted):
             raise Failure(f"{case} emitted more tunnel terminals than accepted streams")
         if not requested_case.startswith("shutdown/"):
             run.stop(client_log)
+        if client2_log is not None:
+            run.stop(client2_log)
         run.stop(server_log)
         run.stop(exchange_log)
-        for path in (client_log, server_log, exchange_log):
-            wait_for_terminal(path)
+        for path in (client_log, client2_log, server_log, exchange_log):
+            if path is not None:
+                wait_for_terminal(path)
         process_logs = [path for _, path, _ in run.processes]
         process_terminals = assert_process_terminals(process_logs)
         client_resources = assert_final_resources(client_log)
+        if client2_log is not None:
+            client_resources = client_resources and assert_final_resources(client2_log)
         server_resources = assert_final_resources(server_log)
+        exchange_resources = all(assert_final_exchange_resources(path) for path in process_logs if "exchange" in path.name)
         privacy_clean = assert_privacy(run, process_logs)
         if profile in {"concurrent-streams", "resource-baseline"}:
             target = 64 if requested_case == "concurrent-streams/64-sustained" else 128
@@ -1037,7 +1290,8 @@ def run_case(root: pathlib.Path, case: str) -> None:
                 "idle_terminal_class": lifecycle_assertions["idle_terminal_class"],
                 "privacy_scan_clean": privacy_clean,
                 "one_terminal_each": process_terminals,
-                "resources_drained": client_resources and server_resources,
+                "resources_drained": client_resources and server_resources and exchange_resources,
+                "resource_profile": resource_profile if profile in {"concurrent-streams", "resource-baseline"} else False,
                 "named_contract": named_contract,
             },
         }
