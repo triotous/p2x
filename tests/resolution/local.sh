@@ -529,9 +529,9 @@ def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathli
                 selected = [row for row in client_rows if row.get("event") == "path_selected"]
                 if len(selected) != 128 or len({row.get("request_id") for row in selected}) != 128:
                     raise CaseFailure("concurrent-opens exact path correlation is incomplete")
-                pending_samples = [row.get("pending_opens", 0) for row in client_rows if row.get("event") == "resources"]
-                if not pending_samples or max(pending_samples) != 64:
-                    raise CaseFailure(f"concurrent-opens did not prove the configured 64-open owner window: {pending_samples}")
+                high_water = [row.get("opens") for row in client_rows if row.get("event") == "route_owner_high_water"]
+                if not high_water or max(high_water) != 64:
+                    raise CaseFailure(f"concurrent-opens did not prove the configured 64-open owner window: {high_water}")
             if case == "connection-reuse":
                 selected = [row for row in client_rows if row.get("event") == "path_selected"]
                 if len(selected) != 2 or len({row.get("connection_id_hash") for row in selected}) != 1:

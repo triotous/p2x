@@ -1167,6 +1167,11 @@ async fn main() -> io::Result<()> {
                 let proxy_pending = swarm.behaviour().proxy_stream.as_ref().map_or(0, |proxy| proxy.pending_count());
                 let route_pending = route_owner.as_ref().map_or(0, route_open::RouteOpenSupervisor::len);
                 let active_streams = active_ingress.len();
+                if let Some(owner) = route_owner.as_ref() {
+                    emitter.emit(&LifecycleRecord::RouteOwnerHighWater {
+                        opens: owner.high_water(),
+                    })?;
+                }
                 emitter.emit(&LifecycleRecord::Resources { connections: connections.len(), pending_opens: proxy_pending.max(route_pending), workers: route_owner.as_ref().map_or(0, route_open::RouteOpenSupervisor::handshake_count).saturating_add(active_streams), tasks: active_streams })?;
             }
             Some(event) = ingress_rx.recv(), if product_ingress => {

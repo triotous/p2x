@@ -137,6 +137,9 @@ pub enum LifecycleRecord<'a> {
         workers: usize,
         tasks: usize,
     },
+    RouteOwnerHighWater {
+        opens: usize,
+    },
     OperationalError {
         code: &'a str,
         message: &'a str,
@@ -398,6 +401,14 @@ mod tests {
         assert_eq!(value["selected_path"], "direct");
         assert_eq!(value["terminal_class"], "cancelled");
     }
+    #[test]
+    fn route_owner_high_water_is_machine_readable() {
+        let value =
+            serde_json::to_value(LifecycleRecord::RouteOwnerHighWater { opens: 64 }).unwrap();
+        assert_eq!(value["event"], "route_owner_high_water");
+        assert_eq!(value["opens"], 64);
+    }
+
     #[test]
     fn exchange_resources_are_machine_readable_counts() {
         let record = LifecycleRecord::ExchangeResources {

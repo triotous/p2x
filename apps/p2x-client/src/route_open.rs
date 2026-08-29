@@ -84,6 +84,7 @@ pub struct RouteOpenSupervisor {
     next_open_id: u64,
     next_request_id: u64,
     max_opens: usize,
+    high_water: usize,
     opens: HashMap<OpenId, RouteOpen>,
 }
 impl Default for RouteOpenSupervisor {
@@ -97,6 +98,7 @@ impl RouteOpenSupervisor {
             next_open_id: 0,
             next_request_id: 0,
             max_opens: max_opens.clamp(1, MAX_ROUTE_OPENS),
+            high_water: 0,
             opens: HashMap::new(),
         }
     }
@@ -161,7 +163,12 @@ impl RouteOpenSupervisor {
                 terminal_delivered: false,
             },
         );
+        self.high_water = self.high_water.max(self.opens.len());
         Ok((open_id, actions))
+    }
+
+    pub fn high_water(&self) -> usize {
+        self.high_water
     }
 
     pub fn resolve_sent(&mut self, open_id: OpenId, wire_id: u64) -> bool {
