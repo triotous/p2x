@@ -82,6 +82,10 @@ impl ProxyWorkerTable {
         self.workers.get(&id).copied()
     }
 
+    pub fn detach_admission(&mut self, id: ProxyWorkerId) -> Option<AdmissionToken> {
+        self.workers.get_mut(&id)?.admission.take()
+    }
+
     pub fn remove(&mut self, id: ProxyWorkerId) -> Option<WorkerRecord> {
         self.workers.remove(&id)
     }
