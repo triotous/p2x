@@ -23,3 +23,11 @@
 [validation] Tunnel --case all passed three consecutive runs; run artifacts under target/p2x-tunnel/20260829T094220Z, 20260829T094433Z, and 20260829T0947xx.
 [action] Closure rerun found direct-open-fallback and graceful-drain evidence timing issues. Restored strict fallback/drain assertions and made pre-Accept server shutdown hold emit a bounded correlated rejection before release.
 [validation] direct-open-fallback and graceful-drain passed with strict assertions; workspace check, tests, Clippy, fmt, and diff check passed.
+[action] Final closure validation on d4b2b69: restored the nightly fuzz corpus after execution, verified no plan or product diff remained, and ran the complete required automated sequence.
+[validation] cargo fmt --all -- --check, cargo clippy --workspace --all-targets --all-features -- -D warnings, cargo test --workspace --all-targets --all-features, cargo deny check, cargo tree -e features, Python compileall, and git diff --check passed.
+[validation] ./tests/resolution/local.sh --case all passed three consecutive runs (20 cases each); artifacts are under target/p2x-resolution/20260829T102938Z..20260829T103035Z, 20260829T103057Z..20260829T103155Z, and 20260829T103214Z..20260829T103314Z. Focused graceful-drain also passed as 06a-drain-verify-1787999326.
+[validation] ./tests/tunnel/local.sh --case all passed three consecutive runs (14 cases each); artifacts are under target/p2x-tunnel/20260829T103405Z..20260829T103442Z, 20260829T103443Z..20260829T103521Z, and 20260829T103523Z..20260829T103600Z.
+[validation] ./tests/auth/local.sh --case all, ./tests/registry/local.sh --case all, and ./tests/connectivity/local.sh --case all passed. Nightly cargo fuzz proxy_frame_decode with -runs=1000 passed; generated corpus changes were discarded/restored.
+[review] HEAD d4b2b69 is clean; both Plan 06a and Plan 06 are unmodified, no test __pycache__ or p2x process remains, and all product/docs/test/rlog changes are committed except this append-only record.
+[status] Plan 06a locally automatable Definition of Done is complete. Linux namespace/firewall enforcement, cross-host topology/NAT, platform/container differences, and long-running soak remain owner-executed §5.5 gates; no local loopback result is used to mark them complete.
+[commit] pending append-only final validation record for d4b2b69.
