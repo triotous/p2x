@@ -492,8 +492,10 @@ def assert_tunnel_lifecycle(case: str, client_rows: list[dict], server_rows: lis
             raise Failure(f"{case} local-to-remote counters differ for {key}")
         if client_row.get("remote_to_local_bytes") != server_row.get("remote_to_local_bytes"):
             raise Failure(f"{case} remote-to-local counters differ for {key}")
-        if client_row.get("selected_path") != server_row.get("selected_path"):
-            raise Failure(f"{case} selected path differs for {key}")
+        client_accepted_path = next(row.get("selected_path") for row in client_accepted if (row.get("request_id_hash"), row.get("stream_id_hash")) == key)
+        server_accepted_path = next(row.get("selected_path") for row in server_accepted if (row.get("request_id_hash"), row.get("stream_id_hash")) == key)
+        if client_row.get("selected_path") != client_accepted_path or server_row.get("selected_path") != server_accepted_path:
+            raise Failure(f"{case} terminal path was not frozen for {key}")
         if client_row.get("setup_duration_ms", -1) < 0 or server_row.get("setup_duration_ms", -1) < 0:
             raise Failure(f"{case} setup duration was not frozen for {key}")
         if client_row.get("selected_path") not in {"direct", "relay"}:
