@@ -20,7 +20,7 @@ const MAX_PER_PEER: usize = 64;
 const MAX_QUEUE: usize = 128;
 const OPEN_DEADLINE: Duration = Duration::from_secs(5);
 pub const MAX_INBOUND_WORKERS: usize = 256;
-pub const MAX_INBOUND_WORKERS_PER_PEER: usize = 32;
+pub const MAX_INBOUND_WORKERS_PER_PEER: usize = 256;
 #[derive(Debug)]
 pub enum ProxyOutput {
     OutboundOpened {
@@ -523,6 +523,22 @@ mod tests {
             Err("proxy.outbound_disabled")
         );
         assert!(server.inbound_admit(peer).is_ok());
+    }
+
+    #[test]
+    fn configured_inbound_per_peer_limit_allows_64_streams() {
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(1);
+        let mut behaviour = ProxyStreamBehaviour::server_with_limits(128, 64);
+        behaviour.known.insert((peer, connection));
+        for _ in 0..64 {
+            behaviour.inbound_admit_on(peer, connection).unwrap();
+        }
+        assert_eq!(behaviour.inbound_count(), 64);
+        assert_eq!(
+            behaviour.inbound_admit_on(peer, connection),
+            Err("limit.proxy_streams")
+        );
     }
 
     #[test]
