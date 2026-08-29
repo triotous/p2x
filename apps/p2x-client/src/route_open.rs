@@ -20,6 +20,7 @@ pub enum RetryClass {
 
 #[derive(Debug)]
 pub struct TunnelHandoff {
+    pub open_id: OpenId,
     pub server: PeerId,
     pub connection: p2x_net::ConnectionId,
     pub request_id: [u8; 16],
@@ -518,6 +519,7 @@ impl RouteOpenSupervisor {
         let removed = self.opens.remove(&open_id)?;
         let _ = removed;
         Some(TunnelHandoff {
+            open_id,
             server,
             connection,
             request_id,

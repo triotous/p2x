@@ -3,6 +3,7 @@ mod config;
 #[allow(dead_code)]
 mod connection_manager;
 mod ingress;
+mod ingress_owner;
 #[allow(dead_code)]
 mod proxy_open;
 #[allow(dead_code)]
@@ -14,6 +15,7 @@ use clap::{Parser, ValueEnum};
 use connection_manager::{ConnectionManager, ResolvedPeerMetadata, SetupLimits};
 use futures::StreamExt;
 use ingress::{IngressCommand, IngressEvent, IngressId};
+use ingress_owner::{IngressOwnerBook, IngressSetupOwner};
 use libp2p::{
     Multiaddr,
     request_response::{Event as RequestResponseEvent, Message as RequestResponseMessage},
@@ -85,6 +87,62 @@ fn forced_path_matches(path: Path, observed_path: ProbePath) -> bool {
             | (Path::Relay, ProbePath::Relay)
             | (Path::Both, ProbePath::Direct | ProbePath::Relay)
     )
+}
+
+fn tunnel_terminal_class(terminal: p2x_proxy::Terminal) -> p2x_net::lifecycle::TunnelTerminalClass {
+    match terminal {
+        p2x_proxy::Terminal::Complete => p2x_net::lifecycle::TunnelTerminalClass::Complete,
+        p2x_proxy::Terminal::IdleTimeout => p2x_net::lifecycle::TunnelTerminalClass::IdleTimeout,
+        p2x_proxy::Terminal::Cancelled => p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
+        p2x_proxy::Terminal::LocalIo => p2x_net::lifecycle::TunnelTerminalClass::LocalIo,
+        p2x_proxy::Terminal::RemoteIo => p2x_net::lifecycle::TunnelTerminalClass::RemoteIo,
+    }
+}
+
+fn emit_client_tunnel_terminal(
+    emitter: &Emitter,
+    owner: &ingress_owner::ActiveTunnelOwner,
+    result: Option<&p2x_proxy::PumpResult>,
+    terminal_class: p2x_net::lifecycle::TunnelTerminalClass,
+    code: Option<&str>,
+) -> io::Result<()> {
+    let peer = owner.server.to_string();
+    emitter.emit(&LifecycleRecord::TunnelTerminal {
+        component_side: p2x_net::lifecycle::ComponentSide::Client,
+        peer_id: &peer,
+        connection_id_hash: stable_hash(owner.connection),
+        request_id_hash: owner.request_id_hash,
+        stream_id_hash: Some(owner.stream_id_hash),
+        selected_path: Some(owner.selected_path),
+        accepted: true,
+        code,
+        terminal_class,
+        setup_duration_ms: owner.setup_duration.as_millis(),
+        local_to_remote_bytes: result.map_or(0, |result| result.local_to_remote_bytes),
+        remote_to_local_bytes: result.map_or(0, |result| result.remote_to_local_bytes),
+        local_eof: result.is_some_and(|result| result.local_eof),
+        remote_eof: result.is_some_and(|result| result.remote_eof),
+        duration_ms: result.map_or(0, |result| result.duration.as_millis()),
+    })
+}
+
+async fn reject_ingress(
+    owners: &mut IngressOwnerBook,
+    id: IngressId,
+    code: PublicErrorCode,
+    emitter: &Emitter,
+) -> io::Result<bool> {
+    let Some(owner) = owners.take_setup(id) else {
+        return Ok(false);
+    };
+    owner.cancel.cancel();
+    let _ = owner.command.send(IngressCommand::Reject).await;
+    emitter.emit(&LifecycleRecord::IngressRejected {
+        route_id_hash: stable_hash(&owner.route_id),
+        ingress_id: id.0,
+        code: code.as_str(),
+    })?;
+    Ok(true)
 }
 
 fn protocol_failure_code(error: &std::io::Error, fault: Option<AuthFaultArg>) -> PublicErrorCode {
@@ -370,42 +428,57 @@ async fn complete_route_actions(
     resolver: &mut resolver::ResolverState,
     route_resolve_wires: &mut MultiResolveWire,
     route_proxy_requests: &mut HashMap<ProxyRequestId, route_open::OpenId>,
-    open_by_ingress: &mut HashMap<route_open::OpenId, IngressId>,
-    ingress_by_id: &mut HashMap<IngressId, mpsc::Sender<IngressCommand>>,
-    ingress_route: &mut HashMap<IngressId, String>,
-    ingress_cancel: &mut HashMap<IngressId, tokio_util::sync::CancellationToken>,
+    ingress_owners: &mut IngressOwnerBook,
+    route_owner: &mut route_open::RouteOpenSupervisor,
+    exchange_peer: libp2p::PeerId,
+    connections: &ConnectionBook,
+    next_wire_id: &mut u64,
     manager: &mut Option<ConnectionManager>,
     swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
     emitter: &Emitter,
     case_id: &str,
 ) -> io::Result<bool> {
-    for (open_id, server, request_id, result) in completions {
+    let mut completions = VecDeque::from(completions);
+    while let Some((open_id, server, request_id, result)) = completions.pop_front() {
         route_resolve_wires.retain(|_, (candidate, _, _)| *candidate != open_id);
         route_proxy_requests.retain(|_, candidate| *candidate != open_id);
         resolver.cancel(request_id);
         if let (Some(manager), Some(server)) = (manager.as_mut(), server) {
             release_route_setup(manager, swarm, server, open_id);
         }
-        let Err(code) = result else { continue };
-        if product_ingress {
-            if let Some(ingress_id) = open_by_ingress.remove(&open_id) {
-                let route_id = ingress_route.remove(&ingress_id).unwrap_or_default();
-                if let Some(cancel) = ingress_cancel.remove(&ingress_id) {
-                    cancel.cancel();
+        if let Err(code) = result {
+            if product_ingress {
+                if let Some(ingress_id) = ingress_owners.ingress_for_open(open_id)
+                    && let Some(owner) = ingress_owners.take_setup_for_open(open_id)
+                {
+                    owner.cancel.cancel();
+                    let _ = owner.command.send(IngressCommand::Reject).await;
+                    emitter.emit(&LifecycleRecord::IngressRejected {
+                        route_id_hash: stable_hash(&owner.route_id),
+                        ingress_id: ingress_id.0,
+                        code: code.as_str(),
+                    })?;
                 }
-                if let Some(command) = ingress_by_id.remove(&ingress_id) {
-                    let _ = command.send(IngressCommand::Reject).await;
-                }
-                emitter.emit(&LifecycleRecord::IngressRejected {
-                    route_id_hash: stable_hash(&route_id),
-                    ingress_id: ingress_id.0,
-                    code: code.as_str(),
-                })?;
+            } else {
+                emitter.terminal(&TerminalResult::simple(case_id, "failed", code.as_str()))?;
+                return Ok(true);
             }
-            continue;
         }
-        emitter.terminal(&TerminalResult::simple(case_id, "failed", code.as_str()))?;
-        return Ok(true);
+        let promoted = route_owner.promote_waiters(resolver);
+        if !promoted.is_empty() {
+            let promoted_completions = drive_route_actions(
+                swarm,
+                route_owner,
+                exchange_peer,
+                emitter,
+                connections,
+                route_resolve_wires,
+                route_proxy_requests,
+                next_wire_id,
+                promoted,
+            )?;
+            completions.extend(promoted_completions);
+        }
     }
     Ok(false)
 }
@@ -870,21 +943,7 @@ async fn main() -> io::Result<()> {
         )
     });
     let mut route_admitted = 0u64;
-    let mut ingress_by_id = HashMap::<IngressId, mpsc::Sender<IngressCommand>>::new();
-    let mut ingress_started = HashMap::<IngressId, std::time::Instant>::new();
-    let mut ingress_route = HashMap::<IngressId, String>::new();
-    let mut ingress_cancel = HashMap::<IngressId, tokio_util::sync::CancellationToken>::new();
-    let mut open_by_ingress = HashMap::<route_open::OpenId, IngressId>::new();
-    let mut active_ingress = HashMap::<
-        IngressId,
-        (
-            libp2p::PeerId,
-            p2x_net::ConnectionId,
-            route_open::OpenId,
-            u64,
-            u64,
-        ),
-    >::new();
+    let mut ingress_owners = IngressOwnerBook::default();
     let mut route_resolve_wires = MultiResolveWire::new();
     let mut route_proxy_requests = HashMap::<ProxyRequestId, route_open::OpenId>::new();
     let mut route_wire_sequence = 0u64;
@@ -962,10 +1021,11 @@ async fn main() -> io::Result<()> {
                             &mut resolver_state,
                             &mut route_resolve_wires,
                             &mut route_proxy_requests,
-                            &mut open_by_ingress,
-                            &mut ingress_by_id,
-                            &mut ingress_route,
-                            &mut ingress_cancel,
+                            &mut ingress_owners,
+                            route_owner.as_mut().expect("multi-open owner exists"),
+                            expected_exchange,
+                            &connections,
+                            &mut route_wire_sequence,
                             &mut connection_manager,
                             &mut swarm,
                             &emitter,
@@ -992,10 +1052,11 @@ async fn main() -> io::Result<()> {
                         &mut resolver_state,
                         &mut route_resolve_wires,
                         &mut route_proxy_requests,
-                        &mut open_by_ingress,
-                        &mut ingress_by_id,
-                        &mut ingress_route,
-                        &mut ingress_cancel,
+                        &mut ingress_owners,
+                        route_owner.as_mut().expect("multi-open owner exists"),
+                        expected_exchange,
+                        &connections,
+                        &mut route_wire_sequence,
                         &mut connection_manager,
                         &mut swarm,
                         &emitter,
@@ -1166,7 +1227,7 @@ async fn main() -> io::Result<()> {
                 }
                 let proxy_pending = swarm.behaviour().proxy_stream.as_ref().map_or(0, |proxy| proxy.pending_count());
                 let route_pending = route_owner.as_ref().map_or(0, route_open::RouteOpenSupervisor::len);
-                let active_streams = active_ingress.len();
+                let active_streams = ingress_owners.active_len();
                 if let Some(owner) = route_owner.as_ref() {
                     emitter.emit(&LifecycleRecord::RouteOwnerHighWater {
                         opens: owner.high_water(),
@@ -1177,45 +1238,41 @@ async fn main() -> io::Result<()> {
             Some(event) = ingress_rx.recv(), if product_ingress => {
                 match event {
                     IngressEvent::Accepted { id, route_id, started_at, deadline, command, cancel } => {
-                        ingress_started.insert(id, started_at);
-                        ingress_cancel.insert(id, cancel);
+                        ingress_owners
+                            .insert_setup(IngressSetupOwner {
+                                ingress_id: id,
+                                route_id: route_id.clone(),
+                                accepted_at: started_at,
+                                deadline,
+                                command: command.clone(),
+                                cancel: cancel.clone(),
+                                open_id: None,
+                            })
+                            .map_err(io::Error::other)?;
                         emitter.emit(&LifecycleRecord::IngressAccepted {
                             route_id_hash: stable_hash(&route_id),
                             ingress_id: id.0,
                         })?;
                         let Some(route) = routes.as_ref().and_then(|config| config.routes.iter().find(|route| route.route_id == route_id)) else {
-                            emitter.emit(&LifecycleRecord::IngressRejected {
-                                route_id_hash: stable_hash(&route_id),
-                                ingress_id: id.0,
-                                code: PublicErrorCode::ProtocolMalformed.as_str(),
-                            })?;
-                            if let Some(cancel) = ingress_cancel.remove(&id) { cancel.cancel(); }
-                            let _ = command.send(IngressCommand::Reject).await;
+                            reject_ingress(&mut ingress_owners, id, PublicErrorCode::ProtocolMalformed, &emitter).await?;
                             continue;
                         };
                         let (Some(session_id), Some(binding)) = (
                             auth_state.current_session_id(unix_now()),
                             auth_state.current_session(unix_now()).map(|session| session.principal_binding()),
                         ) else {
-                            emitter.emit(&LifecycleRecord::IngressRejected {
-                                route_id_hash: stable_hash(&route_id),
-                                ingress_id: id.0,
-                                code: PublicErrorCode::AuthSessionRequired.as_str(),
-                            })?;
-                            if let Some(cancel) = ingress_cancel.remove(&id) { cancel.cancel(); }
-                            let _ = command.send(IngressCommand::Reject).await;
+                            reject_ingress(&mut ingress_owners, id, PublicErrorCode::AuthSessionRequired, &emitter).await?;
                             continue;
                         };
                         let Some(owner) = route_owner.as_mut() else {
-                            if let Some(cancel) = ingress_cancel.remove(&id) { cancel.cancel(); }
-                            let _ = command.send(IngressCommand::Reject).await;
+                            reject_ingress(&mut ingress_owners, id, PublicErrorCode::LimitProxyStreams, &emitter).await?;
                             continue;
                         };
                         match owner.admit(&mut resolver_state, binding, session_id, route.selector.clone(), unix_now(), deadline) {
                             Ok((open_id, actions)) => {
-                                ingress_by_id.insert(id, command);
-                                ingress_route.insert(id, route_id.clone());
-                                open_by_ingress.insert(open_id, id);
+                                ingress_owners
+                                    .attach_open(id, open_id)
+                                    .map_err(io::Error::other)?;
                                 let completed_actions = drive_route_actions(
                                     &mut swarm,
                                     owner,
@@ -1233,10 +1290,11 @@ async fn main() -> io::Result<()> {
                                     &mut resolver_state,
                                     &mut route_resolve_wires,
                                     &mut route_proxy_requests,
-                                    &mut open_by_ingress,
-                                    &mut ingress_by_id,
-                                    &mut ingress_route,
-                                    &mut ingress_cancel,
+                                    &mut ingress_owners,
+                                    route_owner.as_mut().expect("multi-open owner exists"),
+                                    expected_exchange,
+                                    &connections,
+                                    &mut route_wire_sequence,
                                     &mut connection_manager,
                                     &mut swarm,
                                     &emitter,
@@ -1246,13 +1304,7 @@ async fn main() -> io::Result<()> {
                                 }
                             }
                             Err(code) => {
-                                emitter.emit(&LifecycleRecord::IngressRejected {
-                                    route_id_hash: stable_hash(&route_id),
-                                    ingress_id: id.0,
-                                    code: code.as_str(),
-                                })?;
-                                if let Some(cancel) = ingress_cancel.remove(&id) { cancel.cancel(); }
-                                let _ = command.send(IngressCommand::Reject).await;
+                                reject_ingress(&mut ingress_owners, id, code, &emitter).await?;
                             }
                         }
                     }
@@ -1271,87 +1323,78 @@ async fn main() -> io::Result<()> {
                             ingress::PreAcceptCause::Deadline => PublicErrorCode::PeerSetupTimeout,
                             ingress::PreAcceptCause::Shutdown => PublicErrorCode::ExchangeDraining,
                         };
-                        let route_id = ingress_route.remove(&id).unwrap_or_default();
-                        let _ = ingress_by_id.remove(&id);
-                        if let Some(cancel) = ingress_cancel.remove(&id) { cancel.cancel(); }
-                        if let Some(open_id) = open_by_ingress
-                            .iter()
-                            .find_map(|(open_id, ingress_id)| (*ingress_id == id).then_some(*open_id))
-                        {
-                            open_by_ingress.remove(&open_id);
+                        let route_id = ingress_owners
+                            .setup(id)
+                            .map(|owner| owner.route_id.clone())
+                            .unwrap_or_default();
+                        if let Some(open_id) = ingress_owners.setup_open_id(id) {
                             route_resolve_wires.retain(|_, (candidate, _, _)| *candidate != open_id);
                             route_proxy_requests.retain(|_, candidate| *candidate != open_id);
-                            if let Some(action) = route_owner.as_mut().and_then(|owner| owner.cancel(&mut resolver_state, open_id)) {
+                            if let Some(route_owner) = route_owner.as_mut() {
+                                let (completed, promoted) = route_owner
+                                    .cancel_with_promotion(&mut resolver_state, open_id);
+                                let mut actions = promoted;
+                                if let Some(completed) = completed {
+                                    actions.push(completed);
+                                }
                                 let completed_actions = drive_route_actions(
                                     &mut swarm,
-                                    route_owner.as_mut().expect("route owner exists"),
+                                    route_owner,
                                     expected_exchange,
                                     &emitter,
                                     &connections,
                                     &mut route_resolve_wires,
                                     &mut route_proxy_requests,
                                     &mut route_wire_sequence,
-                                    vec![action],
+                                    actions,
                                 )?;
-                                for (_, server, _, _) in completed_actions {
-                                    if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) {
-                                        release_route_setup(manager, &mut swarm, server, open_id);
-                                    }
+                                if complete_route_actions(
+                                    product_ingress,
+                                    completed_actions,
+                                    &mut resolver_state,
+                                    &mut route_resolve_wires,
+                                    &mut route_proxy_requests,
+                                    &mut ingress_owners,
+                                    route_owner,
+                                    expected_exchange,
+                                    &connections,
+                                    &mut route_wire_sequence,
+                                    &mut connection_manager,
+                                    &mut swarm,
+                                    &emitter,
+                                    &args.case_id,
+                                ).await? {
+                                    return Ok(());
                                 }
                             }
+                        } else {
+                            reject_ingress(&mut ingress_owners, id, code, &emitter).await?;
                         }
-                        emitter.emit(&LifecycleRecord::IngressRejected {
-                            route_id_hash: stable_hash(&route_id),
-                            ingress_id: id.0,
-                            code: code.as_str(),
-                        })?;
+                        if !route_id.is_empty() && ingress_owners.setup(id).is_some() {
+                            reject_ingress(&mut ingress_owners, id, code, &emitter).await?;
+                        }
                     }
                     IngressEvent::TunnelFinished { id, result } => {
+                        let Some(active) = ingress_owners.take_active(id) else {
+                            continue;
+                        };
                         let result = result.map_err(io::Error::other)?;
-                        let _ = result.duration;
-                        if let Some((server, connection, _, request_id_hash, stream_id_hash)) = active_ingress.get(&id).copied() {
-                            let peer = server.to_string();
-                            emitter.emit(&LifecycleRecord::TunnelTerminal {
-                                component_side: p2x_net::lifecycle::ComponentSide::Client,
-                                peer_id: &peer,
-                                connection_id_hash: stable_hash(connection),
-                                request_id_hash,
-                                stream_id_hash: Some(stream_id_hash),
-                                selected_path: Some(if connections.is_direct(server, connection) {
-                                    ProbePath::Direct
-                                } else {
-                                    ProbePath::Relay
-                                }),
-                                accepted: true,
-                                code: None,
-                                terminal_class: match result.terminal {
-                                    p2x_proxy::Terminal::Complete => p2x_net::lifecycle::TunnelTerminalClass::Complete,
-                                    p2x_proxy::Terminal::IdleTimeout => p2x_net::lifecycle::TunnelTerminalClass::IdleTimeout,
-                                    p2x_proxy::Terminal::Cancelled => p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
-                                    p2x_proxy::Terminal::LocalIo => p2x_net::lifecycle::TunnelTerminalClass::LocalIo,
-                                    p2x_proxy::Terminal::RemoteIo => p2x_net::lifecycle::TunnelTerminalClass::RemoteIo,
-                                },
-                                setup_duration_ms: ingress_started
-                                    .get(&id)
-                                    .map_or(0, |started| started.elapsed().as_millis()),
-                                local_to_remote_bytes: result.local_to_remote_bytes,
-                                remote_to_local_bytes: result.remote_to_local_bytes,
-                                local_eof: result.local_eof,
-                                remote_eof: result.remote_eof,
-                                duration_ms: result.duration.as_millis(),
-                            })?;
-                        }
-                        ingress_by_id.remove(&id);
-                        ingress_started.remove(&id);
-                        if let Some(cancel) = ingress_cancel.remove(&id) { cancel.cancel(); }
-                        if let Some((server, _connection, open_id, _, _)) = active_ingress.remove(&id)
-                            && let Some(manager) = connection_manager.as_mut()
-                        {
-                            if !manager.close_active(server) {
+                        emit_client_tunnel_terminal(
+                            &emitter,
+                            &active,
+                            Some(&result),
+                            tunnel_terminal_class(result.terminal),
+                            None,
+                        )?;
+                        if let Some(manager) = connection_manager.as_mut() {
+                            if !manager.close_active(active.server) {
                                 return Err(io::Error::other("connection manager active release missing"));
                             }
-                            manager.release_waiter(server, open_id.0);
+                            if !manager.release_waiter(active.server, active.open_id.0) {
+                                return Err(io::Error::other("connection manager waiter release missing"));
+                            }
                         }
+                        active.cancel.cancel();
                     }
                 }
             }
@@ -1426,39 +1469,31 @@ async fn main() -> io::Result<()> {
                                 let attempt_id = route_owner.as_ref().and_then(|owner| owner.path_attempt_id(open_id)).ok_or_else(|| io::Error::other("route path attempt missing"))?;
                                 let _ = route_owner.as_mut().expect("route owner exists").path_event(open_id, PathEvent { attempt_id, now: std::time::Instant::now(), kind: PathEventKind::PayloadAccepted });
                                 let handoff = route_owner.as_mut().expect("route owner exists").accepted(open_id, proxy_id, request_id, stream_id).ok_or_else(|| io::Error::other("route accepted handoff missing"))?;
-                                let ingress_id = open_by_ingress.remove(&open_id).ok_or_else(|| io::Error::other("ingress handoff missing"))?;
-                                let command = ingress_by_id.remove(&ingress_id).ok_or_else(|| io::Error::other("ingress command missing"))?;
-                                if let Some(manager) = connection_manager.as_mut() {
-                                    let selected = if connections.is_direct(handoff.server, handoff.connection) { PathDecision::Direct(handoff.connection) } else { PathDecision::Relay(handoff.connection) };
-                                    if !manager.finish_path(handoff.server, Some(selected)) {
+                                let selected_path = if connections.is_direct(handoff.server, handoff.connection) {
+                                    ProbePath::Direct
+                                } else {
+                                    ProbePath::Relay
+                                };
+                                if let Some(manager) = connection_manager.as_mut()
+                                    && !manager.finish_path(handoff.server, Some(match selected_path {
+                                        ProbePath::Direct => PathDecision::Direct(handoff.connection),
+                                        ProbePath::Relay => PathDecision::Relay(handoff.connection),
+                                    }))
+                                {
                                     return Err(io::Error::other("connection manager active promotion missing"));
                                 }
-                                }
-                                active_ingress.insert(
-                                    ingress_id,
-                                    (
-                                        handoff.server,
-                                        handoff.connection,
-                                        open_id,
-                                        stable_hash(handoff.request_id),
-                                        stable_hash(handoff.stream_id),
-                                    ),
-                                );
-                                let peer = handoff.server.to_string();
+                                let active = ingress_owners
+                                    .promote_active(&handoff, selected_path)
+                                    .map_err(io::Error::other)?;
+                                let peer = active.server.to_string();
                                 emitter.emit(&LifecycleRecord::TunnelAccepted {
                                     component_side: p2x_net::lifecycle::ComponentSide::Client,
                                     peer_id: &peer,
-                                    connection_id_hash: stable_hash(handoff.connection),
-                                    request_id_hash: stable_hash(handoff.request_id),
-                                    stream_id_hash: stable_hash(handoff.stream_id),
-                                    selected_path: Some(if connections.is_direct(handoff.server, handoff.connection) {
-                                        ProbePath::Direct
-                                    } else {
-                                        ProbePath::Relay
-                                    }),
-                                    setup_duration_ms: ingress_started
-                                        .get(&ingress_id)
-                                        .map_or(0, |started| started.elapsed().as_millis()),
+                                    connection_id_hash: stable_hash(active.connection),
+                                    request_id_hash: active.request_id_hash,
+                                    stream_id_hash: active.stream_id_hash,
+                                    selected_path: Some(active.selected_path),
+                                    setup_duration_ms: active.setup_duration.as_millis(),
                                 })?;
                                 if let Some(delay) = args.test_close_proxy_after_accept_ms
                                     && !close_proxy_applied
@@ -1470,13 +1505,30 @@ async fn main() -> io::Result<()> {
                                             + std::time::Duration::from_millis(delay),
                                     ));
                                 }
-                                if command.send(IngressCommand::StartTunnel { stream: Box::new(stream) }).await.is_err() {
-                                    active_ingress.remove(&ingress_id);
-                                    if let Some(manager) = connection_manager.as_mut() {
-                                        if !manager.close_active(handoff.server) {
-                                            return Err(io::Error::other("connection manager active release missing"));
-                                        }
-                                        manager.release_waiter(handoff.server, open_id.0);
+                                let active_id = active.ingress_id;
+                                if ingress_owners
+                                    .start_tunnel(active_id, Box::new(stream))
+                                    .await
+                                    .is_err()
+                                    && let Some(active) = ingress_owners.take_active(active_id)
+                                {
+                                    emit_client_tunnel_terminal(
+                                        &emitter,
+                                        &active,
+                                        None,
+                                        p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
+                                        Some(PublicErrorCode::PeerConnectionFailed.as_str()),
+                                    )?;
+                                    active.cancel.cancel();
+                                    if let Some(manager) = connection_manager.as_mut()
+                                        && !manager.close_active(active.server)
+                                    {
+                                        return Err(io::Error::other("connection manager active release missing"));
+                                    }
+                                    if let Some(manager) = connection_manager.as_mut()
+                                        && !manager.release_waiter(active.server, active.open_id.0)
+                                    {
+                                        return Err(io::Error::other("connection manager waiter release missing"));
                                     }
                                 }
                                 continue;
@@ -1544,15 +1596,10 @@ async fn main() -> io::Result<()> {
                         }
                         Err(code) => {
                             if product_ingress {
-                                if let Some(ingress_id) = open_by_ingress.remove(&open_id)
-                                    && let Some(command) = ingress_by_id.remove(&ingress_id)
-                                {
-                                    let _ = command.send(IngressCommand::Reject).await;
-                                }
-                                if let Some(action) = route_owner
+                                let action = route_owner
                                     .as_mut()
-                                    .and_then(|owner| owner.complete(open_id, Err(code)))
-                                {
+                                    .and_then(|owner| owner.complete(open_id, Err(code)));
+                                if let Some(action) = action {
                                     let completed_actions = drive_route_actions(
                                         &mut swarm,
                                         route_owner.as_mut().expect("route owner exists"),
@@ -1855,10 +1902,11 @@ async fn main() -> io::Result<()> {
                                     &mut resolver_state,
                                     &mut route_resolve_wires,
                                     &mut route_proxy_requests,
-                                    &mut open_by_ingress,
-                                    &mut ingress_by_id,
-                                    &mut ingress_route,
-                                    &mut ingress_cancel,
+                                    &mut ingress_owners,
+                                    route_owner.as_mut().expect("multi-open owner exists"),
+                                    expected_exchange,
+                                    &connections,
+                                    &mut route_wire_sequence,
                                     &mut connection_manager,
                                     &mut swarm,
                                     &emitter,
@@ -2042,10 +2090,11 @@ async fn main() -> io::Result<()> {
                             &mut resolver_state,
                             &mut route_resolve_wires,
                             &mut route_proxy_requests,
-                            &mut open_by_ingress,
-                            &mut ingress_by_id,
-                            &mut ingress_route,
-                            &mut ingress_cancel,
+                            &mut ingress_owners,
+                            route_owner.as_mut().expect("multi-open owner exists"),
+                            expected_exchange,
+                            &connections,
+                            &mut route_wire_sequence,
                             &mut connection_manager,
                             &mut swarm,
                             &emitter,
@@ -2124,10 +2173,11 @@ async fn main() -> io::Result<()> {
                             &mut resolver_state,
                             &mut route_resolve_wires,
                             &mut route_proxy_requests,
-                            &mut open_by_ingress,
-                            &mut ingress_by_id,
-                            &mut ingress_route,
-                            &mut ingress_cancel,
+                            &mut ingress_owners,
+                            route_owner.as_mut().expect("multi-open owner exists"),
+                            expected_exchange,
+                            &connections,
+                            &mut route_wire_sequence,
                             &mut connection_manager,
                             &mut swarm,
                             &emitter,
@@ -2369,10 +2419,11 @@ async fn main() -> io::Result<()> {
                             &mut resolver_state,
                             &mut route_resolve_wires,
                             &mut route_proxy_requests,
-                            &mut open_by_ingress,
-                            &mut ingress_by_id,
-                            &mut ingress_route,
-                            &mut ingress_cancel,
+                            &mut ingress_owners,
+                            route_owner.as_mut().expect("multi-open owner exists"),
+                            expected_exchange,
+                            &connections,
+                            &mut route_wire_sequence,
                             &mut connection_manager,
                             &mut swarm,
                             &emitter,
@@ -2462,10 +2513,11 @@ async fn main() -> io::Result<()> {
                                 &mut resolver_state,
                                 &mut route_resolve_wires,
                                 &mut route_proxy_requests,
-                                &mut open_by_ingress,
-                                &mut ingress_by_id,
-                                &mut ingress_route,
-                                &mut ingress_cancel,
+                                &mut ingress_owners,
+                                route_owner.as_mut().expect("multi-open owner exists"),
+                                expected_exchange,
+                                &connections,
+                                &mut route_wire_sequence,
                                 &mut connection_manager,
                                 &mut swarm,
                                 &emitter,
@@ -2475,12 +2527,8 @@ async fn main() -> io::Result<()> {
                             }
                         }
                         if product_ingress {
-                            for (ingress_id, (_, selected_connection, _, _, _)) in &active_ingress {
-                                if *selected_connection == connection_id
-                                    && let Some(cancel) = ingress_cancel.get(ingress_id)
-                                {
-                                    cancel.cancel();
-                                }
+                            for active in ingress_owners.active_for_connection(connection_id) {
+                                active.cancel.cancel();
                             }
                         }
                         if !product_ingress
@@ -2632,10 +2680,11 @@ async fn main() -> io::Result<()> {
                                             &mut resolver_state,
                                             &mut route_resolve_wires,
                                             &mut route_proxy_requests,
-                                            &mut open_by_ingress,
-                                            &mut ingress_by_id,
-                                            &mut ingress_route,
-                                            &mut ingress_cancel,
+                                            &mut ingress_owners,
+                                            route_owner.as_mut().expect("multi-open owner exists"),
+                                            expected_exchange,
+                                            &connections,
+                                            &mut route_wire_sequence,
                                             &mut connection_manager,
                                             &mut swarm,
                                             &emitter,
@@ -2703,10 +2752,11 @@ async fn main() -> io::Result<()> {
                                         &mut resolver_state,
                                         &mut route_resolve_wires,
                                         &mut route_proxy_requests,
-                                        &mut open_by_ingress,
-                                        &mut ingress_by_id,
-                                        &mut ingress_route,
-                                        &mut ingress_cancel,
+                                        &mut ingress_owners,
+                                        route_owner.as_mut().expect("multi-open owner exists"),
+                                        expected_exchange,
+                                        &connections,
+                                        &mut route_wire_sequence,
                                         &mut connection_manager,
                                         &mut swarm,
                                         &emitter,
@@ -2752,93 +2802,46 @@ async fn main() -> io::Result<()> {
             let _ = task.await;
         }
     }
-    for cancel in ingress_cancel.values() {
-        cancel.cancel();
+    for id in ingress_owners.setup_ids().collect::<Vec<_>>() {
+        if let Some(owner) = ingress_owners.take_setup(id) {
+            owner.cancel.cancel();
+        }
     }
     while let Ok(event) = ingress_rx.try_recv() {
         if let IngressEvent::TunnelFinished { id, result } = event
-            && let Some((server, connection, open_id, request_id_hash, stream_id_hash)) =
-                active_ingress.remove(&id)
+            && let Some(active) = ingress_owners.take_active(id)
         {
             let result = result.map_err(io::Error::other)?;
-            let peer = server.to_string();
-            emitter.emit(&LifecycleRecord::TunnelTerminal {
-                component_side: p2x_net::lifecycle::ComponentSide::Client,
-                peer_id: &peer,
-                connection_id_hash: stable_hash(connection),
-                request_id_hash,
-                stream_id_hash: Some(stream_id_hash),
-                selected_path: Some(if connections.is_direct(server, connection) {
-                    ProbePath::Direct
-                } else {
-                    ProbePath::Relay
-                }),
-                accepted: true,
-                code: None,
-                terminal_class: match result.terminal {
-                    p2x_proxy::Terminal::Complete => {
-                        p2x_net::lifecycle::TunnelTerminalClass::Complete
-                    }
-                    p2x_proxy::Terminal::IdleTimeout => {
-                        p2x_net::lifecycle::TunnelTerminalClass::IdleTimeout
-                    }
-                    p2x_proxy::Terminal::Cancelled => {
-                        p2x_net::lifecycle::TunnelTerminalClass::Cancelled
-                    }
-                    p2x_proxy::Terminal::LocalIo => {
-                        p2x_net::lifecycle::TunnelTerminalClass::LocalIo
-                    }
-                    p2x_proxy::Terminal::RemoteIo => {
-                        p2x_net::lifecycle::TunnelTerminalClass::RemoteIo
-                    }
-                },
-                setup_duration_ms: 0,
-                local_to_remote_bytes: result.local_to_remote_bytes,
-                remote_to_local_bytes: result.remote_to_local_bytes,
-                local_eof: result.local_eof,
-                remote_eof: result.remote_eof,
-                duration_ms: result.duration.as_millis(),
-            })?;
+            emit_client_tunnel_terminal(
+                &emitter,
+                &active,
+                Some(&result),
+                tunnel_terminal_class(result.terminal),
+                None,
+            )?;
             if let Some(manager) = connection_manager.as_mut() {
-                let _ = manager.close_active(server);
-                manager.release_waiter(server, open_id.0);
+                let _ = manager.close_active(active.server);
+                let _ = manager.release_waiter(active.server, active.open_id.0);
+            }
+            active.cancel.cancel();
+        }
+    }
+    for id in ingress_owners.active_ids().collect::<Vec<_>>() {
+        if let Some(active) = ingress_owners.take_active(id) {
+            emit_client_tunnel_terminal(
+                &emitter,
+                &active,
+                None,
+                p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
+                Some(PublicErrorCode::ExchangeDraining.as_str()),
+            )?;
+            active.cancel.cancel();
+            if let Some(manager) = connection_manager.as_mut() {
+                let _ = manager.close_active(active.server);
+                let _ = manager.release_waiter(active.server, active.open_id.0);
             }
         }
     }
-    for (id, (server, connection, open_id, request_id_hash, stream_id_hash)) in
-        active_ingress.drain()
-    {
-        let peer = server.to_string();
-        emitter.emit(&LifecycleRecord::TunnelTerminal {
-            component_side: p2x_net::lifecycle::ComponentSide::Client,
-            peer_id: &peer,
-            connection_id_hash: stable_hash(connection),
-            request_id_hash,
-            stream_id_hash: Some(stream_id_hash),
-            selected_path: Some(if connections.is_direct(server, connection) {
-                ProbePath::Direct
-            } else {
-                ProbePath::Relay
-            }),
-            accepted: true,
-            code: None,
-            terminal_class: p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
-            setup_duration_ms: 0,
-            local_to_remote_bytes: 0,
-            remote_to_local_bytes: 0,
-            local_eof: false,
-            remote_eof: false,
-            duration_ms: 0,
-        })?;
-        if let Some(manager) = connection_manager.as_mut() {
-            let _ = manager.close_active(server);
-            manager.release_waiter(server, open_id.0);
-        }
-        let _ = id;
-    }
-    ingress_by_id.clear();
-    ingress_started.clear();
-    open_by_ingress.clear();
     route_resolve_wires.clear();
     route_proxy_requests.clear();
     if product_ingress {
