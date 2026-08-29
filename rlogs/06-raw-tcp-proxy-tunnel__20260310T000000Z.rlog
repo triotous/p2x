@@ -41,3 +41,9 @@
 [action] Hardening: preserved accepted stream accounting through terminal; emitted hashed request/stream terminal evidence; added client ingress cancellation tokens; made tunnel tests case-specific for multi-stream, large transfer, limits, control loss, path recovery, and shutdown.
 [validation] workspace fmt/clippy/tests passed; tunnel all 14 cases passed; direct/relay/half-close/idle/refusal/timeout and 16-stream/256MiB/limit assertions ran.
 [blocker] Full Plan 06 §5.3 semantics are not all proven: process harness still lacks exact 64/128 stream profile, real firewall-forced relay, deterministic path-loss retry, RSS/file-descriptor sampling, and complete shutdown resource assertions.
+[validation] Corrected pump flow-control deadlock caused by futures split BiLock; added single-scheduler bounded pump and 16 MiB regression test. Final tunnel suite passed all 14 cases, including 256 MiB direct/relay, 64 concurrent with 128 headroom, N/N+1 limits, control-loss recovery, path-loss replacement, shutdown zero resources, RSS/FD samples, and privacy scans.
+[validation] Existing resolution suite passed all 20 cases after removing duplicate server rejection lifecycle records; auth, registry, and connectivity suites passed.
+[review] Plan 06 was not modified. Local Definition-of-Done gates are complete; Linux namespace/firewall, cross-host, platform, and long-running soak remain owner-executed per plan §5.5.
+[status] Implementation phases complete; documentation and final log update pending separate commit.
+[validation] Final cargo fmt check, workspace Clippy with -D warnings, workspace all-target tests, Python syntax check, and git diff check passed.
+[status] Documentation and append-only execution log committed; worktree clean and plan unchanged after its initial addition.
