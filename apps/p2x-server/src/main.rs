@@ -662,7 +662,9 @@ async fn main() -> io::Result<()> {
                         remote_eof: release.pump.is_some_and(|result| result.remote_eof),
                         duration_ms: release.pump.map_or(0, |result| result.duration.as_millis()),
                     })?;
-                } else if let Some(code) = release.code {
+                } else if !release.admission.is_empty()
+                    && let Some(code) = release.code
+                {
                     emitter.emit(&LifecycleRecord::ProxyAuthorization {
                         peer_id: &peer,
                         connection_id_hash: stable_hash(release.connection_id),
