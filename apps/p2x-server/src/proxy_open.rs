@@ -531,6 +531,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_transition_returns_without_waiting() {
+        let (promotions, mut received) = mpsc::channel(1);
+        let (filler_ack, _filler_rx) = oneshot::channel();
+        let (acknowledged, _ack) = oneshot::channel();
+        promotions
+            .send(Promotion {
+                admission: AdmissionToken::empty(),
+                acknowledged: filler_ack,
+            })
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() - Duration::from_millis(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert!(
+            !bounded_promotion(
+                &promotions,
+                Promotion {
+                    admission: AdmissionToken::empty(),
+                    acknowledged
+                },
+                deadline,
+                &cancel,
+            )
+            .await
+        );
+        let _ = received.recv().await;
+        let (accepts, mut accepted_received) = mpsc::channel(1);
+        accepts
+            .send(Accepted {
+                peer_id: PeerId::random(),
+                connection_id: ConnectionId::new_unchecked(2),
+                setup_duration: Duration::ZERO,
+                request_id_hash: 3,
+                stream_id_hash: 4,
+            })
+            .await
+            .unwrap();
+        assert!(
+            !bounded_accepted(
+                &accepts,
+                Accepted {
+                    peer_id: PeerId::random(),
+                    connection_id: ConnectionId::new_unchecked(1),
+                    setup_duration: Duration::ZERO,
+                    request_id_hash: 1,
+                    stream_id_hash: 2,
+                },
+                deadline,
+                &cancel,
+            )
+            .await
+        );
+        let _ = accepted_received.recv().await;
+    }
+
+    #[tokio::test]
     async fn full_accepted_channel_expires_without_waiting() {
         let (accepts, _received) = mpsc::channel(1);
         let accepted = Accepted {
