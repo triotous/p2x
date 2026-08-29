@@ -28,6 +28,14 @@ pub enum IngressCommand {
     Reject,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreAcceptCause {
+    Eof,
+    LocalIo,
+    Deadline,
+    Shutdown,
+}
+
 pub enum IngressEvent {
     Accepted {
         id: IngressId,
@@ -41,8 +49,9 @@ pub enum IngressEvent {
         route_id: String,
         code: &'static str,
     },
-    Closed {
+    PreAcceptClosed {
         id: IngressId,
+        cause: PreAcceptCause,
     },
     TunnelFinished {
         id: IngressId,
@@ -167,6 +176,21 @@ async fn accept_loop(
     while connections.join_next().await.is_some() {}
 }
 
+async fn send_pre_accept(
+    events: &mpsc::Sender<IngressEvent>,
+    id: IngressId,
+    cause: PreAcceptCause,
+    delivered: &mut bool,
+) {
+    if *delivered {
+        return;
+    }
+    *delivered = true;
+    let _ = events
+        .send(IngressEvent::PreAcceptClosed { id, cause })
+        .await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_connection(
     id: IngressId,
@@ -182,16 +206,19 @@ async fn run_connection(
 ) {
     let mut prebuffer = vec![0; copy_buffer_bytes];
     let mut filled = 0;
-    let mut local_eof = false;
+    let mut terminal_delivered = false;
     let deadline = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline_at));
     tokio::pin!(deadline);
     loop {
         tokio::select! {
             _ = &mut deadline => {
-                let _ = events.send(IngressEvent::Closed { id }).await;
+                send_pre_accept(&events, id, PreAcceptCause::Deadline, &mut terminal_delivered).await;
                 return;
             },
-            _ = shutdown.cancelled() => return,
+            _ = shutdown.cancelled() => {
+                send_pre_accept(&events, id, PreAcceptCause::Shutdown, &mut terminal_delivered).await;
+                return;
+            },
             command = commands.recv() => match command {
                 Some(IngressCommand::StartTunnel { stream }) => {
                     prebuffer.truncate(filled);
@@ -212,11 +239,14 @@ async fn run_connection(
                 }
                 Some(IngressCommand::Reject) | None => return,
             },
-            read = socket.read(&mut prebuffer[filled..]), if filled < prebuffer.len() && !local_eof => match read {
-                Ok(0) => local_eof = true,
+            read = socket.read(&mut prebuffer[filled..]), if filled < prebuffer.len() => match read {
+                Ok(0) => {
+                    send_pre_accept(&events, id, PreAcceptCause::Eof, &mut terminal_delivered).await;
+                    return;
+                }
                 Ok(count) => filled += count,
                 Err(_) => {
-                    let _ = events.send(IngressEvent::Closed { id }).await;
+                    send_pre_accept(&events, id, PreAcceptCause::LocalIo, &mut terminal_delivered).await;
                     return;
                 }
             },
@@ -229,6 +259,28 @@ async fn run_connection(
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn pre_accept_terminal_is_delivered_once() {
+        let (events, mut received) = mpsc::channel(2);
+        let mut delivered = false;
+        send_pre_accept(&events, IngressId(1), PreAcceptCause::Eof, &mut delivered).await;
+        send_pre_accept(
+            &events,
+            IngressId(1),
+            PreAcceptCause::Deadline,
+            &mut delivered,
+        )
+        .await;
+        assert!(matches!(
+            received.recv().await,
+            Some(IngressEvent::PreAcceptClosed {
+                id: IngressId(1),
+                cause: PreAcceptCause::Eof,
+            })
+        ));
+        assert!(received.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn bound_listener_forwards_prefixed_bytes_after_start() {

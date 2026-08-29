@@ -359,8 +359,56 @@ type MultiResolveWire = HashMap<
 type RouteCompletion = (
     route_open::OpenId,
     Option<libp2p::PeerId>,
+    [u8; 16],
     Result<(), PublicErrorCode>,
 );
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_route_actions(
+    product_ingress: bool,
+    completions: Vec<RouteCompletion>,
+    resolver: &mut resolver::ResolverState,
+    route_resolve_wires: &mut MultiResolveWire,
+    route_proxy_requests: &mut HashMap<ProxyRequestId, route_open::OpenId>,
+    open_by_ingress: &mut HashMap<route_open::OpenId, IngressId>,
+    ingress_by_id: &mut HashMap<IngressId, mpsc::Sender<IngressCommand>>,
+    ingress_route: &mut HashMap<IngressId, String>,
+    ingress_cancel: &mut HashMap<IngressId, tokio_util::sync::CancellationToken>,
+    manager: &mut Option<ConnectionManager>,
+    swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
+    emitter: &Emitter,
+    case_id: &str,
+) -> io::Result<bool> {
+    for (open_id, server, request_id, result) in completions {
+        route_resolve_wires.retain(|_, (candidate, _, _)| *candidate != open_id);
+        route_proxy_requests.retain(|_, candidate| *candidate != open_id);
+        resolver.cancel(request_id);
+        if let (Some(manager), Some(server)) = (manager.as_mut(), server) {
+            release_route_setup(manager, swarm, server, open_id);
+        }
+        let Err(code) = result else { continue };
+        if product_ingress {
+            if let Some(ingress_id) = open_by_ingress.remove(&open_id) {
+                let route_id = ingress_route.remove(&ingress_id).unwrap_or_default();
+                if let Some(cancel) = ingress_cancel.remove(&ingress_id) {
+                    cancel.cancel();
+                }
+                if let Some(command) = ingress_by_id.remove(&ingress_id) {
+                    let _ = command.send(IngressCommand::Reject).await;
+                }
+                emitter.emit(&LifecycleRecord::IngressRejected {
+                    route_id_hash: stable_hash(&route_id),
+                    ingress_id: ingress_id.0,
+                    code: code.as_str(),
+                })?;
+            }
+            continue;
+        }
+        emitter.terminal(&TerminalResult::simple(case_id, "failed", code.as_str()))?;
+        return Ok(true);
+    }
+    Ok(false)
+}
 
 #[allow(clippy::too_many_arguments)]
 fn drive_route_actions(
@@ -466,8 +514,9 @@ fn drive_route_actions(
             route_open::RouteAction::Complete {
                 open_id,
                 server,
+                request_id,
                 result,
-            } => completed.push((open_id, server, result)),
+            } => completed.push((open_id, server, request_id, result)),
             route_open::RouteAction::StartHandshakeWorker { .. } => {
                 return Err(io::Error::other(
                     "handshake worker action must be dispatched from an opened stream",
@@ -513,7 +562,9 @@ fn release_route_setup(
     server: libp2p::PeerId,
     waiter_id: route_open::OpenId,
 ) {
-    manager.release_waiter(server, waiter_id.0);
+    if !manager.release_waiter(server, waiter_id.0) {
+        return;
+    }
     let _ = manager.release(server);
     for action in manager.pool_close_actions(server) {
         if let connection_manager::ConnectionSetupAction::Close { connection } = action {
@@ -820,6 +871,7 @@ async fn main() -> io::Result<()> {
     });
     let mut route_admitted = 0u64;
     let mut ingress_by_id = HashMap::<IngressId, mpsc::Sender<IngressCommand>>::new();
+    let mut ingress_route = HashMap::<IngressId, String>::new();
     let mut ingress_cancel = HashMap::<IngressId, tokio_util::sync::CancellationToken>::new();
     let mut open_by_ingress = HashMap::<route_open::OpenId, IngressId>::new();
     let mut active_ingress = HashMap::<
@@ -903,9 +955,21 @@ async fn main() -> io::Result<()> {
                             &mut route_wire_sequence,
                             vec![action],
                         )?;
-                        if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
-                            if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
-                            emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                        if complete_route_actions(
+                            product_ingress,
+                            completed_actions,
+                            &mut resolver_state,
+                            &mut route_resolve_wires,
+                            &mut route_proxy_requests,
+                            &mut open_by_ingress,
+                            &mut ingress_by_id,
+                            &mut ingress_route,
+                            &mut ingress_cancel,
+                            &mut connection_manager,
+                            &mut swarm,
+                            &emitter,
+                            &args.case_id,
+                        ).await? {
                             return Ok(());
                         }
                     }
@@ -921,9 +985,21 @@ async fn main() -> io::Result<()> {
                         &mut route_wire_sequence,
                         path_actions,
                     )?;
-                    if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
-                        if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
-                        emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                    if complete_route_actions(
+                        product_ingress,
+                        completed_actions,
+                        &mut resolver_state,
+                        &mut route_resolve_wires,
+                        &mut route_proxy_requests,
+                        &mut open_by_ingress,
+                        &mut ingress_by_id,
+                        &mut ingress_route,
+                        &mut ingress_cancel,
+                        &mut connection_manager,
+                        &mut swarm,
+                        &emitter,
+                        &args.case_id,
+                    ).await? {
                         return Ok(());
                     }
                 }
@@ -1131,6 +1207,7 @@ async fn main() -> io::Result<()> {
                         match owner.admit(&mut resolver_state, binding, session_id, route.selector.clone(), unix_now(), deadline) {
                             Ok((open_id, actions)) => {
                                 ingress_by_id.insert(id, command);
+                                ingress_route.insert(id, route_id.clone());
                                 open_by_ingress.insert(open_id, id);
                                 let completed_actions = drive_route_actions(
                                     &mut swarm,
@@ -1143,17 +1220,22 @@ async fn main() -> io::Result<()> {
                                     &mut route_wire_sequence,
                                     actions,
                                 )?;
-                                if let Some((failed_open, server, _)) = completed_actions.into_iter().next() {
-                                        if let Some(failed_ingress) = open_by_ingress.remove(&failed_open) {
-                                        ingress_by_id.remove(&failed_ingress);
-                                        if let Some(cancel) = ingress_cancel.remove(&failed_ingress) { cancel.cancel(); }
-                                    }
-                                    if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) {
-                                        release_route_setup(manager, &mut swarm, server, failed_open);
-                                    }
-                                    if let Some(command) = ingress_by_id.remove(&id) {
-                                        let _ = command.send(IngressCommand::Reject).await;
-                                    }
+                                if complete_route_actions(
+                                    product_ingress,
+                                    completed_actions,
+                                    &mut resolver_state,
+                                    &mut route_resolve_wires,
+                                    &mut route_proxy_requests,
+                                    &mut open_by_ingress,
+                                    &mut ingress_by_id,
+                                    &mut ingress_route,
+                                    &mut ingress_cancel,
+                                    &mut connection_manager,
+                                    &mut swarm,
+                                    &emitter,
+                                    &args.case_id,
+                                ).await? {
+                                    return Ok(());
                                 }
                             }
                             Err(code) => {
@@ -1174,7 +1256,14 @@ async fn main() -> io::Result<()> {
                             code,
                         })?;
                     }
-                    IngressEvent::Closed { id } => {
+                    IngressEvent::PreAcceptClosed { id, cause } => {
+                        let code = match cause {
+                            ingress::PreAcceptCause::Eof | ingress::PreAcceptCause::LocalIo => {
+                                PublicErrorCode::PeerConnectionFailed
+                            }
+                            ingress::PreAcceptCause::Deadline => PublicErrorCode::PeerSetupTimeout,
+                            ingress::PreAcceptCause::Shutdown => PublicErrorCode::ExchangeDraining,
+                        };
                         let _ = ingress_by_id.remove(&id);
                         if let Some(cancel) = ingress_cancel.remove(&id) { cancel.cancel(); }
                         if let Some(open_id) = open_by_ingress
@@ -1196,13 +1285,18 @@ async fn main() -> io::Result<()> {
                                     &mut route_wire_sequence,
                                     vec![action],
                                 )?;
-                                for (_, server, _) in completed_actions {
+                                for (_, server, _, _) in completed_actions {
                                     if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) {
                                         release_route_setup(manager, &mut swarm, server, open_id);
                                     }
                                 }
                             }
                         }
+                        emitter.emit(&LifecycleRecord::IngressRejected {
+                            route_id_hash: 0,
+                            ingress_id: id.0,
+                            code: code.as_str(),
+                        })?;
                     }
                     IngressEvent::TunnelFinished { id, result } => {
                         let _ = result.duration;
@@ -1359,7 +1453,7 @@ async fn main() -> io::Result<()> {
                                 &mut route_wire_sequence,
                                 vec![action],
                             )?;
-                            for (_, completed_server, result) in completed_actions {
+                            for (_, completed_server, _, result) in completed_actions {
                                 result.map_err(|code| io::Error::other(code.as_str()))?;
                                 if let (Some(manager), Some(completed_server)) = (connection_manager.as_mut(), completed_server) {
                                     release_route_setup(manager, &mut swarm, completed_server, open_id);
@@ -1422,7 +1516,7 @@ async fn main() -> io::Result<()> {
                                         &mut route_wire_sequence,
                                         vec![action],
                                     )?;
-                                    for (_, server, _) in completed_actions {
+                                    for (_, server, _, _) in completed_actions {
                                         if let (Some(manager), Some(server)) =
                                             (connection_manager.as_mut(), server)
                                         {
@@ -1478,7 +1572,7 @@ async fn main() -> io::Result<()> {
                             if completed_actions.is_empty() && route_owner.as_ref().is_some_and(|owner| owner.len() > 0) {
                                 continue;
                             }
-                            if let Some((_, completed_server, _)) = completed_actions.into_iter().next()
+                            if let Some((_, completed_server, _, _)) = completed_actions.into_iter().next()
                                 && let Some(manager) = connection_manager.as_mut()
                             { let _ = completed_server.map(|peer| manager.release(peer)); }
                             emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
@@ -1703,9 +1797,21 @@ async fn main() -> io::Result<()> {
                                     &mut route_wire_sequence,
                                     actions,
                                 )?;
-                                if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
-                                    if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
-                                    emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                                if complete_route_actions(
+                                    product_ingress,
+                                    completed_actions,
+                                    &mut resolver_state,
+                                    &mut route_resolve_wires,
+                                    &mut route_proxy_requests,
+                                    &mut open_by_ingress,
+                                    &mut ingress_by_id,
+                                    &mut ingress_route,
+                                    &mut ingress_cancel,
+                                    &mut connection_manager,
+                                    &mut swarm,
+                                    &emitter,
+                                    &args.case_id,
+                                ).await? {
                                     return Ok(());
                                 }
                             }
@@ -1878,9 +1984,21 @@ async fn main() -> io::Result<()> {
                             &mut route_wire_sequence,
                             vec![action],
                         )?;
-                        if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
-                            if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
-                            emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                        if complete_route_actions(
+                            product_ingress,
+                            completed_actions,
+                            &mut resolver_state,
+                            &mut route_resolve_wires,
+                            &mut route_proxy_requests,
+                            &mut open_by_ingress,
+                            &mut ingress_by_id,
+                            &mut ingress_route,
+                            &mut ingress_cancel,
+                            &mut connection_manager,
+                            &mut swarm,
+                            &emitter,
+                            &args.case_id,
+                        ).await? {
                             return Ok(());
                         }
                     }
@@ -1948,9 +2066,21 @@ async fn main() -> io::Result<()> {
                             &mut route_wire_sequence,
                             actions,
                         )?;
-                        if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
-                            if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
-                            emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                        if complete_route_actions(
+                            product_ingress,
+                            completed_actions,
+                            &mut resolver_state,
+                            &mut route_resolve_wires,
+                            &mut route_proxy_requests,
+                            &mut open_by_ingress,
+                            &mut ingress_by_id,
+                            &mut ingress_route,
+                            &mut ingress_cancel,
+                            &mut connection_manager,
+                            &mut swarm,
+                            &emitter,
+                            &args.case_id,
+                        ).await? {
                             return Ok(());
                         }
                     }
@@ -2181,9 +2311,21 @@ async fn main() -> io::Result<()> {
                             &mut route_wire_sequence,
                             action.into_iter().collect(),
                         )?;
-                        if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
-                            if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
-                            emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                        if complete_route_actions(
+                            product_ingress,
+                            completed_actions,
+                            &mut resolver_state,
+                            &mut route_resolve_wires,
+                            &mut route_proxy_requests,
+                            &mut open_by_ingress,
+                            &mut ingress_by_id,
+                            &mut ingress_route,
+                            &mut ingress_cancel,
+                            &mut connection_manager,
+                            &mut swarm,
+                            &emitter,
+                            &args.case_id,
+                        ).await? {
                             return Ok(());
                         }
                     }
@@ -2262,14 +2404,21 @@ async fn main() -> io::Result<()> {
                                 &mut route_wire_sequence,
                                 actions,
                             )?;
-                            if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
-                                if let Some(ingress_id) = open_by_ingress.remove(&failed_open)
-                                    && let Some(command) = ingress_by_id.remove(&ingress_id)
-                                {
-                                    let _ = command.send(IngressCommand::Reject).await;
-                                }
-                                if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
-                                emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                            if complete_route_actions(
+                                product_ingress,
+                                completed_actions,
+                                &mut resolver_state,
+                                &mut route_resolve_wires,
+                                &mut route_proxy_requests,
+                                &mut open_by_ingress,
+                                &mut ingress_by_id,
+                                &mut ingress_route,
+                                &mut ingress_cancel,
+                                &mut connection_manager,
+                                &mut swarm,
+                                &emitter,
+                                &args.case_id,
+                            ).await? {
                                 return Ok(());
                             }
                         }
@@ -2425,9 +2574,21 @@ async fn main() -> io::Result<()> {
                                             &mut route_wire_sequence,
                                             actions,
                                         )?;
-                                        if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
-                                            if let Some(server) = server { release_route_setup(manager, &mut swarm, server, failed_open); }
-                                            emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                                        if complete_route_actions(
+                                            product_ingress,
+                                            completed_actions,
+                                            &mut resolver_state,
+                                            &mut route_resolve_wires,
+                                            &mut route_proxy_requests,
+                                            &mut open_by_ingress,
+                                            &mut ingress_by_id,
+                                            &mut ingress_route,
+                                            &mut ingress_cancel,
+                                            &mut connection_manager,
+                                            &mut swarm,
+                                            &emitter,
+                                            &args.case_id,
+                                        ).await? {
                                             return Ok(());
                                         }
                                     }
@@ -2484,9 +2645,21 @@ async fn main() -> io::Result<()> {
                                         &mut route_wire_sequence,
                                         actions,
                                     )?;
-                                    if let Some((failed_open, server, Err(code))) = completed_actions.into_iter().next() {
-                                        if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) { release_route_setup(manager, &mut swarm, server, failed_open); }
-                                        emitter.terminal(&TerminalResult::simple(&args.case_id, "failed", code.as_str()))?;
+                                    if complete_route_actions(
+                                        product_ingress,
+                                        completed_actions,
+                                        &mut resolver_state,
+                                        &mut route_resolve_wires,
+                                        &mut route_proxy_requests,
+                                        &mut open_by_ingress,
+                                        &mut ingress_by_id,
+                                        &mut ingress_route,
+                                        &mut ingress_cancel,
+                                        &mut connection_manager,
+                                        &mut swarm,
+                                        &emitter,
+                                        &args.case_id,
+                                    ).await? {
                                         return Ok(());
                                     }
                                 }

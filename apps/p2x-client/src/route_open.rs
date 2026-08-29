@@ -54,6 +54,7 @@ pub enum RouteAction {
     Complete {
         open_id: OpenId,
         server: Option<PeerId>,
+        request_id: [u8; 16],
         result: Result<(), PublicErrorCode>,
     },
 }
@@ -474,6 +475,7 @@ impl RouteOpenSupervisor {
         Some(RouteAction::Complete {
             open_id,
             server: open.server_peer_id,
+            request_id,
             result: Err(PublicErrorCode::PeerSetupTimeout),
         })
     }
@@ -570,6 +572,7 @@ impl RouteOpenSupervisor {
                 p2x_net::PathAction::Finish(reason) => Some(RouteAction::Complete {
                     open_id,
                     server: open.server_peer_id,
+                    request_id: open.resolve_request.resolve_request_id(),
                     result: Err(match reason {
                         p2x_net::PathFailure::SetupExpired => PublicErrorCode::PeerSetupTimeout,
                         _ => PublicErrorCode::PeerConnectionFailed,
@@ -596,14 +599,19 @@ impl RouteOpenSupervisor {
     }
 
     fn finish(&mut self, open_id: OpenId, result: Result<(), PublicErrorCode>) -> RouteAction {
-        let mut server = None;
-        if let Some(mut open) = self.opens.remove(&open_id) {
+        let (server, request_id) = if let Some(mut open) = self.opens.remove(&open_id) {
             open.terminal_delivered = true;
-            server = open.server_peer_id;
-        }
+            (
+                open.server_peer_id,
+                open.resolve_request.resolve_request_id(),
+            )
+        } else {
+            (None, [0; 16])
+        };
         RouteAction::Complete {
             open_id,
             server,
+            request_id,
             result,
         }
     }
