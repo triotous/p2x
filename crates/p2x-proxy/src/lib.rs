@@ -366,6 +366,7 @@ mod tests {
         fail_read: bool,
         fail_write_after: Option<usize>,
         block_write: bool,
+        pending_read: bool,
         max_write: usize,
         closed: bool,
         drops: AtomicUsize,
@@ -384,6 +385,7 @@ mod tests {
                 fail_read: false,
                 fail_write_after: None,
                 block_write: false,
+                pending_read: false,
                 max_write: 0,
                 closed: false,
                 drops: AtomicUsize::new(0),
@@ -414,6 +416,9 @@ mod tests {
             buf: &mut [u8],
         ) -> Poll<io::Result<usize>> {
             let mut state = self.state.lock().unwrap();
+            if state.pending_read {
+                return Poll::Pending;
+            }
             if state.fail_read {
                 state.fail_read = false;
                 return Poll::Ready(Err(io::Error::other("scripted read")));
@@ -633,6 +638,8 @@ mod tests {
     async fn cancellation_drops_both_scripted_objects() {
         let (local, local_state) = ScriptedIo::new(b"");
         let (remote, remote_state) = ScriptedIo::new(b"");
+        local_state.lock().unwrap().pending_read = true;
+        remote_state.lock().unwrap().pending_read = true;
         let result = pump_no_idle(local, remote, MIN_COPY_BUFFER, async {})
             .await
             .unwrap();
