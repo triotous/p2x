@@ -94,12 +94,12 @@ class Upstream:
                         return
                     time.sleep(0.5)
                     client.sendall(data)
-            if self.mode == "slow":
+            if self.mode == "slow" or (self.mode == "slow-first" and connection_number == 1):
                 while True:
                     data = client.recv(65536)
                     if not data:
                         return
-                    time.sleep(0.0001)
+                    time.sleep(0.001)
                     client.sendall(data)
             if self.mode == "idle-first" and connection_number == 1:
                 while not self.stop.wait(0.1):
@@ -141,6 +141,9 @@ class Run:
         self.out.mkdir(parents=True, exist_ok=True)
         self.secret = pathlib.Path(__import__("tempfile").mkdtemp(prefix="p2x-tunnel-"))
         self.processes: list[tuple[subprocess.Popen, pathlib.Path, object]] = []
+        self.samples: list[dict] = []
+        self.sample_stop = threading.Event()
+        self.sample_thread: threading.Thread | None = None
         self.upstream_port = free_port(socket.SOCK_STREAM)
         self.local_port = free_port(socket.SOCK_STREAM)
         self.exchange_tcp = free_port(socket.SOCK_STREAM)
@@ -200,13 +203,13 @@ credentials:
         ).strip()
 
     def write_configs(self) -> None:
-        idle = 1_000 if self.case == "idle-timeout" else 300_000
+        idle = 1_000 if self.case == "idle-timeout" else 3_600_000 if self.case.startswith("large-slow") else 300_000
         connect = self.upstream_port
         if self.case == "upstream-refused":
             connect = free_port(socket.SOCK_STREAM)
             self.upstream_port = connect
         self.services = self.secret / "services.yaml"
-        max_workers = 2 if self.case == "stream-limits" else 256
+        max_workers = 2 if self.case == "stream-limits" else 128 if self.case == "concurrent-streams" else 256
         max_workers_per_client = 2 if self.case == "stream-limits" else 64 if self.case == "concurrent-streams" else 32
         max_upstream_dials = 2 if self.case == "stream-limits" else 64
         concurrency_limit = 1 if self.case == "stream-limits" else 64
@@ -259,6 +262,38 @@ limits:
   copy_buffer_bytes: 32768
 """
         )
+
+    def start_sampler(self) -> None:
+        def sample() -> None:
+            while not self.sample_stop.wait(0.2):
+                row = {"time": time.monotonic()}
+                for process, _, _ in self.processes:
+                    if process.poll() is not None:
+                        continue
+                    try:
+                        name = pathlib.Path(process.args[0]).name
+                        rss = subprocess.check_output(
+                            ["ps", "-o", "rss=", "-p", str(process.pid)],
+                            text=True,
+                        ).strip()
+                        fds = subprocess.check_output(
+                            ["lsof", "-p", str(process.pid)],
+                            text=True,
+                            stderr=subprocess.DEVNULL,
+                        ).count("\\n")
+                    except subprocess.CalledProcessError:
+                        continue
+                    row[f"rss_{name}"] = int(rss or 0) * 1024
+                    row[f"fds_{name}"] = fds
+                self.samples.append(row)
+
+        self.sample_thread = threading.Thread(target=sample, daemon=True)
+        self.sample_thread.start()
+
+    def stop_sampler(self) -> None:
+        self.sample_stop.set()
+        if self.sample_thread is not None:
+            self.sample_thread.join(timeout=3)
 
     def start(self, name: str, argv: list[str], env: dict[str, str]) -> pathlib.Path:
         log = self.out / f"{name}.ndjson"
@@ -323,6 +358,7 @@ limits:
                 process.wait()
             if not handle.closed:
                 handle.close()
+        self.stop_sampler()
         if self.upstream is not None:
             self.upstream.close()
         import shutil
@@ -341,7 +377,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
     exchange_log = server_log = client_log = None
     try:
         if case not in {"upstream-refused", "upstream-timeout"}:
-            mode = "half-close" if case.startswith("half-close") else "idle" if case == "idle-timeout" else "hold" if case in {"path-loss-recovery", "shutdown-cancellation"} else "slow" if case.startswith("large-slow") else "echo"
+            mode = "half-close" if case.startswith("half-close") else "idle" if case == "idle-timeout" else "hold" if case in {"path-loss-recovery", "shutdown-cancellation", "concurrent-streams"} else "slow-first" if case.startswith("large-slow") else "echo"
             run.upstream = Upstream(run.upstream_port, mode)
             run.upstream.start()
         exchange_log = run.start_exchange()
@@ -353,6 +389,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
         client_log = run.start_client(exchange)
         wait_for(client_log, lambda row: row.get("event") == "started", 20)
         wait_for(client_log, lambda row: row.get("event") == "auth_readiness" and row.get("ready") is True, 45)
+        run.start_sampler()
         client = None if case == "concurrent-streams" else socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
         if client is not None:
             client.settimeout(900 if case.startswith("large-slow") else 60)
@@ -388,6 +425,13 @@ def run_case(root: pathlib.Path, case: str) -> None:
             exchange_log = run.start_exchange("exchange-recovered")
             wait_for(exchange_log, lambda row: row.get("event") == "listener_ready" and "/tcp/" in row.get("address", ""), 45)
             wait_for(client_log, lambda row: row.get("event") == "auth_readiness" and row.get("ready") is True and row.get("generation", 0) >= 2, 60)
+            recovered = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            recovered.settimeout(30)
+            recovered_payload = b"control-loss-recovered"
+            recovered.sendall(recovered_payload)
+            if recovered.recv(len(recovered_payload)) != recovered_payload:
+                raise Failure("control-loss-direct did not recover a later ingress")
+            recovered.close()
         elif case == "path-loss-recovery":
             assert client is not None
             client.sendall(b"path-loss-payload")
@@ -395,6 +439,12 @@ def run_case(root: pathlib.Path, case: str) -> None:
             client.close()
             client = None
             wait_for(client_log, lambda row: row.get("event") == "tunnel_terminal", 30)
+            recovered = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            recovered.settimeout(30)
+            recovered.sendall(b"path-loss-recovered")
+            if recovered.recv(len(b"path-loss-recovered")) != b"path-loss-recovered":
+                raise Failure("path-loss-recovery did not accept a later ingress")
+            recovered.close()
         elif case == "shutdown-cancellation":
             assert client is not None
             client.sendall(b"shutdown-cancellation")
@@ -446,28 +496,78 @@ def run_case(root: pathlib.Path, case: str) -> None:
                     raise Failure("concurrent result collection failed")
             else:
                 assert client is not None
-                payload = (b"p2x-tunnel-sentinel-" + secrets.token_bytes(max(32, payload_size - 20)))[:payload_size]
-                send_error: list[BaseException] = []
-                def send_payload() -> None:
-                    try:
-                        client.sendall(payload)
-                        client.shutdown(socket.SHUT_WR)
-                    except BaseException as error:
-                        send_error.append(error)
-                sender = threading.Thread(target=send_payload, daemon=True)
-                sender.start()
-                data = bytearray()
-                while len(data) < len(payload):
-                    data.extend(client.recv(min(65536, len(payload) - len(data))))
-                sender.join(timeout=120 if case.startswith("large-slow") else 30)
-                if send_error:
-                    raise Failure(f"echo sender failed: {send_error[0]}")
-                if bytes(data) != payload:
-                    raise Failure("echo payload mismatch")
+                if case.startswith("large-slow"):
+                    block = b"p2x-tunnel-sentinel-" + b"x" * (64 * 1024 - 20)
+                    expected = hashlib.sha256()
+                    for offset in range(0, payload_size, len(block)):
+                        expected.update(block[: min(len(block), payload_size - offset)])
+                    send_error: list[BaseException] = []
+                    def send_large() -> None:
+                        try:
+                            for offset in range(0, payload_size, len(block)):
+                                client.sendall(block[: min(len(block), payload_size - offset)])
+                            client.shutdown(socket.SHUT_WR)
+                        except BaseException as error:
+                            send_error.append(error)
+                    sender = threading.Thread(target=send_large, daemon=True)
+                    sender.start()
+                    digest = hashlib.sha256()
+                    received = 0
+                    small_done = threading.Event()
+                    def small_stream() -> None:
+                        try:
+                            with socket.create_connection(("127.0.0.1", run.local_port), timeout=30) as small:
+                                small.settimeout(30)
+                                small_payload = b"small-stream-during-large"
+                                small.sendall(small_payload)
+                                if small.recv(len(small_payload)) != small_payload:
+                                    raise Failure("small stream payload mismatch during large transfer")
+                            small_done.set()
+                        except BaseException as error:
+                            send_error.append(error)
+                    small = threading.Thread(target=small_stream, daemon=True)
+                    small.start()
+                    while received < payload_size:
+                        chunk = client.recv(min(65536, payload_size - received))
+                        if not chunk:
+                            raise Failure(f"large stream closed at {received} bytes")
+                        digest.update(chunk)
+                        received += len(chunk)
+                    sender.join(timeout=120)
+                    small.join(timeout=60)
+                    if send_error:
+                        raise Failure(f"large stream failed: {send_error[0]}")
+                    if not small_done.is_set():
+                        raise Failure("small stream did not finish during large transfer")
+                    if digest.digest() != expected.digest():
+                        raise Failure("large stream hash mismatch")
+                else:
+                    payload = (b"p2x-tunnel-sentinel-" + secrets.token_bytes(max(32, payload_size - 20)))[:payload_size]
+                    send_error: list[BaseException] = []
+                    def send_payload() -> None:
+                        try:
+                            client.sendall(payload)
+                            client.shutdown(socket.SHUT_WR)
+                        except BaseException as error:
+                            send_error.append(error)
+                    sender = threading.Thread(target=send_payload, daemon=True)
+                    sender.start()
+                    data = bytearray()
+                    while len(data) < len(payload):
+                        data.extend(client.recv(min(65536, len(payload) - len(data))))
+                    sender.join(timeout=30)
+                    if send_error:
+                        raise Failure(f"echo sender failed: {send_error[0]}")
+                    if bytes(data) != payload:
+                        raise Failure("echo payload mismatch")
             selected = [row.get("selected_path") for row in read_rows(client_log) if row.get("event") == "path_selected"]
             expected_path = "relay" if case.endswith("-relay") else "direct"
             if expected_path not in selected:
                 raise Failure(f"expected {expected_path} selected path, saw {selected}")
+            if case == "concurrent-streams":
+                terminals = [row for row in read_rows(client_log) if row.get("event") == "tunnel_terminal"]
+                if len({row.get("stream_id_hash") for row in terminals}) != 64:
+                    raise Failure("concurrent-streams did not produce 64 unique stream correlations")
         if client is not None:
             client.close()
         time.sleep(0.3)
@@ -480,8 +580,8 @@ def run_case(root: pathlib.Path, case: str) -> None:
             if not any(row.get("event") == "tunnel_terminal" and row.get("accepted") for row in read_rows(client_log)):
                 raise Failure("control-loss-direct did not complete an accepted stream")
         if case == "path-loss-recovery":
-            if not any(row.get("event") == "tunnel_terminal" for row in read_rows(client_log)):
-                raise Failure("path-loss-recovery did not terminate the active stream")
+            if sum(row.get("event") == "tunnel_terminal" for row in read_rows(client_log)) < 2:
+                raise Failure("path-loss-recovery did not terminate and replace the active stream")
             if not any(row.get("event") == "connection_observed" and row.get("state") == "closed" for row in read_rows(client_log)):
                 raise Failure("path-loss-recovery did not observe selected path loss")
         all_output = "\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
@@ -492,10 +592,27 @@ def run_case(root: pathlib.Path, case: str) -> None:
             raise Failure("stream-limits did not observe N+1 rejection")
         if case == "stream-limits" and not any(row.get("event") == "resources" and row.get("workers", 0) >= 1 for row in server_rows):
             raise Failure("stream-limits did not observe a held active worker")
-        if case == "large-slow-direct" and not any(row.get("event") == "tunnel_terminal" and row.get("local_to_remote_bytes", 0) >= 256 * 1024 * 1024 for row in read_rows(client_log)):
-            raise Failure("large-slow-direct did not report the declared transfer")
-        if case == "large-slow-relay" and not any(row.get("event") == "tunnel_terminal" and row.get("local_to_remote_bytes", 0) >= 256 * 1024 * 1024 for row in read_rows(client_log)):
-            raise Failure("large-slow-relay did not report the declared transfer")
+        if case == "stream-limits" and not any(row.get("event") == "ingress_rejected" and row.get("code") == "limit.proxy_streams" for row in read_rows(client_log)):
+            raise Failure("stream-limits did not observe client ingress rejection evidence")
+        if case == "shutdown-cancellation":
+            for path in (client_log, server_log):
+                rows = read_rows(path)
+                if not any(row.get("event") == "terminal" and row.get("code") == "shutdown" for row in rows):
+                    raise Failure(f"{path.name} did not report shutdown")
+                tail = [row for row in rows if row.get("event") == "resources"][-3:]
+                if tail and any(row.get("workers", 0) or row.get("tasks", 0) or row.get("pending_opens", 0) for row in tail):
+                    raise Failure(f"{path.name} did not drain logical resources: {tail}")
+        if case.startswith("large-slow"):
+            terminal = next((row for row in read_rows(client_log) if row.get("event") == "tunnel_terminal"), None)
+            if terminal is None or terminal.get("local_to_remote_bytes", 0) < 256 * 1024 * 1024 or terminal.get("remote_to_local_bytes", 0) < 256 * 1024 * 1024:
+                raise Failure(f"{case} did not report the complete transfer")
+            rss = [value for row in run.samples for key, value in row.items() if key.startswith("rss_p2x-client") and isinstance(value, int)]
+            fds = [value for row in run.samples for key, value in row.items() if key.startswith("fds_p2x-client") and isinstance(value, int)]
+            if not rss or not fds or max(fds) - min(fds) > 32:
+                raise Failure(f"{case} resource samples did not drain: rss={rss[-3:]} fds={fds[-3:]}")
+            if max(rss) - min(rss) > 64 * 1024 * 1024:
+                raise Failure(f"{case} RSS exceeded the bounded process delta: {rss[-3:]}")
+            (run.out / "resource-samples.json").write_text(json.dumps({"samples": run.samples, "copy_buffer_bytes": 32768, "max_active_streams": 1, "declared_user_buffers": 2, "declared_bytes": 2 * 32768, "rss_delta_limit": 64 * 1024 * 1024}, sort_keys=True) + "\n")
         if case.endswith("-relay") and not any(row.get("event") == "path_selected" and row.get("selected_path") == "relay" for row in read_rows(client_log)):
             raise Failure("forced relay path was not selected")
         if case == "upstream-refused" and not any(row.get("code") == "upstream.connect_failed" and not row.get("authorized") for row in server_rows):
