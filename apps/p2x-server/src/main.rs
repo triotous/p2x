@@ -756,32 +756,26 @@ async fn main() -> io::Result<()> {
                                         } else if let Err(code) = proxy_admission.preflight(candidate.peer_id, &open.upstream_id, upstream.concurrency_limit) {
                                             reject(code)
                                         } else {
-                                            match ticket_admission.authorize_candidate(
-                                                validation_candidate,
-                                                relay_peer_id.unwrap_or(*swarm.local_peer_id()),
-                                                candidate.peer_id,
-                                                *swarm.local_peer_id(),
-                                                session.tenant(),
-                                                service,
-                                                registration_revision,
-                                                expires_at,
-                                                session.authorization_revision(),
-                                                &open,
-                                                now,
-                                            ) {
-                                                ticket_admission::TicketAdmission::Authorized(stream_id) => {
+                                            match ticket_admission.allocate_stream_id(&validation_candidate, now) {
+                                                Ok(stream_id) => {
                                                     let admission = stream_admission::AdmissionToken::new(stream_id);
                                                     match proxy_admission.reserve(admission, candidate.peer_id, open.upstream_id.clone(), upstream.concurrency_limit) {
-                                                        Ok(()) => proxy_open::ServerDecision::Admit {
-                                                            stream_id,
-                                                            admission,
-                                                            upstream,
-                                                            copy_buffer_bytes: services.proxy.copy_buffer_bytes,
+                                                        Ok(()) => match ticket_admission.consume_candidate_with_stream_id(validation_candidate, stream_id, now) {
+                                                            ticket_admission::TicketAdmission::Authorized(stream_id) => proxy_open::ServerDecision::Admit {
+                                                                stream_id,
+                                                                admission,
+                                                                upstream,
+                                                                copy_buffer_bytes: services.proxy.copy_buffer_bytes,
+                                                            },
+                                                            ticket_admission::TicketAdmission::Rejected(code) => {
+                                                                let _ = proxy_admission.release(admission);
+                                                                reject(code)
+                                                            }
                                                         },
                                                         Err(code) => reject(code),
                                                     }
                                                 }
-                                                ticket_admission::TicketAdmission::Rejected(code) => reject(code),
+                                                Err(code) => reject(code),
                                             }
                                         }
                                     }

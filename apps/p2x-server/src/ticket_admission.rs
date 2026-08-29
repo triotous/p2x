@@ -136,12 +136,20 @@ impl TicketAdmissionLedger {
         })
     }
 
+    pub fn candidate_time_valid(&self, candidate: &ValidationCandidate, now: i64) -> bool {
+        candidate.claims.expires_at() > now.saturating_sub(self.clock_skew)
+            && candidate.claims.not_before() <= now.saturating_add(self.clock_skew)
+    }
+
     pub fn preflight_candidate(
         &mut self,
         candidate: &ValidationCandidate,
         now: i64,
     ) -> Result<(), PublicErrorCode> {
         self.sweep(now);
+        if !self.candidate_time_valid(candidate, now) {
+            return Err(PublicErrorCode::AuthTicketExpired);
+        }
         if self.replay.contains_key(&candidate.ticket_id) {
             return Err(PublicErrorCode::AuthTicketReplayed);
         }
@@ -151,18 +159,31 @@ impl TicketAdmissionLedger {
         Ok(())
     }
 
-    pub fn consume_candidate(
+    pub fn allocate_stream_id(
+        &mut self,
+        candidate: &ValidationCandidate,
+        now: i64,
+    ) -> Result<[u8; 16], PublicErrorCode> {
+        self.preflight_candidate(candidate, now)?;
+        let stream_id = (self.stream_id_source)()?;
+        if stream_id == [0; 16] {
+            return Err(PublicErrorCode::ExchangeOverloaded);
+        }
+        Ok(stream_id)
+    }
+
+    pub fn consume_candidate_with_stream_id(
         &mut self,
         candidate: ValidationCandidate,
+        stream_id: [u8; 16],
         now: i64,
     ) -> TicketAdmission {
         if let Err(code) = self.preflight_candidate(&candidate, now) {
             return TicketAdmission::Rejected(code);
         }
-        let stream_id = match (self.stream_id_source)() {
-            Ok(stream_id) => stream_id,
-            Err(code) => return TicketAdmission::Rejected(code),
-        };
+        if stream_id == [0; 16] {
+            return TicketAdmission::Rejected(PublicErrorCode::ExchangeOverloaded);
+        }
         self.replay.insert(
             candidate.ticket_id,
             ReplayEntry {
@@ -171,6 +192,18 @@ impl TicketAdmissionLedger {
             },
         );
         TicketAdmission::Authorized(stream_id)
+    }
+
+    pub fn consume_candidate(
+        &mut self,
+        candidate: ValidationCandidate,
+        now: i64,
+    ) -> TicketAdmission {
+        let stream_id = match self.allocate_stream_id(&candidate, now) {
+            Ok(stream_id) => stream_id,
+            Err(code) => return TicketAdmission::Rejected(code),
+        };
+        self.consume_candidate_with_stream_id(candidate, stream_id, now)
     }
 
     #[allow(dead_code, clippy::too_many_arguments)]
@@ -363,6 +396,45 @@ mod tests {
         expected.upstream_id = "orders";
         assert_eq!(
             admission.validate_and_consume(&ring, envelope.as_bytes(), &expected, [7; 32]),
+            TicketAdmission::Authorized([9; 16])
+        );
+        assert_eq!(admission.len(), 1);
+    }
+
+    #[test]
+    fn explicit_stream_id_is_consumed_only_after_admission() {
+        let peer = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = libp2p::PeerId::from_public_key(&peer.public()).to_bytes();
+        let candidate = ValidationCandidate {
+            ticket_id: [8; 16],
+            claims: p2x_protocol::ticket::ConnectionTicketClaimsV1::new(
+                peer_id.clone(),
+                "tenant".into(),
+                peer_id.clone(),
+                peer_id,
+                "orders".into(),
+                [4; 32],
+                1,
+                2,
+                4,
+                10,
+                20,
+                [8; 16],
+                1,
+            )
+            .unwrap(),
+            owner_fingerprint: [6; 32],
+        };
+        let mut admission = TicketAdmissionLedger::new(1, 0)
+            .unwrap()
+            .with_stream_id_source(|| Ok([9; 16]));
+        assert_eq!(
+            admission.allocate_stream_id(&candidate, 11).unwrap(),
+            [9; 16]
+        );
+        assert_eq!(admission.len(), 0);
+        assert_eq!(
+            admission.consume_candidate_with_stream_id(candidate, [9; 16], 11),
             TicketAdmission::Authorized([9; 16])
         );
         assert_eq!(admission.len(), 1);
@@ -600,6 +672,35 @@ mod tests {
             TicketAdmission::Rejected(PublicErrorCode::AuthTicketInvalid)
         );
         assert_eq!(admission.len(), 0);
+    }
+
+    #[test]
+    fn owner_time_recheck_rejects_expired_candidate() {
+        let peer = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = libp2p::PeerId::from_public_key(&peer.public()).to_bytes();
+        let candidate = ValidationCandidate {
+            ticket_id: [8; 16],
+            claims: p2x_protocol::ticket::ConnectionTicketClaimsV1::new(
+                peer_id.clone(),
+                "tenant".into(),
+                peer_id.clone(),
+                peer_id,
+                "orders".into(),
+                [4; 32],
+                1,
+                2,
+                4,
+                10,
+                20,
+                [8; 16],
+                1,
+            )
+            .unwrap(),
+            owner_fingerprint: [0; 32],
+        };
+        let admission = TicketAdmissionLedger::new(1, 0).unwrap();
+        assert!(admission.candidate_time_valid(&candidate, 19));
+        assert!(!admission.candidate_time_valid(&candidate, 20));
     }
 
     #[test]
