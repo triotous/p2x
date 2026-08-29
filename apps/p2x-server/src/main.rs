@@ -1520,17 +1520,22 @@ async fn main() -> io::Result<()> {
             "proxy worker table leaked during shutdown",
         ));
     }
+    if !proxy_owner.stream_admission().is_empty() {
+        return Err(io::Error::other(
+            "proxy stream admission leaked during shutdown",
+        ));
+    }
+    if !proxy_worker_tasks.is_empty() || !proxy_workers.is_empty() {
+        return Err(io::Error::other(
+            "proxy worker tasks leaked during shutdown",
+        ));
+    }
     emitter.emit(&LifecycleRecord::Resources {
         connections: 0,
         pending_opens: 0,
         workers: 0,
         tasks: 0,
     })?;
-    if !proxy_owner.stream_admission().is_empty() {
-        return Err(io::Error::other(
-            "proxy stream admission leaked during shutdown",
-        ));
-    }
     worker_admission.close_and_discard();
     emitter.terminal(&TerminalResult::simple(
         &args.case_id,
