@@ -40,6 +40,7 @@ pub enum IngressEvent {
     Accepted {
         id: IngressId,
         route_id: String,
+        started_at: Instant,
         deadline: Instant,
         command: mpsc::Sender<IngressCommand>,
         cancel: CancellationToken,
@@ -141,13 +142,15 @@ async fn accept_loop(
             }
             continue;
         };
-        let deadline = Instant::now() + setup_timeout;
+        let started_at = Instant::now();
+        let deadline = started_at + setup_timeout;
         let (command, commands) = mpsc::channel(1);
         let cancel = shutdown.child_token();
         if events
             .send(IngressEvent::Accepted {
                 id,
                 route_id: route_id.clone(),
+                started_at,
                 deadline,
                 command,
                 cancel: cancel.clone(),

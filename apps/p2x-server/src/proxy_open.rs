@@ -15,6 +15,7 @@ pub struct Promotion {
 pub struct Release {
     pub peer_id: PeerId,
     pub connection_id: ConnectionId,
+    pub setup_duration: Duration,
     pub admission: AdmissionToken,
     pub request_id_hash: u64,
     pub stream_id_hash: Option<u64>,
@@ -109,6 +110,7 @@ pub async fn run_worker(
                 &releases,
                 peer_id,
                 connection_id,
+                started.elapsed(),
                 AdmissionToken::empty(),
                 request_id_hash,
                 None,
@@ -158,6 +160,7 @@ pub async fn run_worker(
             &releases,
             peer_id,
             connection_id,
+            started.elapsed(),
             AdmissionToken::empty(),
             request_id
                 .map(p2x_net::lifecycle::stable_hash)
@@ -212,6 +215,7 @@ pub async fn run_worker(
                     &releases,
                     peer_id,
                     connection_id,
+                    started.elapsed(),
                     admission,
                     request_id_hash,
                     stream_id_hash,
@@ -263,6 +267,7 @@ pub async fn run_worker(
                             &releases,
                             peer_id,
                             connection_id,
+                            started.elapsed(),
                             admission,
                             request_id_hash,
                             stream_id_hash,
@@ -318,6 +323,7 @@ pub async fn run_worker(
         &releases,
         peer_id,
         connection_id,
+        started.elapsed(),
         admission,
         request_id_hash,
         stream_id_hash,
@@ -333,6 +339,7 @@ async fn release(
     releases: &mpsc::Sender<Release>,
     peer_id: PeerId,
     connection_id: ConnectionId,
+    setup_duration: Duration,
     admission: AdmissionToken,
     request_id_hash: u64,
     stream_id_hash: Option<u64>,
@@ -344,6 +351,7 @@ async fn release(
         .send(Release {
             peer_id,
             connection_id,
+            setup_duration,
             admission,
             request_id_hash,
             stream_id_hash,

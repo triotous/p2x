@@ -15,6 +15,23 @@ pub enum ConnectionState {
     Closed,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentSide {
+    Client,
+    Server,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelTerminalClass {
+    Complete,
+    IdleTimeout,
+    Cancelled,
+    LocalIo,
+    RemoteIo,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReservationState {
@@ -76,12 +93,16 @@ pub enum LifecycleRecord<'a> {
         code: &'a str,
     },
     TunnelTerminal {
+        component_side: ComponentSide,
         peer_id: &'a str,
         connection_id_hash: u64,
         request_id_hash: u64,
         stream_id_hash: Option<u64>,
+        selected_path: Option<ProbePath>,
         accepted: bool,
         code: Option<&'a str>,
+        terminal_class: TunnelTerminalClass,
+        setup_duration_ms: u128,
         local_to_remote_bytes: u64,
         remote_to_local_bytes: u64,
         local_eof: bool,
@@ -329,6 +350,31 @@ mod tests {
         assert_eq!(value["event"], "terminal");
         assert_eq!(value["final_workers"], 0);
         assert_eq!(value["bytes_read"], 0);
+    }
+
+    #[test]
+    fn tunnel_terminal_serializes_side_path_and_class() {
+        let record = LifecycleRecord::TunnelTerminal {
+            component_side: ComponentSide::Client,
+            peer_id: "peer",
+            connection_id_hash: 1,
+            request_id_hash: 2,
+            stream_id_hash: Some(3),
+            selected_path: Some(ProbePath::Direct),
+            accepted: true,
+            code: None,
+            terminal_class: TunnelTerminalClass::Cancelled,
+            setup_duration_ms: 4,
+            local_to_remote_bytes: 5,
+            remote_to_local_bytes: 6,
+            local_eof: false,
+            remote_eof: true,
+            duration_ms: 7,
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["component_side"], "client");
+        assert_eq!(value["selected_path"], "direct");
+        assert_eq!(value["terminal_class"], "cancelled");
     }
     #[test]
     fn exchange_resources_are_machine_readable_counts() {

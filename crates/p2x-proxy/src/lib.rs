@@ -184,6 +184,8 @@ where
     }
 }
 
+const POLL_BUDGET: usize = 64;
+
 fn poll_pump<L, R>(
     cx: &mut Context<'_>,
     local: &mut Pin<Box<L>>,
@@ -196,7 +198,7 @@ where
     L: AsyncRead + AsyncWrite + Unpin,
     R: AsyncRead + AsyncWrite + Unpin,
 {
-    loop {
+    for _ in 0..POLL_BUDGET {
         let mut progressed = false;
         match poll_direction(
             cx,
@@ -231,6 +233,8 @@ where
             return Poll::Pending;
         }
     }
+    cx.waker().wake_by_ref();
+    Poll::Pending
 }
 
 /// Copies both directions with one fixed buffer per direction and one shared idle timer.
@@ -342,6 +346,13 @@ where
 mod tests {
     use super::*;
     use futures::io::AsyncReadExt as FuturesReadExt;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::compat::TokioAsyncReadCompatExt;
 
@@ -419,6 +430,45 @@ mod tests {
         assert_eq!(result.remote_to_local_bytes, 0);
         assert!(result.local_eof && result.remote_eof);
         assert_eq!(result.terminal, Terminal::Complete);
+    }
+
+    #[tokio::test]
+    async fn scheduler_budget_allows_a_heartbeat_during_hot_copy() {
+        let (mut local_peer, local) = tokio::io::duplex(64 * 1024);
+        let (remote, mut remote_peer) = tokio::io::duplex(64 * 1024);
+        let heartbeat = Arc::new(AtomicBool::new(false));
+        let heartbeat_seen = heartbeat.clone();
+        let heartbeat_task = tokio::spawn(async move {
+            for _ in 0..32 {
+                heartbeat_seen.store(true, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+        let pump = tokio::spawn(pump_no_idle(
+            local.compat(),
+            remote.compat(),
+            MIN_COPY_BUFFER,
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            },
+        ));
+        let writer = tokio::spawn(async move {
+            let block = vec![0x41; MIN_COPY_BUFFER];
+            for _ in 0..64 {
+                if local_peer.write_all(&block).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let reader = tokio::spawn(async move {
+            let mut block = vec![0; MIN_COPY_BUFFER];
+            while remote_peer.read_exact(&mut block).await.is_ok() {}
+        });
+        heartbeat_task.await.unwrap();
+        assert!(heartbeat.load(Ordering::Relaxed));
+        let _ = pump.await;
+        writer.abort();
+        reader.abort();
     }
 
     #[tokio::test]

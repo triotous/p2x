@@ -871,6 +871,7 @@ async fn main() -> io::Result<()> {
     });
     let mut route_admitted = 0u64;
     let mut ingress_by_id = HashMap::<IngressId, mpsc::Sender<IngressCommand>>::new();
+    let mut ingress_started = HashMap::<IngressId, std::time::Instant>::new();
     let mut ingress_route = HashMap::<IngressId, String>::new();
     let mut ingress_cancel = HashMap::<IngressId, tokio_util::sync::CancellationToken>::new();
     let mut open_by_ingress = HashMap::<route_open::OpenId, IngressId>::new();
@@ -1170,7 +1171,8 @@ async fn main() -> io::Result<()> {
             }
             Some(event) = ingress_rx.recv(), if product_ingress => {
                 match event {
-                    IngressEvent::Accepted { id, route_id, deadline, command, cancel } => {
+                    IngressEvent::Accepted { id, route_id, started_at, deadline, command, cancel } => {
+                        ingress_started.insert(id, started_at);
                         ingress_cancel.insert(id, cancel);
                         emitter.emit(&LifecycleRecord::IngressAccepted {
                             route_id_hash: stable_hash(&route_id),
@@ -1304,12 +1306,28 @@ async fn main() -> io::Result<()> {
                         if let Some((server, connection, _, request_id_hash, stream_id_hash)) = active_ingress.get(&id).copied() {
                             let peer = server.to_string();
                             emitter.emit(&LifecycleRecord::TunnelTerminal {
+                                component_side: p2x_net::lifecycle::ComponentSide::Client,
                                 peer_id: &peer,
                                 connection_id_hash: stable_hash(connection),
                                 request_id_hash,
                                 stream_id_hash: Some(stream_id_hash),
+                                selected_path: Some(if connections.is_direct(server, connection) {
+                                    ProbePath::Direct
+                                } else {
+                                    ProbePath::Relay
+                                }),
                                 accepted: true,
                                 code: None,
+                                terminal_class: match result.terminal {
+                                    p2x_proxy::Terminal::Complete => p2x_net::lifecycle::TunnelTerminalClass::Complete,
+                                    p2x_proxy::Terminal::IdleTimeout => p2x_net::lifecycle::TunnelTerminalClass::IdleTimeout,
+                                    p2x_proxy::Terminal::Cancelled => p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
+                                    p2x_proxy::Terminal::LocalIo => p2x_net::lifecycle::TunnelTerminalClass::LocalIo,
+                                    p2x_proxy::Terminal::RemoteIo => p2x_net::lifecycle::TunnelTerminalClass::RemoteIo,
+                                },
+                                setup_duration_ms: ingress_started
+                                    .get(&id)
+                                    .map_or(0, |started| started.elapsed().as_millis()),
                                 local_to_remote_bytes: result.local_to_remote_bytes,
                                 remote_to_local_bytes: result.remote_to_local_bytes,
                                 local_eof: result.local_eof,
@@ -1318,6 +1336,7 @@ async fn main() -> io::Result<()> {
                             })?;
                         }
                         ingress_by_id.remove(&id);
+                        ingress_started.remove(&id);
                         if let Some(cancel) = ingress_cancel.remove(&id) { cancel.cancel(); }
                         if let Some((server, _connection, open_id, _, _)) = active_ingress.remove(&id)
                             && let Some(manager) = connection_manager.as_mut()
@@ -2722,6 +2741,7 @@ async fn main() -> io::Result<()> {
         let _ = id;
     }
     ingress_by_id.clear();
+    ingress_started.clear();
     open_by_ingress.clear();
     route_resolve_wires.clear();
     route_proxy_requests.clear();

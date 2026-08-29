@@ -650,12 +650,25 @@ async fn main() -> io::Result<()> {
                 let peer = release.peer_id.to_string();
                 if release.accepted {
                     emitter.emit(&LifecycleRecord::TunnelTerminal {
+                        component_side: p2x_net::lifecycle::ComponentSide::Server,
                         peer_id: &peer,
                         connection_id_hash: stable_hash(release.connection_id),
                         request_id_hash: release.request_id_hash,
                         stream_id_hash: release.stream_id_hash,
+                        selected_path: connection_paths.get(&release.connection_id).copied(),
                         accepted: true,
                         code: release.code.map(PublicErrorCode::as_str),
+                        terminal_class: release.pump.map_or(
+                            p2x_net::lifecycle::TunnelTerminalClass::Complete,
+                            |result| match result.terminal {
+                                p2x_proxy::Terminal::Complete => p2x_net::lifecycle::TunnelTerminalClass::Complete,
+                                p2x_proxy::Terminal::IdleTimeout => p2x_net::lifecycle::TunnelTerminalClass::IdleTimeout,
+                                p2x_proxy::Terminal::Cancelled => p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
+                                p2x_proxy::Terminal::LocalIo => p2x_net::lifecycle::TunnelTerminalClass::LocalIo,
+                                p2x_proxy::Terminal::RemoteIo => p2x_net::lifecycle::TunnelTerminalClass::RemoteIo,
+                            },
+                        ),
+                        setup_duration_ms: release.setup_duration.as_millis(),
                         local_to_remote_bytes: release.pump.map_or(0, |result| result.local_to_remote_bytes),
                         remote_to_local_bytes: release.pump.map_or(0, |result| result.remote_to_local_bytes),
                         local_eof: release.pump.is_some_and(|result| result.local_eof),
