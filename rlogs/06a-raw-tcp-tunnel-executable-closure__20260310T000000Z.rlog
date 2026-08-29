@@ -13,3 +13,6 @@
 [action] Phase E: reordered server admission so capacity reservation precedes replay consume, added explicit stream-ID allocation/consume APIs with fresh time validation, and extended owner_pipeline through immutable TCP connect, Accepted, opaque bytes, pump counters, release, and replay rejection.
 [validation] Workspace check, workspace tests, workspace Clippy with -D warnings, fmt check, and owner_pipeline test passed.
 [commit] 1026946 Extend raw tunnel owner pipeline.
+[action] Phase F initial executable closure: added explicit tunnel_accepted lifecycle events, exact client/server terminal correlation and directional counter checks, random payload privacy sentinels, and shutdown drain processing for completed pump events.
+[validation] Tunnel fixed direct, fixed relay, idle-timeout, stream-limits, and shutdown focused cases passed after the accepted-event and shutdown-drain fixes.
+[commit] ded6667 Drain accepted tunnels during shutdown.
