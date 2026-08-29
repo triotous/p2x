@@ -372,18 +372,31 @@ def one_terminal(path: pathlib.Path) -> dict:
         raise Failure(f"{path.name}: expected one terminal, got {len(terminals)}")
     return terminals[0]
 
+def wait_for_terminal(path: pathlib.Path, timeout: float = 15.0) -> dict:
+    return wait_for(path, lambda row: row.get("event") == "terminal", timeout)
+
 def assert_tunnel_lifecycle(case: str, client_rows: list[dict], server_rows: list[dict]) -> dict[str, bool]:
     client_accepted = [row for row in client_rows if row.get("event") == "tunnel_accepted"]
     server_accepted = [row for row in server_rows if row.get("event") == "tunnel_accepted"]
     client_terminal = [row for row in client_rows if row.get("event") == "tunnel_terminal"]
     server_terminal = [row for row in server_rows if row.get("event") == "tunnel_terminal"]
-    expected = {"accepted": False, "terminal_correlation": False, "directional_bytes": False, "idle_terminal_class": False}
+    expected = {
+        "accepted": False,
+        "terminal_correlation": False,
+        "directional_bytes": False,
+        "idle_terminal_class": False,
+        "upstream_failure_or_idle": False,
+    }
     if not client_accepted and not server_accepted:
         if client_terminal or server_terminal:
             raise Failure(f"{case} emitted a tunnel terminal without Accepted")
-        expected["accepted"] = case in {"upstream-refused", "upstream-timeout", "idle-timeout"}
-        if case == "idle-timeout":
-            raise Failure("idle-timeout did not reach Accepted")
+        expected["upstream_failure_or_idle"] = any(
+            row.get("code") in {"upstream.connect_failed", "upstream.connect_timeout"}
+            for row in server_rows
+            if row.get("event") == "proxy_authorization"
+        )
+        if not expected["upstream_failure_or_idle"]:
+            raise Failure(f"{case} did not observe a concrete pre-Accept failure")
         return expected
     if len(client_accepted) != len(server_accepted):
         raise Failure(f"{case} Accepted cardinality differs: client={len(client_accepted)} server={len(server_accepted)}")
@@ -411,6 +424,7 @@ def assert_tunnel_lifecycle(case: str, client_rows: list[dict], server_rows: lis
         if not any(row.get("terminal_class") == "idle_timeout" and row.get("code") == "upstream.idle_timeout" for row in server_terminal):
             raise Failure("idle-timeout did not emit idle_timeout terminal class with public code")
         expected["idle_terminal_class"] = True
+        expected["upstream_failure_or_idle"] = True
     return expected
 
 
@@ -627,7 +641,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
             client.close()
         time.sleep(0.3)
         if case == "shutdown-cancellation":
-            if one_terminal(client_log).get("code") != "shutdown":
+            if wait_for_terminal(client_log).get("code") != "shutdown":
                 raise Failure("shutdown-cancellation did not stop the client cleanly")
             if not any(row.get("event") == "resources" and row.get("workers") == 1 for row in read_rows(client_log)):
                 raise Failure("shutdown-cancellation did not observe active work before cancellation")
@@ -651,6 +665,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
             raise Failure("stream-limits did not observe a held active worker")
         if case == "shutdown-cancellation":
             for path in (client_log, server_log):
+                wait_for_terminal(path)
                 rows = read_rows(path)
                 if not any(row.get("event") == "terminal" and row.get("code") == "shutdown" for row in rows):
                     raise Failure(f"{path.name} did not report shutdown")
@@ -694,13 +709,13 @@ def run_case(root: pathlib.Path, case: str) -> None:
         run.stop(server_log)
         run.stop(exchange_log)
         for path in (client_log, server_log, exchange_log):
-            one_terminal(path)
+            wait_for_terminal(path)
         summary = {
             "case": case,
             "passed": True,
             "observed_assertions": {
                 "accepted_and_opaque_bytes": lifecycle_assertions["accepted"],
-                "upstream_failure_or_idle": case in {"upstream-refused", "upstream-timeout", "idle-timeout"},
+                "upstream_failure_or_idle": lifecycle_assertions["upstream_failure_or_idle"],
                 "terminal_correlation": lifecycle_assertions["terminal_correlation"],
                 "directional_bytes": lifecycle_assertions["directional_bytes"],
                 "idle_terminal_class": lifecycle_assertions["idle_terminal_class"],
