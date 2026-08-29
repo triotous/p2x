@@ -1123,6 +1123,7 @@ async fn main() -> io::Result<()> {
                             continue;
                         };
                         let Some(owner) = route_owner.as_mut() else {
+                            if let Some(cancel) = ingress_cancel.remove(&id) { cancel.cancel(); }
                             let _ = command.send(IngressCommand::Reject).await;
                             continue;
                         };
@@ -1130,7 +1131,6 @@ async fn main() -> io::Result<()> {
                             Ok((open_id, actions)) => {
                                 ingress_by_id.insert(id, command);
                                 open_by_ingress.insert(open_id, id);
-                                let _ = cancel;
                                 let completed_actions = drive_route_actions(
                                     &mut swarm,
                                     owner,
@@ -1143,8 +1143,9 @@ async fn main() -> io::Result<()> {
                                     actions,
                                 )?;
                                 if let Some((failed_open, server, _)) = completed_actions.into_iter().next() {
-                                    if let Some(failed_ingress) = open_by_ingress.remove(&failed_open) {
+                                        if let Some(failed_ingress) = open_by_ingress.remove(&failed_open) {
                                         ingress_by_id.remove(&failed_ingress);
+                                        if let Some(cancel) = ingress_cancel.remove(&failed_ingress) { cancel.cancel(); }
                                     }
                                     if let (Some(manager), Some(server)) = (connection_manager.as_mut(), server) {
                                         release_route_setup(manager, &mut swarm, server, failed_open);
@@ -1160,9 +1161,17 @@ async fn main() -> io::Result<()> {
                                     ingress_id: id.0,
                                     code: code.as_str(),
                                 })?;
+                                if let Some(cancel) = ingress_cancel.remove(&id) { cancel.cancel(); }
                                 let _ = command.send(IngressCommand::Reject).await;
                             }
                         }
+                    }
+                    IngressEvent::Rejected { id, route_id, code } => {
+                        emitter.emit(&LifecycleRecord::IngressRejected {
+                            route_id_hash: stable_hash(&route_id),
+                            ingress_id: id.0,
+                            code,
+                        })?;
                     }
                     IngressEvent::Closed { id } => {
                         let _ = ingress_by_id.remove(&id);
@@ -1172,6 +1181,8 @@ async fn main() -> io::Result<()> {
                             .find_map(|(open_id, ingress_id)| (*ingress_id == id).then_some(*open_id))
                         {
                             open_by_ingress.remove(&open_id);
+                            route_resolve_wires.retain(|_, (candidate, _, _)| *candidate != open_id);
+                            route_proxy_requests.retain(|_, candidate| *candidate != open_id);
                             if let Some(action) = route_owner.as_mut().and_then(|owner| owner.cancel(&mut resolver_state, open_id)) {
                                 let completed_actions = drive_route_actions(
                                     &mut swarm,
@@ -1283,8 +1294,8 @@ async fn main() -> io::Result<()> {
             }
             Some(proxy_result) = proxy_result_rx.recv() => {
                 if let Some(open_id) = proxy_result.open_id {
-                    let (server, _, _, _, _, _) = route_owner.as_ref().and_then(|owner| owner.path_input(open_id)).ok_or_else(|| io::Error::other("route result owner missing"))?;
-                    let connection = route_owner.as_ref().and_then(|owner| owner.selected_connection(open_id)).ok_or_else(|| io::Error::other("route selected connection missing"))?;
+                    let Some((server, _, _, _, _, _)) = route_owner.as_ref().and_then(|owner| owner.path_input(open_id)) else { continue; };
+                    let Some(connection) = route_owner.as_ref().and_then(|owner| owner.selected_connection(open_id)) else { continue; };
                     match proxy_result.result {
                         Ok((request_id, stream_id, stream)) => {
                             if product_ingress {
@@ -2109,7 +2120,7 @@ async fn main() -> io::Result<()> {
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Proxy(ProxyOutput::OutboundOpened { request_id, peer_id: _, connection_id, stream })) if route_proxy_requests.contains_key(&request_id) => {
                         let open_id = route_proxy_requests.remove(&request_id).expect("checked route proxy request exists");
-                        let attempt_id = route_owner.as_ref().and_then(|owner| owner.path_attempt_id(open_id)).ok_or_else(|| io::Error::other("route path attempt missing"))?;
+                        let Some(attempt_id) = route_owner.as_ref().and_then(|owner| owner.path_attempt_id(open_id)) else { continue; };
                         let next_actions = route_owner.as_mut().expect("multi-open owner exists").path_event(
                             open_id,
                             PathEvent {

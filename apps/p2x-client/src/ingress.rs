@@ -36,6 +36,11 @@ pub enum IngressEvent {
         command: mpsc::Sender<IngressCommand>,
         cancel: CancellationToken,
     },
+    Rejected {
+        id: IngressId,
+        route_id: String,
+        code: &'static str,
+    },
     Closed {
         id: IngressId,
     },
@@ -110,12 +115,23 @@ async fn accept_loop(
             accepted = bound.listener.accept() => accepted,
         };
         let Ok((socket, _)) = accepted else { break };
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
-            drop(socket);
-            continue;
-        };
         let id = IngressId(next_id.fetch_add(1, Ordering::Relaxed).saturating_add(1));
         let route_id = bound.config.route_id.clone();
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            drop(socket);
+            if events
+                .send(IngressEvent::Rejected {
+                    id,
+                    route_id,
+                    code: p2x_protocol::PublicErrorCode::LimitProxyStreams.as_str(),
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        };
         let deadline = Instant::now() + setup_timeout;
         let (command, commands) = mpsc::channel(1);
         let cancel = shutdown.child_token();

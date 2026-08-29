@@ -4,6 +4,10 @@ use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use std::{
     io,
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -93,33 +97,41 @@ fn valid_buffer(buffer_size: usize) -> io::Result<()> {
     }
 }
 
+struct DirectionStats {
+    bytes: AtomicU64,
+    eof: AtomicBool,
+}
+
 async fn copy_direction<R, W>(
     mut reader: R,
     mut writer: W,
     buffer_size: usize,
     activity: watch::Sender<Instant>,
-) -> (u64, bool, Option<io::Error>)
+    stats: Arc<DirectionStats>,
+) -> Option<io::Error>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut buffer = vec![0; buffer_size];
-    let mut bytes = 0u64;
     loop {
         let count = match reader.read(&mut buffer).await {
             Ok(count) => count,
-            Err(error) => return (bytes, false, Some(error)),
+            Err(error) => return Some(error),
         };
         if count == 0 {
             return match writer.close().await {
-                Ok(()) => (bytes, true, None),
-                Err(error) => (bytes, false, Some(error)),
+                Ok(()) => {
+                    stats.eof.store(true, Ordering::Release);
+                    None
+                }
+                Err(error) => Some(error),
             };
         }
         if let Err(error) = writer.write_all(&buffer[..count]).await {
-            return (bytes, false, Some(error));
+            return Some(error);
         }
-        bytes = bytes.saturating_add(count as u64);
+        stats.bytes.fetch_add(count as u64, Ordering::Relaxed);
         let _ = activity.send(Instant::now());
     }
 }
@@ -176,17 +188,27 @@ where
     let (activity_tx, mut activity_rx) = watch::channel(started);
     let (local_reader, local_writer) = local.split();
     let (remote_reader, remote_writer) = remote.split();
+    let local_stats = Arc::new(DirectionStats {
+        bytes: AtomicU64::new(0),
+        eof: AtomicBool::new(false),
+    });
+    let remote_stats = Arc::new(DirectionStats {
+        bytes: AtomicU64::new(0),
+        eof: AtomicBool::new(false),
+    });
     let local_to_remote = tokio::spawn(copy_direction(
         local_reader,
         remote_writer,
         buffer_size,
         activity_tx.clone(),
+        local_stats.clone(),
     ));
     let remote_to_local = tokio::spawn(copy_direction(
         remote_reader,
         local_writer,
         buffer_size,
         activity_tx,
+        remote_stats.clone(),
     ));
     let mut local_result = Box::pin(local_to_remote);
     let mut remote_result = Box::pin(remote_to_local);
@@ -207,13 +229,13 @@ where
         tokio::select! {
             result = &mut local_result, if local_done.is_none() => {
                 let result = result.map_err(io::Error::other)?;
-                let failed = result.2.is_some();
+                let failed = result.is_some();
                 local_done = Some(result);
                 if failed { break Terminal::LocalIo; }
             }
             result = &mut remote_result, if remote_done.is_none() => {
                 let result = result.map_err(io::Error::other)?;
-                let failed = result.2.is_some();
+                let failed = result.is_some();
                 remote_done = Some(result);
                 if failed { break Terminal::RemoteIo; }
             }
@@ -242,19 +264,14 @@ where
             let _ = (&mut remote_result).await;
         }
     }
-    let (local_to_remote_bytes, local_eof) = local_done
-        .as_ref()
-        .map_or((0, false), |(bytes, eof, _)| (*bytes, *eof));
-    let (remote_to_local_bytes, remote_eof) = remote_done
-        .as_ref()
-        .map_or((0, false), |(bytes, eof, _)| (*bytes, *eof));
+    let local_to_remote_bytes = local_stats.bytes.load(Ordering::Relaxed);
+    let remote_to_local_bytes = remote_stats.bytes.load(Ordering::Relaxed);
+    let local_eof = local_stats.eof.load(Ordering::Acquire);
+    let remote_eof = remote_stats.eof.load(Ordering::Acquire);
     let terminal = if terminal == Terminal::Complete {
-        if local_done.as_ref().is_some_and(|result| result.2.is_some()) {
+        if local_done.as_ref().is_some_and(|result| result.is_some()) {
             Terminal::LocalIo
-        } else if remote_done
-            .as_ref()
-            .is_some_and(|result| result.2.is_some())
-        {
+        } else if remote_done.as_ref().is_some_and(|result| result.is_some()) {
             Terminal::RemoteIo
         } else {
             Terminal::Complete
