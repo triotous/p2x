@@ -40,11 +40,13 @@ def read_rows(path: pathlib.Path) -> list[dict]:
     rows = []
     lines = path.read_text(errors="replace").splitlines(keepends=True)
     for index, line in enumerate(lines):
-        if not line.strip() or index == len(lines) - 1 and not line.endswith(("\n", "\r")):
+        if not line.strip():
             continue
         try:
             rows.append(json.loads(line))
         except json.JSONDecodeError as error:
+            if index == len(lines) - 1 and not line.endswith(("\n", "\r")):
+                continue
             raise Failure(f"invalid NDJSON in {path}: {error}") from error
     return rows
 
@@ -263,7 +265,11 @@ credentials:
         if self.case == "stream-limits/server-global":
             max_workers = max_upstream_dials = concurrency_limit = 2
             max_workers_per_client = 128
+        if self.case == "per-ingress-failure-recovery/path-capacity":
+            max_workers = max_workers_per_client = max_upstream_dials = concurrency_limit = 1
         if self.case == "stream-limits/client-ingress":
+            max_workers = max_workers_per_client = max_upstream_dials = concurrency_limit = 2
+        if self.case == "stream-limits/client-server":
             max_workers = max_workers_per_client = max_upstream_dials = concurrency_limit = 2
         self.services.write_text(
             f"""schema_version: 1
@@ -721,7 +727,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
     exchange_log = server_log = client_log = None
     try:
         if profile not in {"upstream-refused", "upstream-timeout"} and requested_case != "per-ingress-failure-recovery/upstream":
-            mode = "half-close" if profile.startswith("half-close") else "idle-first" if profile == "idle-timeout" else "hold-until-release" if profile in {"concurrent-streams", "resource-baseline"} else "hold" if profile in {"path-loss-recovery", "shutdown-cancellation", "shutdown"} else "slow-first" if profile.startswith("large-slow") else "echo"
+            mode = "half-close" if profile.startswith("half-close") else "idle-first" if profile == "idle-timeout" else "hold-until-release" if profile in {"concurrent-streams", "resource-baseline"} or requested_case == "stream-limits/client-server" else "hold" if profile in {"path-loss-recovery", "shutdown-cancellation", "shutdown"} else "slow-first" if profile.startswith("large-slow") else "echo"
             run.upstream = Upstream(run.upstream_port, mode)
             run.upstream.start()
         exchange_log = run.start_exchange()
@@ -868,6 +874,8 @@ def run_case(root: pathlib.Path, case: str) -> None:
             wait_for(client_log, lambda row: row.get("event") == "ingress_rejected", 20)
             wait_for_eof(overflow)
             overflow.close()
+            assert run.upstream is not None
+            run.upstream.release()
             client.close()
             client = None
             reusable = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
