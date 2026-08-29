@@ -844,6 +844,7 @@ async fn main() -> io::Result<()> {
     let mut proxy_server: Option<libp2p::PeerId> = None;
     let mut pending_proxy: Option<ProxyRequestId> = None;
     let mut close_proxy_due: Option<(p2x_net::ConnectionId, std::time::Instant)> = None;
+    let mut close_proxy_applied = false;
     let mut maintenance = tokio::time::interval(std::time::Duration::from_millis(100));
     struct ProxyResult {
         open_id: Option<route_open::OpenId>,
@@ -1319,7 +1320,10 @@ async fn main() -> io::Result<()> {
                                         stable_hash(handoff.stream_id),
                                     ),
                                 );
-                                if let Some(delay) = args.test_close_proxy_after_accept_ms {
+                                if let Some(delay) = args.test_close_proxy_after_accept_ms
+                                    && !close_proxy_applied
+                                {
+                                    close_proxy_applied = true;
                                     close_proxy_due = Some((
                                         handoff.connection,
                                         std::time::Instant::now()
@@ -2514,8 +2518,36 @@ async fn main() -> io::Result<()> {
         }
     }
     shutdown.cancel();
-    for task in ingress_tasks.drain(..) {
-        task.abort();
+    for mut task in ingress_tasks.drain(..) {
+        if tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    for cancel in ingress_cancel.into_values() {
+        cancel.cancel();
+    }
+    for (id, (server, _, open_id, _, _)) in active_ingress.drain() {
+        if let Some(manager) = connection_manager.as_mut() {
+            manager.close_active(server);
+            manager.release_waiter(server, open_id.0);
+        }
+        let _ = id;
+    }
+    ingress_by_id.clear();
+    open_by_ingress.clear();
+    route_resolve_wires.clear();
+    route_proxy_requests.clear();
+    if product_ingress {
+        emitter.emit(&LifecycleRecord::Resources {
+            connections: connections.len(),
+            pending_opens: 0,
+            workers: 0,
+            tasks: 0,
+        })?;
     }
     let mut terminal = TerminalResult::simple(&args.case_id, "stopped", "shutdown");
     terminal.setup_duration_ms = started_at.elapsed().as_millis();

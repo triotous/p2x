@@ -209,10 +209,10 @@ credentials:
             connect = free_port(socket.SOCK_STREAM)
             self.upstream_port = connect
         self.services = self.secret / "services.yaml"
-        max_workers = 2 if self.case == "stream-limits" else 128 if self.case == "concurrent-streams" else 256
-        max_workers_per_client = 2 if self.case == "stream-limits" else 64 if self.case == "concurrent-streams" else 32
-        max_upstream_dials = 2 if self.case == "stream-limits" else 64
-        concurrency_limit = 1 if self.case == "stream-limits" else 64
+        max_workers = 2 if self.case == "stream-limits" else 256
+        max_workers_per_client = 2 if self.case == "stream-limits" else 128 if self.case == "concurrent-streams" else 32
+        max_upstream_dials = 2 if self.case == "stream-limits" else 128 if self.case == "concurrent-streams" else 64
+        concurrency_limit = 1 if self.case == "stream-limits" else 128 if self.case == "concurrent-streams" else 64
         self.services.write_text(
             f"""schema_version: 1
 registration:
@@ -237,7 +237,7 @@ proxy:
   ticket_clock_skew: 5
 """
         )
-        direct = 0 if self.case.endswith("-relay") else 1500
+        direct = 0 if self.case.endswith("-relay") else 5000 if self.case == "control-loss-direct" else 1500
         self.routes = self.secret / "routes.yaml"
         self.routes.write_text(
             f"""schema_version: 1
@@ -413,10 +413,13 @@ def run_case(root: pathlib.Path, case: str) -> None:
             reusable.close()
         elif case == "control-loss-direct":
             assert client is not None
+            wait_for(client_log, lambda row: row.get("event") == "path_selected" and row.get("selected_path") == "direct", 45)
             first = b"control-loss-before"
             client.sendall(first)
             if client.recv(len(first)) != first:
                 raise Failure("direct stream failed before control loss")
+            wait_for(server_log, lambda row: row.get("event") == "proxy_authorization" and row.get("authorized") is True, 45)
+            time.sleep(0.5)
             run.stop(exchange_log, force=True)
             second = b"control-loss-after"
             client.sendall(second)
@@ -424,6 +427,8 @@ def run_case(root: pathlib.Path, case: str) -> None:
                 raise Failure("accepted direct stream did not survive exchange control loss")
             exchange_log = run.start_exchange("exchange-recovered")
             wait_for(exchange_log, lambda row: row.get("event") == "listener_ready" and "/tcp/" in row.get("address", ""), 45)
+            wait_for(exchange_log, lambda row: row.get("event") == "registry_transition" and row.get("code") == "registry.registered", 60)
+            wait_for(server_log, lambda row: row.get("event") == "server_readiness" and row.get("ready") is True and row.get("registration") is True, 60)
             wait_for(client_log, lambda row: row.get("event") == "auth_readiness" and row.get("ready") is True and row.get("generation", 0) >= 2, 60)
             recovered = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
             recovered.settimeout(30)
@@ -492,6 +497,8 @@ def run_case(root: pathlib.Path, case: str) -> None:
                         return item, bytes(data)
                 with ThreadPoolExecutor(max_workers=64) as pool:
                     results = list(pool.map(one, range(64)))
+                if len(results) != 64:
+                    raise Failure("concurrent-streams did not run the full 64-stream profile")
                 if any(item != data for item, data in results):
                     raise Failure("concurrent result collection failed")
             else:
@@ -568,7 +575,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
                 raise Failure(f"expected {expected_path} selected path, saw {selected}")
             if case == "concurrent-streams":
                 terminals = [row for row in read_rows(client_log) if row.get("event") == "tunnel_terminal"]
-                if len({row.get("stream_id_hash") for row in terminals}) != 64:
+                if len(terminals) != 64 or len({row.get("stream_id_hash") for row in terminals}) != 64:
                     raise Failure("concurrent-streams did not produce 64 unique stream correlations")
         if client is not None:
             client.close()
@@ -599,9 +606,9 @@ def run_case(root: pathlib.Path, case: str) -> None:
                 rows = read_rows(path)
                 if not any(row.get("event") == "terminal" and row.get("code") == "shutdown" for row in rows):
                     raise Failure(f"{path.name} did not report shutdown")
-                tail = [row for row in rows if row.get("event") == "resources"][-3:]
-                if tail and any(row.get("workers", 0) or row.get("tasks", 0) or row.get("pending_opens", 0) for row in tail):
-                    raise Failure(f"{path.name} did not drain logical resources: {tail}")
+                final_resources = [row for row in rows if row.get("event") == "resources"][-1:]
+                if final_resources and any(row.get("workers", 0) or row.get("tasks", 0) or row.get("pending_opens", 0) for row in final_resources):
+                    raise Failure(f"{path.name} did not drain logical resources: {final_resources}")
         if case.startswith("large-slow"):
             large_terminals = [
                 row for row in read_rows(client_log)
