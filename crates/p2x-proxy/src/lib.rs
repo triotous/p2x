@@ -1,13 +1,12 @@
 //! Bounded opaque-byte tunnelling for futures and Tokio I/O streams.
 
-use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures::{
+    future::poll_fn,
+    io::{AsyncRead, AsyncWrite},
+};
 use std::{
     io,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -97,42 +96,140 @@ fn valid_buffer(buffer_size: usize) -> io::Result<()> {
     }
 }
 
-struct DirectionStats {
-    bytes: AtomicU64,
-    eof: AtomicBool,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectionPhase {
+    Read,
+    Write,
+    Close,
+    Done,
 }
 
-async fn copy_direction<R, W>(
-    mut reader: R,
-    mut writer: W,
-    buffer_size: usize,
-    activity: watch::Sender<Instant>,
-    stats: Arc<DirectionStats>,
-) -> Option<io::Error>
+struct Direction {
+    buffer: Vec<u8>,
+    filled: usize,
+    offset: usize,
+    bytes: u64,
+    eof: bool,
+    phase: DirectionPhase,
+}
+
+impl Direction {
+    fn new(buffer_size: usize) -> Self {
+        Self {
+            buffer: vec![0; buffer_size],
+            filled: 0,
+            offset: 0,
+            bytes: 0,
+            eof: false,
+            phase: DirectionPhase::Read,
+        }
+    }
+}
+
+fn poll_direction<R, W>(
+    cx: &mut Context<'_>,
+    reader: Pin<&mut R>,
+    writer: Pin<&mut W>,
+    direction: &mut Direction,
+    activity: &watch::Sender<Instant>,
+    terminal: Terminal,
+) -> Poll<Result<bool, Terminal>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buffer = vec![0; buffer_size];
-    loop {
-        let count = match reader.read(&mut buffer).await {
-            Ok(count) => count,
-            Err(error) => return Some(error),
-        };
-        if count == 0 {
-            return match writer.close().await {
-                Ok(()) => {
-                    stats.eof.store(true, Ordering::Release);
-                    None
+    match direction.phase {
+        DirectionPhase::Read => match reader.poll_read(cx, &mut direction.buffer) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(_)) => Poll::Ready(Err(terminal)),
+            Poll::Ready(Ok(0)) => {
+                direction.eof = true;
+                direction.phase = DirectionPhase::Close;
+                Poll::Ready(Ok(true))
+            }
+            Poll::Ready(Ok(count)) => {
+                direction.filled = count;
+                direction.offset = 0;
+                direction.phase = DirectionPhase::Write;
+                Poll::Ready(Ok(true))
+            }
+        },
+        DirectionPhase::Write => {
+            match writer.poll_write(cx, &direction.buffer[direction.offset..direction.filled]) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(_)) => Poll::Ready(Err(terminal)),
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(terminal)),
+                Poll::Ready(Ok(count)) => {
+                    direction.offset += count;
+                    direction.bytes = direction.bytes.saturating_add(count as u64);
+                    let _ = activity.send(Instant::now());
+                    if direction.offset == direction.filled {
+                        direction.filled = 0;
+                        direction.offset = 0;
+                        direction.phase = DirectionPhase::Read;
+                    }
+                    Poll::Ready(Ok(true))
                 }
-                Err(error) => Some(error),
-            };
+            }
         }
-        if let Err(error) = writer.write_all(&buffer[..count]).await {
-            return Some(error);
+        DirectionPhase::Close => match writer.poll_close(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(_)) => Poll::Ready(Err(terminal)),
+            Poll::Ready(Ok(())) => {
+                direction.phase = DirectionPhase::Done;
+                Poll::Ready(Ok(true))
+            }
+        },
+        DirectionPhase::Done => Poll::Ready(Ok(false)),
+    }
+}
+
+fn poll_pump<L, R>(
+    cx: &mut Context<'_>,
+    local: &mut Pin<Box<L>>,
+    remote: &mut Pin<Box<R>>,
+    local_to_remote: &mut Direction,
+    remote_to_local: &mut Direction,
+    activity: &watch::Sender<Instant>,
+) -> Poll<Result<(), Terminal>>
+where
+    L: AsyncRead + AsyncWrite + Unpin,
+    R: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let mut progressed = false;
+        match poll_direction(
+            cx,
+            local.as_mut(),
+            remote.as_mut(),
+            local_to_remote,
+            activity,
+            Terminal::LocalIo,
+        ) {
+            Poll::Pending => {}
+            Poll::Ready(Ok(step)) => progressed |= step,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
         }
-        stats.bytes.fetch_add(count as u64, Ordering::Relaxed);
-        let _ = activity.send(Instant::now());
+        match poll_direction(
+            cx,
+            remote.as_mut(),
+            local.as_mut(),
+            remote_to_local,
+            activity,
+            Terminal::RemoteIo,
+        ) {
+            Poll::Pending => {}
+            Poll::Ready(Ok(step)) => progressed |= step,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+        }
+        if local_to_remote.phase == DirectionPhase::Done
+            && remote_to_local.phase == DirectionPhase::Done
+        {
+            return Poll::Ready(Ok(()));
+        }
+        if !progressed {
+            return Poll::Pending;
+        }
     }
 }
 
@@ -186,37 +283,15 @@ where
 {
     let started = Instant::now();
     let (activity_tx, mut activity_rx) = watch::channel(started);
-    let (local_reader, local_writer) = local.split();
-    let (remote_reader, remote_writer) = remote.split();
-    let local_stats = Arc::new(DirectionStats {
-        bytes: AtomicU64::new(0),
-        eof: AtomicBool::new(false),
-    });
-    let remote_stats = Arc::new(DirectionStats {
-        bytes: AtomicU64::new(0),
-        eof: AtomicBool::new(false),
-    });
-    let local_to_remote = tokio::spawn(copy_direction(
-        local_reader,
-        remote_writer,
-        buffer_size,
-        activity_tx.clone(),
-        local_stats.clone(),
-    ));
-    let remote_to_local = tokio::spawn(copy_direction(
-        remote_reader,
-        local_writer,
-        buffer_size,
-        activity_tx,
-        remote_stats.clone(),
-    ));
-    let mut local_result = Box::pin(local_to_remote);
-    let mut remote_result = Box::pin(remote_to_local);
+    let mut local = Box::pin(local);
+    let mut remote = Box::pin(remote);
+    let mut local_to_remote = Direction::new(buffer_size);
+    let mut remote_to_local = Direction::new(buffer_size);
     let mut cancel = Box::pin(cancel);
-    let mut local_done = None;
-    let mut remote_done = None;
     let terminal = loop {
-        if local_done.is_some() && remote_done.is_some() {
+        if local_to_remote.phase == DirectionPhase::Done
+            && remote_to_local.phase == DirectionPhase::Done
+        {
             break Terminal::Complete;
         }
         let idle_enabled = idle_timeout.is_some();
@@ -226,59 +301,33 @@ where
                 |timeout| *activity_rx.borrow() + timeout,
             )));
         tokio::pin!(deadline);
+        let pump = poll_fn(|cx| {
+            poll_pump(
+                cx,
+                &mut local,
+                &mut remote,
+                &mut local_to_remote,
+                &mut remote_to_local,
+                &activity_tx,
+            )
+        });
+        tokio::pin!(pump);
         tokio::select! {
-            result = &mut local_result, if local_done.is_none() => {
-                let result = result.map_err(io::Error::other)?;
-                let failed = result.is_some();
-                local_done = Some(result);
-                if failed { break Terminal::LocalIo; }
-            }
-            result = &mut remote_result, if remote_done.is_none() => {
-                let result = result.map_err(io::Error::other)?;
-                let failed = result.is_some();
-                remote_done = Some(result);
-                if failed { break Terminal::RemoteIo; }
-            }
-            changed = activity_rx.changed() => {
-                if changed.is_err() {
-                    if local_done.is_none() {
-                        local_done = Some((&mut local_result).await.map_err(io::Error::other)?);
-                    }
-                    if remote_done.is_none() {
-                        remote_done = Some((&mut remote_result).await.map_err(io::Error::other)?);
-                    }
-                    break Terminal::Complete;
+            result = &mut pump => {
+                match result {
+                    Ok(()) => break Terminal::Complete,
+                    Err(terminal) => break terminal,
                 }
             }
+            _ = activity_rx.changed() => {}
             _ = &mut deadline, if idle_enabled => break Terminal::IdleTimeout,
             _ = &mut cancel => break Terminal::Cancelled,
         }
     };
-    if terminal != Terminal::Complete {
-        if local_done.is_none() {
-            local_result.as_mut().abort();
-            let _ = (&mut local_result).await;
-        }
-        if remote_done.is_none() {
-            remote_result.as_mut().abort();
-            let _ = (&mut remote_result).await;
-        }
-    }
-    let local_to_remote_bytes = local_stats.bytes.load(Ordering::Relaxed);
-    let remote_to_local_bytes = remote_stats.bytes.load(Ordering::Relaxed);
-    let local_eof = local_stats.eof.load(Ordering::Acquire);
-    let remote_eof = remote_stats.eof.load(Ordering::Acquire);
-    let terminal = if terminal == Terminal::Complete {
-        if local_done.as_ref().is_some_and(|result| result.is_some()) {
-            Terminal::LocalIo
-        } else if remote_done.as_ref().is_some_and(|result| result.is_some()) {
-            Terminal::RemoteIo
-        } else {
-            Terminal::Complete
-        }
-    } else {
-        terminal
-    };
+    let local_to_remote_bytes = local_to_remote.bytes;
+    let remote_to_local_bytes = remote_to_local.bytes;
+    let local_eof = local_to_remote.eof;
+    let remote_eof = remote_to_local.eof;
     Ok(PumpResult {
         local_to_remote_bytes,
         remote_to_local_bytes,
@@ -334,6 +383,40 @@ mod tests {
         let result = task.await.unwrap().unwrap();
         assert_eq!(result.local_to_remote_bytes, 4, "{result:?}");
         assert_eq!(result.remote_to_local_bytes, 5, "{result:?}");
+        assert!(result.local_eof && result.remote_eof);
+        assert_eq!(result.terminal, Terminal::Complete);
+    }
+
+    #[tokio::test]
+    async fn pump_handles_large_flow_control_without_deadlock() {
+        let (mut local_peer, local) = tokio::io::duplex(64 * 1024);
+        let (remote, mut remote_peer) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(pump(
+            local.compat(),
+            remote.compat(),
+            MIN_COPY_BUFFER,
+            Duration::from_secs(5),
+            futures::future::pending(),
+        ));
+        let size = 16 * 1024 * 1024;
+        let send = async move {
+            let payload = vec![0x5a; size];
+            local_peer.write_all(&payload).await.unwrap();
+            local_peer.shutdown().await.unwrap();
+        };
+        let receive = async move {
+            let mut received = vec![0; size];
+            remote_peer.read_exact(&mut received).await.unwrap();
+            let mut eof = [0; 1];
+            assert_eq!(remote_peer.read(&mut eof).await.unwrap(), 0);
+            remote_peer.shutdown().await.unwrap();
+            received
+        };
+        let (_, received) = tokio::join!(send, receive);
+        assert!(received.iter().all(|byte| *byte == 0x5a));
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.local_to_remote_bytes, size as u64);
+        assert_eq!(result.remote_to_local_bytes, 0);
         assert!(result.local_eof && result.remote_eof);
         assert_eq!(result.terminal, Terminal::Complete);
     }

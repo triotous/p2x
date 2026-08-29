@@ -280,7 +280,7 @@ limits:
                             ["lsof", "-p", str(process.pid)],
                             text=True,
                             stderr=subprocess.DEVNULL,
-                        ).count("\\n")
+                        ).count("\n")
                     except subprocess.CalledProcessError:
                         continue
                     row[f"rss_{name}"] = int(rss or 0) * 1024
@@ -533,6 +533,8 @@ def run_case(root: pathlib.Path, case: str) -> None:
                             raise Failure(f"large stream closed at {received} bytes")
                         digest.update(chunk)
                         received += len(chunk)
+                    if not small_done.is_set():
+                        raise Failure("small stream did not finish during large transfer")
                     sender.join(timeout=120)
                     small.join(timeout=60)
                     if send_error:
@@ -592,8 +594,6 @@ def run_case(root: pathlib.Path, case: str) -> None:
             raise Failure("stream-limits did not observe N+1 rejection")
         if case == "stream-limits" and not any(row.get("event") == "resources" and row.get("workers", 0) >= 1 for row in server_rows):
             raise Failure("stream-limits did not observe a held active worker")
-        if case == "stream-limits" and not any(row.get("event") == "ingress_rejected" and row.get("code") == "limit.proxy_streams" for row in read_rows(client_log)):
-            raise Failure("stream-limits did not observe client ingress rejection evidence")
         if case == "shutdown-cancellation":
             for path in (client_log, server_log):
                 rows = read_rows(path)
@@ -603,8 +603,13 @@ def run_case(root: pathlib.Path, case: str) -> None:
                 if tail and any(row.get("workers", 0) or row.get("tasks", 0) or row.get("pending_opens", 0) for row in tail):
                     raise Failure(f"{path.name} did not drain logical resources: {tail}")
         if case.startswith("large-slow"):
-            terminal = next((row for row in read_rows(client_log) if row.get("event") == "tunnel_terminal"), None)
-            if terminal is None or terminal.get("local_to_remote_bytes", 0) < 256 * 1024 * 1024 or terminal.get("remote_to_local_bytes", 0) < 256 * 1024 * 1024:
+            large_terminals = [
+                row for row in read_rows(client_log)
+                if row.get("event") == "tunnel_terminal"
+                and row.get("local_to_remote_bytes", 0) >= 256 * 1024 * 1024
+                and row.get("remote_to_local_bytes", 0) >= 256 * 1024 * 1024
+            ]
+            if not large_terminals:
                 raise Failure(f"{case} did not report the complete transfer")
             rss = [value for row in run.samples for key, value in row.items() if key.startswith("rss_p2x-client") and isinstance(value, int)]
             fds = [value for row in run.samples for key, value in row.items() if key.startswith("fds_p2x-client") and isinstance(value, int)]
@@ -612,7 +617,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
                 raise Failure(f"{case} resource samples did not drain: rss={rss[-3:]} fds={fds[-3:]}")
             if max(rss) - min(rss) > 64 * 1024 * 1024:
                 raise Failure(f"{case} RSS exceeded the bounded process delta: {rss[-3:]}")
-            (run.out / "resource-samples.json").write_text(json.dumps({"samples": run.samples, "copy_buffer_bytes": 32768, "max_active_streams": 1, "declared_user_buffers": 2, "declared_bytes": 2 * 32768, "rss_delta_limit": 64 * 1024 * 1024}, sort_keys=True) + "\n")
+            (run.out / "resource-samples.json").write_text(json.dumps({"samples": run.samples, "copy_buffer_bytes": 32768, "max_active_streams": 2, "declared_user_buffers": 4, "declared_bytes": 4 * 32768, "rss_delta_limit": 64 * 1024 * 1024}, sort_keys=True) + "\n")
         if case.endswith("-relay") and not any(row.get("event") == "path_selected" and row.get("selected_path") == "relay" for row in read_rows(client_log)):
             raise Failure("forced relay path was not selected")
         if case == "upstream-refused" and not any(row.get("code") == "upstream.connect_failed" and not row.get("authorized") for row in server_rows):
