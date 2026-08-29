@@ -477,6 +477,15 @@ impl RouteOpenSupervisor {
     }
 
     pub fn cancel(&mut self, resolver: &mut ResolverState, open_id: OpenId) -> Option<RouteAction> {
+        self.cancel_with_code(resolver, open_id, PublicErrorCode::PeerSetupTimeout)
+    }
+
+    pub fn cancel_with_code(
+        &mut self,
+        resolver: &mut ResolverState,
+        open_id: OpenId,
+        code: PublicErrorCode,
+    ) -> Option<RouteAction> {
         let open = self.opens.remove(&open_id)?;
         let request_id = open.resolve_request.resolve_request_id();
         resolver.cancel(request_id);
@@ -484,7 +493,7 @@ impl RouteOpenSupervisor {
             open_id,
             server: open.server_peer_id,
             request_id,
-            result: Err(PublicErrorCode::PeerSetupTimeout),
+            result: Err(code),
         })
     }
 
@@ -493,7 +502,16 @@ impl RouteOpenSupervisor {
         resolver: &mut ResolverState,
         open_id: OpenId,
     ) -> (Option<RouteAction>, Vec<RouteAction>) {
-        let completed = self.cancel(resolver, open_id);
+        self.cancel_with_code_and_promotion(resolver, open_id, PublicErrorCode::PeerSetupTimeout)
+    }
+
+    pub fn cancel_with_code_and_promotion(
+        &mut self,
+        resolver: &mut ResolverState,
+        open_id: OpenId,
+        code: PublicErrorCode,
+    ) -> (Option<RouteAction>, Vec<RouteAction>) {
+        let completed = self.cancel_with_code(resolver, open_id, code);
         let promoted = self.promote_waiters(resolver);
         (completed, promoted)
     }

@@ -1342,7 +1342,7 @@ async fn main() -> io::Result<()> {
                             route_proxy_requests.retain(|_, candidate| *candidate != open_id);
                             if let Some(route_owner) = route_owner.as_mut() {
                                 let (completed, promoted) = route_owner
-                                    .cancel_with_promotion(&mut resolver_state, open_id);
+                                    .cancel_with_code_and_promotion(&mut resolver_state, open_id, code);
                                 let mut actions = promoted;
                                 if let Some(completed) = completed {
                                     actions.push(completed);
