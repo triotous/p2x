@@ -7,8 +7,7 @@ use p2x_protocol::{OpenProxyStreamV1, ProxyOpenResponseV1, PublicError, PublicEr
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ProxyWorkerId(pub u64);
+pub use crate::proxy_owner::ProxyWorkerId;
 
 pub struct Promotion {
     pub worker_id: ProxyWorkerId,

@@ -32,7 +32,9 @@ use p2x_protocol::{
     RegistryResponseV1, Role,
 };
 use p2x_server::{
-    config, proxy_open, proxy_owner::ProxyWorkerTable, stream_admission, ticket_admission,
+    config, proxy_open,
+    proxy_owner::{ProxyDecisionContext, ProxyWorkerTable, ServerProxyOwner},
+    stream_admission, ticket_admission,
 };
 use std::{collections::HashMap, io, path::PathBuf};
 use tokio::{sync::mpsc, task::JoinSet};
@@ -512,7 +514,7 @@ async fn main() -> io::Result<()> {
         )
     };
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let mut ticket_admission = ticket_admission::TicketAdmissionLedger::new(
+    let ticket_admission = ticket_admission::TicketAdmissionLedger::new(
         service_config
             .as_ref()
             .map_or(ticket_admission::MAX_REPLAY_ENTRIES, |config| {
@@ -521,6 +523,7 @@ async fn main() -> io::Result<()> {
         args.ticket_clock_skew as i64,
     )
     .map_err(|code| io::Error::new(io::ErrorKind::InvalidInput, code.as_str()))?;
+    let mut proxy_owner = ServerProxyOwner::new(ticket_admission, service_config.clone());
     if args.credential_env.is_none() && !args.unsafe_connectivity_lab {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -571,16 +574,6 @@ async fn main() -> io::Result<()> {
     let (proxy_promotion_tx, mut proxy_promotion_rx) =
         mpsc::channel::<proxy_open::Promotion>(proxy_limit);
     let (proxy_accept_tx, mut proxy_accept_rx) = mpsc::channel::<proxy_open::Accepted>(proxy_limit);
-    let mut proxy_admission = service_config.as_ref().map_or_else(
-        || stream_admission::StreamAdmission::new(256, 32, 64),
-        |services| {
-            stream_admission::StreamAdmission::new(
-                services.proxy.max_workers,
-                services.proxy.max_workers_per_client,
-                services.proxy.max_upstream_dials,
-            )
-        },
-    );
     let mut proxy_workers = JoinSet::new();
     let mut proxy_worker_tasks = HashMap::<tokio::task::Id, proxy_open::ProxyWorkerId>::new();
     let mut proxy_worker_table = ProxyWorkerTable::default();
@@ -755,12 +748,12 @@ async fn main() -> io::Result<()> {
                     + swarm.behaviour().proxy_stream.as_ref().map_or(0, |proxy| proxy.pending_count());
                 let configured_proxy_workers = proxy_worker_table.len();
                 emitter.emit(&LifecycleRecord::Resources { connections, pending_opens, workers: worker_admission.admitted() + configured_proxy_workers, tasks: worker_admission.admitted() + configured_proxy_workers })?;
-                if !proxy_admission.is_empty() {
+                if !proxy_owner.stream_admission().is_empty() {
                     emitter.emit(&LifecycleRecord::Resources {
                         connections,
                         pending_opens,
                         workers: proxy_worker_table.len(),
-                        tasks: proxy_admission.dialing(),
+                        tasks: proxy_owner.stream_admission().dialing(),
                     })?;
                 }
             }
@@ -768,7 +761,7 @@ async fn main() -> io::Result<()> {
                 match result {
                     Ok((task_id, release)) => {
                         proxy_worker_tasks.remove(&task_id);
-                        finish_proxy_worker(release, &mut proxy_worker_table, &mut proxy_admission, &mut swarm, &connection_paths, &emitter)?;
+                        finish_proxy_worker(release, &mut proxy_worker_table, proxy_owner.stream_admission_mut(), &mut swarm, &connection_paths, &emitter)?;
                     }
                     Err(error) => {
                         let task_id = error.id();
@@ -791,7 +784,7 @@ async fn main() -> io::Result<()> {
                             code: Some(PublicErrorCode::PeerConnectionFailed),
                             pump: None,
                         };
-                        finish_proxy_worker_record(release, record, &mut proxy_admission, &mut swarm, &connection_paths, &emitter)?;
+                        finish_proxy_worker_record(release, record, proxy_owner.stream_admission_mut(), &mut swarm, &connection_paths, &emitter)?;
                     }
                 }
             }
@@ -799,7 +792,7 @@ async fn main() -> io::Result<()> {
                 let acknowledged = proxy_worker_table
                     .get(promotion.worker_id)
                     .is_some_and(|record| record.admission == Some(promotion.admission))
-                    && proxy_admission.promote(promotion.admission);
+                    && proxy_owner.promote(promotion.admission);
                 let _ = promotion.acknowledged.send(acknowledged);
                 if !acknowledged {
                     return Err(io::Error::other("proxy stream promotion failed"));
@@ -831,104 +824,27 @@ async fn main() -> io::Result<()> {
             Some(candidate) = proxy_rx.recv() => {
                 let peer_name = candidate.peer_id.to_string();
                 let request_id = candidate.open.as_ref().ok().map(|open| open.request_id);
-                let decision = match candidate.open {
-                    Ok(open) => {
-                        let now = unix_now();
-                        if std::time::Instant::now() >= candidate.deadline {
-                            proxy_open::ServerDecision::Reject(
-                                p2x_protocol::ProxyOpenResponseV1::Rejected {
-                                    request_id: Some(open.request_id),
-                                    error: p2x_protocol::PublicError::new(
-                                        PublicErrorCode::PeerSetupTimeout,
-                                        true,
-                                    ),
-                                },
-                            )
-                        } else {
-                        match (verification_ring.as_ref(), auth_state.current_session(now), service_config.as_ref(), availability.registration_context(now)) {
-                            (Some(_ring), Some(session), Some(services), Some((_, expires_at))) => {
-                                let Some(service) = services.service(&open.upstream_id) else {
-                                    return Err(io::Error::other("advertised service disappeared"));
-                                };
-                                let Some(upstream) = services.upstreams.get(&open.upstream_id).cloned() else {
-                                    return Err(io::Error::other("immutable upstream disappeared"));
-                                };
-                                let reject = |code: PublicErrorCode| proxy_open::ServerDecision::Reject(
-                                    p2x_protocol::ProxyOpenResponseV1::Rejected {
-                                        request_id: Some(open.request_id),
-                                        error: p2x_protocol::PublicError::new(
-                                            code,
-                                            matches!(code, PublicErrorCode::RegistryStaleRevision | PublicErrorCode::LimitProxyStreams | PublicErrorCode::RegistryOffline),
-                                        ),
-                                    },
-                                );
-                                match candidate.validation {
-                                    Ok(validation_candidate) => {
-                                        let preflight = ticket_admission.preflight_candidate(&validation_candidate, now);
-                                        if let Err(code) = preflight {
-                                            reject(code)
-                                        } else if let Err(code) = ticket_admission.validate_candidate(
-                                            &validation_candidate,
-                                            relay_peer_id.unwrap_or(*swarm.local_peer_id()),
-                                            candidate.peer_id,
-                                            *swarm.local_peer_id(),
-                                            session.tenant(),
-                                            service,
-                                            registration_revision,
-                                            expires_at,
-                                            session.authorization_revision(),
-                                            &open,
-                                            now,
-                                        ) {
-                                            reject(code)
-                                        } else if service.selector().protocol() != p2x_protocol::ProtocolClass::Tcp {
-                                            reject(PublicErrorCode::ProtocolCapabilityMismatch)
-                                        } else if upstream.advertisement.health() != p2x_protocol::Health::Ready {
-                                            reject(PublicErrorCode::RegistryOffline)
-                                        } else if let Err(code) = proxy_admission.preflight(candidate.peer_id, &open.upstream_id, upstream.concurrency_limit) {
-                                            reject(code)
-                                        } else {
-                                            match ticket_admission.allocate_stream_id(&validation_candidate, now) {
-                                                Ok(stream_id) => {
-                                                    let admission = stream_admission::AdmissionToken::new(stream_id);
-                                                    match proxy_admission.reserve(admission, candidate.peer_id, open.upstream_id.clone(), upstream.concurrency_limit) {
-                                                        Ok(()) => match ticket_admission.consume_candidate_with_stream_id(validation_candidate, stream_id, now) {
-                                                            ticket_admission::TicketAdmission::Authorized(stream_id) => proxy_open::ServerDecision::Admit {
-                                                                stream_id,
-                                                                admission,
-                                                                upstream,
-                                                                copy_buffer_bytes: services.proxy.copy_buffer_bytes,
-                                                            },
-                                                            ticket_admission::TicketAdmission::Rejected(code) => {
-                                                                let _ = proxy_admission.release(admission);
-                                                                reject(code)
-                                                            }
-                                                        },
-                                                        Err(code) => reject(code),
-                                                    }
-                                                }
-                                                Err(code) => reject(code),
-                                            }
-                                        }
-                                    }
-                                    Err(code) => reject(code),
-                                }
-                            }
-                            _ => proxy_open::ServerDecision::Reject(
-                                p2x_protocol::ProxyOpenResponseV1::Rejected {
-                                    request_id,
-                                    error: p2x_protocol::PublicError::new(PublicErrorCode::AuthSessionRequired, false),
-                                },
-                            ),
-                        }
-                        }
-                    }
-                    Err(code) => proxy_open::ServerDecision::Reject(
-                        p2x_protocol::ProxyOpenResponseV1::Rejected {
+                let decision = {
+                    let now = unix_now();
+                    let session = auth_state.current_session(now);
+                    let context = session.as_ref().and_then(|session| {
+                        availability.registration_context(now).map(|(_, expires_at)| ProxyDecisionContext {
+                            issuer: relay_peer_id.unwrap_or(*swarm.local_peer_id()),
+                            server: *swarm.local_peer_id(),
+                            tenant: session.tenant(),
+                            registration_revision,
+                            registration_expires_at: expires_at,
+                            authorization_revision: session.authorization_revision(),
+                            now,
+                        })
+                    });
+                    match context {
+                        Some(context) => proxy_owner.decide(&candidate, context),
+                        None => proxy_open::ServerDecision::Reject(p2x_protocol::ProxyOpenResponseV1::Rejected {
                             request_id,
-                            error: p2x_protocol::PublicError::new(code, false),
-                        },
-                    ),
+                            error: p2x_protocol::PublicError::new(PublicErrorCode::AuthSessionRequired, false),
+                        }),
+                    }
                 };
                 let (request_id_hash, stream_id_hash, authorized, code) = match &decision {
                     proxy_open::ServerDecision::Admit { stream_id, .. } => (
@@ -1476,7 +1392,7 @@ async fn main() -> io::Result<()> {
             }
             Some(result) = proxy_workers.join_next() => {
                 let release = result.map_err(|_| io::Error::other("proxy worker panicked during shutdown"))?;
-                finish_proxy_worker(release, &mut proxy_worker_table, &mut proxy_admission, &mut swarm, &connection_paths, &emitter)?;
+                finish_proxy_worker(release, &mut proxy_worker_table, proxy_owner.stream_admission_mut(), &mut swarm, &connection_paths, &emitter)?;
             }
             Some(promotion) = proxy_promotion_rx.recv() => {
                 let _ = promotion.acknowledged.send(false);
@@ -1543,7 +1459,7 @@ async fn main() -> io::Result<()> {
         swarm.close_connection(connection_id);
     }
     availability.stopped();
-    ticket_admission.clear();
+    proxy_owner.clear_tickets();
     connection_paths.clear();
     if !proxy_worker_table.is_empty() {
         return Err(io::Error::other(
@@ -1556,7 +1472,7 @@ async fn main() -> io::Result<()> {
         workers: 0,
         tasks: 0,
     })?;
-    if !proxy_admission.is_empty() {
+    if !proxy_owner.stream_admission().is_empty() {
         return Err(io::Error::other(
             "proxy stream admission leaked during shutdown",
         ));
