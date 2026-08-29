@@ -1404,8 +1404,9 @@ async fn main() -> io::Result<()> {
                     setup_duration_ms: accepted.setup_duration.as_millis(),
                 })?;
             }
-            Some(result) = proxy_workers.join_next() => {
-                let release = result.map_err(|_| io::Error::other("proxy worker panicked during shutdown"))?;
+            Some(result) = proxy_workers.join_next_with_id() => {
+                let (task_id, release) = result.map_err(|_| io::Error::other("proxy worker panicked during shutdown"))?;
+                proxy_worker_tasks.remove(&task_id);
                 finish_proxy_worker(release, &mut proxy_worker_table, proxy_owner.stream_admission_mut(), &mut swarm, &connection_paths, &emitter)?;
             }
             Some(promotion) = proxy_promotion_rx.recv() => {
