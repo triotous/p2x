@@ -21,3 +21,5 @@
 [commit] 169fc31 Classify held upstream dials as timeout.
 [validation] Latest tunnel --case all run passed all 14 cases on the corrected HEAD; artifacts are under target/p2x-tunnel/20260829T094220Z and later run-scoped directories.
 [validation] Tunnel --case all passed three consecutive runs; run artifacts under target/p2x-tunnel/20260829T094220Z, 20260829T094433Z, and 20260829T0947xx.
+[action] Closure rerun found direct-open-fallback and graceful-drain evidence timing issues. Restored strict fallback/drain assertions and made pre-Accept server shutdown hold emit a bounded correlated rejection before release.
+[validation] direct-open-fallback and graceful-drain passed with strict assertions; workspace check, tests, Clippy, fmt, and diff check passed.
