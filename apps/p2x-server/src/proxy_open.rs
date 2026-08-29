@@ -7,7 +7,11 @@ use p2x_protocol::{OpenProxyStreamV1, ProxyOpenResponseV1, PublicError, PublicEr
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
-#[derive(Clone, Copy, Debug)]
+pub struct Promotion {
+    pub admission: AdmissionToken,
+    pub acknowledged: oneshot::Sender<bool>,
+}
+
 pub struct Release {
     pub peer_id: PeerId,
     pub connection_id: ConnectionId,
@@ -32,6 +36,7 @@ pub enum ServerDecision {
 pub struct Candidate {
     pub peer_id: PeerId,
     pub connection_id: ConnectionId,
+    pub deadline: std::time::Instant,
     pub open: Result<OpenProxyStreamV1, PublicErrorCode>,
     pub validation: Result<super::ticket_admission::ValidationCandidate, PublicErrorCode>,
     pub decision: oneshot::Sender<ServerDecision>,
@@ -43,6 +48,21 @@ async fn read_open<T: AsyncRead + Unpin>(
     proxy_codec::read_open(stream)
         .await
         .map_err(|_| PublicErrorCode::ProtocolMalformed)
+}
+
+async fn write_response_bounded<T: AsyncWrite + Unpin>(
+    stream: &mut T,
+    response: &ProxyOpenResponseV1,
+    deadline: std::time::Instant,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> bool {
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        result = tokio::time::timeout(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            proxy_codec::write_response(stream, response),
+        ) => result.is_ok_and(|result| result.is_ok()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -57,18 +77,48 @@ pub async fn run_worker(
     hold_dial_ms: Option<u64>,
     candidates: mpsc::Sender<Candidate>,
     releases: mpsc::Sender<Release>,
-    promotions: mpsc::Sender<AdmissionToken>,
+    promotions: mpsc::Sender<Promotion>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let (decision, response) = oneshot::channel();
-    let open = tokio::time::timeout(Duration::from_secs(5), read_open(&mut stream))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .ok_or(PublicErrorCode::ProtocolMalformed);
+    let started = std::time::Instant::now();
+    let worker_deadline = started + Duration::from_secs(5);
+    let started_unix = now;
+    let cancel = shutdown.child_token();
+    let open = tokio::select! {
+        _ = cancel.cancelled() => Err(PublicErrorCode::ExchangeDraining),
+        result = tokio::time::timeout(
+            worker_deadline.saturating_duration_since(std::time::Instant::now()),
+            read_open(&mut stream),
+        ) => result
+            .ok()
+            .and_then(Result::ok)
+            .ok_or(PublicErrorCode::ProtocolMalformed),
+    };
     let request_id = open.as_ref().ok().map(|open| open.request_id);
     if let Some(delay) = hold_handshake_ms {
-        tokio::time::sleep(Duration::from_millis(delay)).await;
+        let remaining = worker_deadline.saturating_duration_since(std::time::Instant::now());
+        if super::upstream::hold(Duration::from_millis(delay), remaining, cancel.clone())
+            .await
+            .is_err()
+        {
+            let request_id_hash = request_id
+                .map(p2x_net::lifecycle::stable_hash)
+                .unwrap_or_default();
+            release(
+                &releases,
+                peer_id,
+                connection_id,
+                AdmissionToken::empty(),
+                request_id_hash,
+                None,
+                false,
+                Some(PublicErrorCode::PeerSetupTimeout),
+                None,
+            )
+            .await;
+            return;
+        }
     }
     let validation = match (&verification_ring, open.as_ref()) {
         (Some(ring), Ok(open)) => super::ticket_admission::TicketAdmissionLedger::new(
@@ -76,21 +126,34 @@ pub async fn run_worker(
             clock_skew,
         )
         .expect("worker verification limits are valid")
-        .verify_candidate(ring, open.ticket.as_bytes(), now),
+        .verify_candidate(
+            ring,
+            open.ticket.as_bytes(),
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64)
+                .max(started_unix),
+        ),
         (None, Ok(_)) => Err(PublicErrorCode::AuthSessionRequired),
         (_, Err(_)) => Err(PublicErrorCode::ProtocolMalformed),
     };
-    if candidates
-        .send(Candidate {
-            peer_id,
-            connection_id,
-            open: open.clone(),
-            validation,
-            decision,
-        })
-        .await
-        .is_err()
-    {
+    let candidate = Candidate {
+        peer_id,
+        connection_id,
+        deadline: worker_deadline,
+        open: open.clone(),
+        validation,
+        decision,
+    };
+    let candidate_sent = tokio::select! {
+        _ = cancel.cancelled() => false,
+        result = tokio::time::timeout(
+            worker_deadline.saturating_duration_since(std::time::Instant::now()),
+            candidates.send(candidate),
+        ) => result.is_ok_and(|result| result.is_ok()),
+    };
+    if !candidate_sent {
         release(
             &releases,
             peer_id,
@@ -101,18 +164,27 @@ pub async fn run_worker(
                 .unwrap_or_default(),
             None,
             false,
-            None,
+            Some(PublicErrorCode::PeerSetupTimeout),
             None,
         )
         .await;
         return;
     }
-    let decision = response.await.unwrap_or_else(|_| {
-        ServerDecision::Reject(ProxyOpenResponseV1::Rejected {
+    let decision = tokio::select! {
+        _ = cancel.cancelled() => ServerDecision::Reject(ProxyOpenResponseV1::Rejected {
             request_id,
-            error: PublicError::new(PublicErrorCode::ExchangeOverloaded, true),
-        })
-    });
+            error: PublicError::new(PublicErrorCode::ExchangeDraining, true),
+        }),
+        decision = tokio::time::timeout(
+            worker_deadline.saturating_duration_since(std::time::Instant::now()),
+            response,
+        ) => decision.ok().and_then(Result::ok).unwrap_or_else(|| ServerDecision::Reject(
+            ProxyOpenResponseV1::Rejected {
+                request_id,
+                error: PublicError::new(PublicErrorCode::PeerSetupTimeout, true),
+            },
+        )),
+    };
     let request_id_hash = request_id
         .map(p2x_net::lifecycle::stable_hash)
         .unwrap_or_default();
@@ -125,7 +197,7 @@ pub async fn run_worker(
             if let ProxyOpenResponseV1::Rejected { error, .. } = &response {
                 code = Some(error.code);
             }
-            let _ = proxy_codec::write_response(&mut stream, &response).await;
+            let _ = write_response_bounded(&mut stream, &response, worker_deadline, &cancel).await;
             AdmissionToken::empty()
         }
         ServerDecision::Admit {
@@ -150,28 +222,64 @@ pub async fn run_worker(
                 .await;
                 return;
             };
+            let remaining = worker_deadline.saturating_duration_since(std::time::Instant::now());
             let dial = match hold_dial_ms {
-                Some(delay) if delay >= upstream.connect_timeout.as_millis() as u64 => {
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                    Err(super::upstream::ConnectError::Timeout)
-                }
-                Some(delay) => {
-                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                    super::upstream::connect(&upstream).await
-                }
-                None => super::upstream::connect(&upstream).await,
+                Some(delay) => match super::upstream::hold(
+                    Duration::from_millis(delay),
+                    remaining,
+                    cancel.clone(),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        super::upstream::connect(
+                            &upstream,
+                            worker_deadline.saturating_duration_since(std::time::Instant::now()),
+                            cancel.clone(),
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                },
+                None => super::upstream::connect(&upstream, remaining, cancel.clone()).await,
             };
             match dial {
                 Ok(socket) => {
-                    let _ = promotions.send(admission).await;
+                    let (acknowledged, ack) = oneshot::channel();
+                    if promotions
+                        .send(Promotion {
+                            admission,
+                            acknowledged,
+                        })
+                        .await
+                        .is_err()
+                        || !tokio::select! {
+                            _ = cancel.cancelled() => false,
+                            acknowledged = ack => acknowledged.unwrap_or(false),
+                        }
+                    {
+                        drop(socket);
+                        release(
+                            &releases,
+                            peer_id,
+                            connection_id,
+                            admission,
+                            request_id_hash,
+                            stream_id_hash,
+                            false,
+                            Some(PublicErrorCode::ExchangeDraining),
+                            None,
+                        )
+                        .await;
+                        return;
+                    }
                     let response = ProxyOpenResponseV1::Accepted {
                         request_id: open.request_id,
                         stream_id,
                         selected_upstream_mode: p2x_protocol::UpstreamMode::Tcp,
                     };
-                    if proxy_codec::write_response(&mut stream, &response)
+                    if write_response_bounded(&mut stream, &response, worker_deadline, &cancel)
                         .await
-                        .is_ok()
                     {
                         accepted = true;
                         pump = p2x_proxy::pump(
@@ -198,7 +306,9 @@ pub async fn run_worker(
                         request_id: Some(open.request_id),
                         error: PublicError::new(error.code(), true),
                     };
-                    let _ = proxy_codec::write_response(&mut stream, &response).await;
+                    let _ =
+                        write_response_bounded(&mut stream, &response, worker_deadline, &cancel)
+                            .await;
                 }
             }
             admission

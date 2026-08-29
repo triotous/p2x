@@ -1,6 +1,11 @@
 use super::config::LocalUpstream;
-use std::{io, time::Duration};
-use tokio::net::TcpStream;
+use std::time::Duration;
+use tokio::{
+    net::TcpStream,
+    select,
+    time::{sleep, timeout},
+};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectError {
@@ -16,22 +21,39 @@ impl ConnectError {
     }
 }
 
-pub async fn connect(upstream: &LocalUpstream) -> Result<TcpStream, ConnectError> {
-    tokio::time::timeout(
-        upstream.connect_timeout,
-        TcpStream::connect(upstream.connect),
-    )
-    .await
-    .map_err(|_| ConnectError::Timeout)?
-    .map_err(|_| ConnectError::Failed)
+pub async fn connect(
+    upstream: &LocalUpstream,
+    remaining: Duration,
+    cancel: CancellationToken,
+) -> Result<TcpStream, ConnectError> {
+    let budget = timeout_for(upstream, remaining);
+    if budget.is_zero() {
+        return Err(ConnectError::Timeout);
+    }
+    select! {
+        _ = cancel.cancelled() => Err(ConnectError::Timeout),
+        result = timeout(budget, TcpStream::connect(upstream.connect)) => {
+            result.map_err(|_| ConnectError::Timeout)?.map_err(|_| ConnectError::Failed)
+        }
+    }
+}
+
+pub async fn hold(
+    delay: Duration,
+    remaining: Duration,
+    cancel: CancellationToken,
+) -> Result<(), ConnectError> {
+    if delay > remaining {
+        return Err(ConnectError::Timeout);
+    }
+    select! {
+        _ = cancel.cancelled() => Err(ConnectError::Timeout),
+        _ = sleep(delay) => Ok(()),
+    }
 }
 
 pub fn timeout_for(upstream: &LocalUpstream, remaining: Duration) -> Duration {
     upstream.connect_timeout.min(remaining)
-}
-
-pub fn redacted_io_error(error: io::Error) -> io::Error {
-    io::Error::new(error.kind(), "upstream connection failed")
 }
 
 #[cfg(test)]
@@ -62,9 +84,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_stops_connector_without_waiting_for_full_budget() {
+        let target = upstream("127.0.0.1:1");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            connect(&target, Duration::from_secs(1), cancel).await,
+            Err(ConnectError::Timeout)
+        ));
+    }
+
+    #[tokio::test]
+    async fn hold_uses_the_same_remaining_budget_and_cancellation() {
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            hold(
+                Duration::from_millis(2),
+                Duration::from_millis(1),
+                cancel.clone()
+            )
+            .await,
+            Err(ConnectError::Timeout)
+        );
+        cancel.cancel();
+        assert_eq!(
+            hold(Duration::from_secs(1), Duration::from_secs(2), cancel).await,
+            Err(ConnectError::Timeout)
+        );
+    }
+
+    #[tokio::test]
     async fn connector_classifies_refusal_without_leaking_address() {
         let target = upstream("127.0.0.1:1");
-        let error = connect(&target).await.unwrap_err();
+        let error = connect(&target, Duration::from_millis(10), CancellationToken::new())
+            .await
+            .unwrap_err();
         assert_eq!(error, ConnectError::Failed);
         assert!(!format!("{error:?}").contains("127.0.0.1"));
         assert_eq!(

@@ -446,7 +446,7 @@ async fn main() -> io::Result<()> {
     let (proxy_release_tx, mut proxy_release_rx) =
         mpsc::channel::<proxy_open::Release>(proxy_limit);
     let (proxy_promotion_tx, mut proxy_promotion_rx) =
-        mpsc::channel::<stream_admission::AdmissionToken>(proxy_limit);
+        mpsc::channel::<proxy_open::Promotion>(proxy_limit);
     let mut proxy_admission = service_config.as_ref().map_or_else(
         || stream_admission::StreamAdmission::new(256, 32, 64),
         |services| {
@@ -676,8 +676,12 @@ async fn main() -> io::Result<()> {
                 }
                 proxy_workers = proxy_workers.saturating_sub(1);
             }
-            Some(admission) = proxy_promotion_rx.recv() => {
-                let _ = proxy_admission.promote(admission);
+            Some(promotion) = proxy_promotion_rx.recv() => {
+                let acknowledged = proxy_admission.promote(promotion.admission);
+                let _ = promotion.acknowledged.send(acknowledged);
+                if !acknowledged {
+                    return Err(io::Error::other("proxy stream promotion failed"));
+                }
             }
             Some(candidate) = proxy_rx.recv() => {
                 let peer_name = candidate.peer_id.to_string();
@@ -685,6 +689,17 @@ async fn main() -> io::Result<()> {
                 let decision = match candidate.open {
                     Ok(open) => {
                         let now = unix_now();
+                        if std::time::Instant::now() >= candidate.deadline {
+                            proxy_open::ServerDecision::Reject(
+                                p2x_protocol::ProxyOpenResponseV1::Rejected {
+                                    request_id: Some(open.request_id),
+                                    error: p2x_protocol::PublicError::new(
+                                        PublicErrorCode::PeerSetupTimeout,
+                                        true,
+                                    ),
+                                },
+                            )
+                        } else {
                         match (verification_ring.as_ref(), auth_state.current_session(now), service_config.as_ref(), availability.registration_context(now)) {
                             (Some(_ring), Some(session), Some(services), Some((_, expires_at))) => {
                                 let Some(service) = services.service(&open.upstream_id) else {
@@ -766,6 +781,7 @@ async fn main() -> io::Result<()> {
                                     error: p2x_protocol::PublicError::new(PublicErrorCode::AuthSessionRequired, false),
                                 },
                             ),
+                        }
                         }
                     }
                     Err(code) => proxy_open::ServerDecision::Reject(
@@ -1294,6 +1310,9 @@ async fn main() -> io::Result<()> {
                     proxy.inbound_release_on(release.peer_id, release.connection_id);
                 }
                 proxy_workers = proxy_workers.saturating_sub(1);
+            }
+            Some(promotion) = proxy_promotion_rx.recv() => {
+                let _ = promotion.acknowledged.send(false);
             }
         }
     }

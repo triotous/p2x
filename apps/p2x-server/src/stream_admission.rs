@@ -1,6 +1,6 @@
 use libp2p::PeerId;
 use p2x_protocol::{PublicErrorCode, UpstreamId};
-use std::collections::HashMap;
+use std::{collections::HashMap, collections::hash_map::Entry as HashMapEntry};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
@@ -80,22 +80,21 @@ impl StreamAdmission {
         service: UpstreamId,
         service_limit: usize,
     ) -> Result<(), PublicErrorCode> {
+        if self.entries.contains_key(&token.stream_id) {
+            return Err(PublicErrorCode::ProtocolMalformed);
+        }
         self.preflight(peer, &service, service_limit)?;
-        if self
-            .entries
-            .insert(
-                token.stream_id,
-                Entry {
+        match self.entries.entry(token.stream_id) {
+            HashMapEntry::Occupied(_) => Err(PublicErrorCode::ProtocolMalformed),
+            HashMapEntry::Vacant(slot) => {
+                slot.insert(Entry {
                     peer,
                     service,
                     phase: Phase::Dialing,
-                },
-            )
-            .is_some()
-        {
-            return Err(PublicErrorCode::ProtocolMalformed);
+                });
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     pub fn promote(&mut self, token: AdmissionToken) -> bool {
@@ -166,6 +165,22 @@ mod tests {
         assert!(admission.release(first));
         assert!(!admission.release(first));
         assert_eq!(admission.len(), 0);
+    }
+
+    #[test]
+    fn collision_preserves_the_existing_entry() {
+        let first_peer = PeerId::random();
+        let second_peer = PeerId::random();
+        let token = AdmissionToken::new([7; 16]);
+        let mut admission = StreamAdmission::new(4, 4, 4);
+        admission.reserve(token, first_peer, service(), 4).unwrap();
+        assert_eq!(
+            admission.reserve(token, second_peer, UpstreamId::new("other").unwrap(), 4),
+            Err(PublicErrorCode::ProtocolMalformed)
+        );
+        assert_eq!(admission.peer_count(first_peer), 1);
+        assert_eq!(admission.peer_count(second_peer), 0);
+        assert!(admission.contains(token));
     }
 
     #[test]
