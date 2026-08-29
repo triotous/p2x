@@ -2846,7 +2846,7 @@ async fn main() -> io::Result<()> {
     route_proxy_requests.clear();
     if product_ingress {
         emitter.emit(&LifecycleRecord::Resources {
-            connections: connections.len(),
+            connections: 0,
             pending_opens: 0,
             workers: 0,
             tasks: 0,

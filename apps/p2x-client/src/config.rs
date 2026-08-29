@@ -124,7 +124,7 @@ impl ClientConfig {
         }
         let limits = ClientLimits {
             max_peer_states: file.limits.max_peer_states.unwrap_or(64),
-            max_pending_setups: file.limits.max_pending_setups.unwrap_or(128),
+            max_pending_setups: file.limits.max_pending_setups.unwrap_or(256),
             max_pending_per_server: file.limits.max_pending_per_server.unwrap_or(64),
             max_route_opens: file.limits.max_route_opens.unwrap_or(128),
             max_ingress_connections: file.limits.max_ingress_connections.unwrap_or(512),
@@ -134,7 +134,7 @@ impl ClientConfig {
         if limits.max_peer_states == 0
             || limits.max_peer_states > 256
             || limits.max_pending_setups == 0
-            || limits.max_pending_setups > 128
+            || limits.max_pending_setups > 256
             || limits.max_pending_per_server == 0
             || limits.max_pending_per_server > 128
             || limits.max_route_opens == 0

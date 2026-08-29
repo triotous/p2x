@@ -6,8 +6,8 @@ use p2x_protocol::{
 };
 use std::collections::{HashMap, VecDeque};
 
-pub const MAX_WAITERS_PER_SELECTOR: usize = 64;
-const MAX_PENDING_REQUESTS: usize = 128;
+pub const MAX_WAITERS_PER_SELECTOR: usize = 256;
+const MAX_PENDING_REQUESTS: usize = 256;
 const MAX_CACHE_ENTRIES: usize = 2_048;
 
 fn valid_relay_address(address: &[u8], exchange: Option<PeerId>, server: PeerId) -> bool {
