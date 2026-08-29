@@ -81,6 +81,7 @@ impl ProxyWorkerTable {
     pub fn get(&self, id: ProxyWorkerId) -> Option<WorkerRecord> {
         self.workers.get(&id).copied()
     }
+
     pub fn remove(&mut self, id: ProxyWorkerId) -> Option<WorkerRecord> {
         self.workers.remove(&id)
     }

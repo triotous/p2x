@@ -326,7 +326,20 @@ fn finish_proxy_worker(
         ));
     }
     let accepted = release.accepted || record.accepted;
-    let selected_path = if accepted {
+    if accepted && !record.accepted {
+        emitter.emit(&LifecycleRecord::TunnelAccepted {
+            component_side: p2x_net::lifecycle::ComponentSide::Server,
+            peer_id: &release.peer_id.to_string(),
+            connection_id_hash: stable_hash(release.connection_id),
+            request_id_hash: release.request_id_hash,
+            stream_id_hash: release
+                .stream_id_hash
+                .ok_or_else(|| io::Error::other("accepted worker missing stream ID"))?,
+            selected_path: Some(release.selected_path),
+            setup_duration_ms: release.setup_duration.as_millis(),
+        })?;
+    }
+    let selected_path = if record.accepted {
         record.selected_path
     } else {
         release.selected_path
@@ -1390,6 +1403,9 @@ async fn main() -> io::Result<()> {
                 ));
             }
             Some(accepted) = proxy_accept_rx.recv() => {
+                if proxy_worker_table.get(accepted.worker_id).is_none() {
+                    continue;
+                }
                 proxy_worker_table
                     .mark_accepted(
                         accepted.worker_id,
