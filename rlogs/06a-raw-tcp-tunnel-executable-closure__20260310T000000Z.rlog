@@ -2,3 +2,8 @@
 [action] Phase A: centralized product route completion cleanup, preserved finite diagnostic terminals, added request correlation to route completion, and made pre-Accept ingress closure explicit and exactly-once guarded.
 [validation] Phase A focused client check, unit tests, Clippy with -D warnings, fmt check, and git diff check passed.
 [commit] 715ba74 Isolate product ingress route failures.
+[action] Phase B: enforced literal client active-plus-pending per-server limits, checked promotion/release transitions, deterministic config fixtures, and immediate pre-Accept ingress terminal handling.
+[validation] Phase B focused client check, unit tests, Clippy with -D warnings, fmt check, and git diff check passed.
+[commit] b3aeabe Enforce client ingress and stream bounds.
+[action] Phase C: added a single five-second server worker deadline, cancellation-aware candidate/decision/write waits, clipped cancellable upstream connect and hold paths, fresh ticket verification time, acknowledged dial promotion, collision-safe stream admission, and shutdown promotion draining.
+[validation] Phase C focused server check, owner tests, Clippy with -D warnings, fmt check, and git diff check passed.
