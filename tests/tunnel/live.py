@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import secrets
+import select
 import signal
 import socket
 import subprocess
@@ -37,8 +38,9 @@ def read_rows(path: pathlib.Path) -> list[dict]:
     if not path.exists():
         return []
     rows = []
-    for line in path.read_text(errors="replace").splitlines():
-        if not line.strip():
+    lines = path.read_text(errors="replace").splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if not line.strip() or index == len(lines) - 1 and not line.endswith(("\n", "\r")):
             continue
         try:
             rows.append(json.loads(line))
@@ -65,25 +67,36 @@ class Upstream:
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
         self.listener: socket.socket | None = None
+        self.ready = threading.Event()
+        self.error: BaseException | None = None
         self.accepted_connections = 0
 
     def start(self) -> None:
         self.thread.start()
+        if not self.ready.wait(2):
+            raise Failure("upstream did not become ready")
+        if self.error is not None:
+            raise Failure(f"upstream failed to start: {self.error}")
 
     def run(self) -> None:
-        with socket.socket() as listener:
-            self.listener = listener
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind(("127.0.0.1", self.port))
-            listener.listen()
-            listener.settimeout(0.2)
-            while not self.stop.is_set():
-                try:
-                    client, _ = listener.accept()
-                except socket.timeout:
-                    continue
-                self.accepted_connections += 1
-                threading.Thread(target=self.handle, args=(client, self.accepted_connections), daemon=True).start()
+        try:
+            with socket.socket() as listener:
+                self.listener = listener
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind(("127.0.0.1", self.port))
+                listener.listen()
+                listener.settimeout(0.2)
+                self.ready.set()
+                while not self.stop.is_set():
+                    try:
+                        client, _ = listener.accept()
+                    except socket.timeout:
+                        continue
+                    self.accepted_connections += 1
+                    threading.Thread(target=self.handle, args=(client, self.accepted_connections), daemon=True).start()
+        except BaseException as error:
+            self.error = error
+            self.ready.set()
 
     def handle(self, client: socket.socket, connection_number: int) -> None:
         with client:
@@ -147,6 +160,7 @@ class Run:
         self.resource_marks: dict[str, dict] = {}
         self.upstream_port = free_port(socket.SOCK_STREAM)
         self.local_port = free_port(socket.SOCK_STREAM)
+        self.local_port2 = free_port(socket.SOCK_STREAM)
         self.exchange_tcp = free_port(socket.SOCK_STREAM)
         self.exchange_quic = free_port(socket.SOCK_DGRAM)
         self.upstream: Upstream | None = None
@@ -156,14 +170,17 @@ class Run:
         self.route_id = "r_" + secrets.token_hex(8)
         self.upstream_id = "u_" + secrets.token_hex(8)
         self.client_credential_id = "client_" + secrets.token_hex(4)
+        self.client2_credential_id = "client_" + secrets.token_hex(4)
         self.server_credential_id = "server_" + secrets.token_hex(4)
-        self.private = [self.selector_key, self.selector_value, self.route_id, self.upstream_id, self.client_credential_id, self.server_credential_id]
+        self.private = [self.selector_key, self.selector_value, self.route_id, self.upstream_id, self.client_credential_id, self.client2_credential_id, self.server_credential_id]
         self.client_token, client_digest = token(self.client_credential_id)
+        self.client2_token, client2_digest = token(self.client2_credential_id)
         self.server_token, server_digest = token(self.server_credential_id)
         self.payload_sentinel = "p2x-" + secrets.token_urlsafe(16)
         self.exchange_peer = self.identity("exchange")
         self.server_peer = self.identity("server")
         self.client_peer = self.identity("client")
+        self.client2_peer = self.identity("client2")
         now = int(time.time())
         self.ticket_key = self.secret / "ticket.key"
         self.ticket_key.write_bytes(b"\x01" + secrets.token_bytes(32))
@@ -182,6 +199,16 @@ credentials:
   - credential_id: {self.client_credential_id}
     token_sha256: \"{client_digest}\"
     peer_id: \"{self.client_peer}\"
+    tenant: test
+    role: client
+    scopes: [open_proxy_stream]
+    quota_profile: standard
+    not_before: {now - 60}
+    expires_at: {now + 3600}
+    revoked: false
+  - credential_id: {self.client2_credential_id}
+    token_sha256: \"{client2_digest}\"
+    peer_id: \"{self.client2_peer}\"
     tenant: test
     role: client
     scopes: [open_proxy_stream]
@@ -220,10 +247,13 @@ credentials:
         self.services = self.secret / "services.yaml"
         base_case = self.case.split("/", 1)[0]
         concurrent = base_case == "concurrent-streams" or base_case == "resource-baseline"
-        max_workers = 2 if base_case == "stream-limits" else 256
-        max_workers_per_client = 2 if base_case == "stream-limits" else 128 if concurrent else 32
-        max_upstream_dials = 2 if base_case == "stream-limits" else 128 if concurrent else 64
-        concurrency_limit = 1 if base_case == "stream-limits" else 128 if concurrent else 64
+        limited = base_case == "stream-limits" or self.case == "per-ingress-failure-recovery/path-capacity"
+        max_workers = 1 if self.case in {"per-ingress-failure-recovery/path-capacity", "stream-limits/server-global"} else 2 if base_case == "stream-limits" else 256
+        max_workers_per_client = 1 if self.case == "stream-limits/server-client" else 1 if limited else 128 if concurrent else 32
+        max_upstream_dials = 1 if self.case in {"per-ingress-failure-recovery/path-capacity", "stream-limits/server-dial"} else 128 if concurrent else 64
+        concurrency_limit = 1 if self.case == "stream-limits/server-service" else 1 if limited else 128 if concurrent else 64
+        if self.case == "stream-limits/server-global":
+            max_workers_per_client = max_upstream_dials = concurrency_limit = 128
         self.services.write_text(
             f"""schema_version: 1
 registration:
@@ -249,12 +279,13 @@ proxy:
 """
         )
         direct = 0 if base_case.endswith("-relay") else 5000 if base_case == "control-loss-direct" else 1500
+        setup_timeout = 1_000 if self.case == "deadline-stages" else 20_000
         self.routes = self.secret / "routes.yaml"
         self.routes.write_text(
             f"""schema_version: 1
 network:
   direct_preference_ms: {direct}
-  connection_setup_timeout_ms: 20000
+  connection_setup_timeout_ms: {setup_timeout}
 targets:
   - route_id: {self.route_id}
     selector:
@@ -268,11 +299,13 @@ limits:
   max_peer_states: 64
   max_pending_setups: 256
   max_pending_per_server: 128
-  max_ingress_connections: 512
-  max_streams_per_server: 128
+  max_ingress_connections: {1 if self.case == "stream-limits/client-ingress" else 512}
+  max_streams_per_server: {1 if self.case == "stream-limits/client-server" else 128}
   copy_buffer_bytes: 32768
 """
         )
+        self.routes2 = self.secret / "routes2.yaml"
+        self.routes2.write_text(self.routes.read_text().replace(f":{self.local_port}", f":{self.local_port2}"))
 
     def start_sampler(self) -> None:
         def sample() -> None:
@@ -342,6 +375,9 @@ limits:
         if self.case.split("/", 1)[0] in {"concurrent-streams", "resource-baseline"}:
             args += ["--resolve-limit-global", "256", "--resolve-limit-per-client", "128", "--resolve-limit-per-minute", "256"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
+        elif self.case == "deadline-stages":
+            args += ["--test-hold-resolve-ms", "1500"]
+            env["P2X_ENABLE_TEST_HOOKS"] = "1"
         return self.start(name, args, env)
 
     def start_server(self, exchange: str, name: str = "server") -> pathlib.Path:
@@ -350,15 +386,31 @@ limits:
         if self.case.split("/", 1)[0] == "upstream-timeout":
             args += ["--test-hold-upstream-dial-ms", "4000"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
-        elif self.case.split("/", 1)[0] == "stream-limits":
-            args += ["--test-hold-proxy-handshake-ms", "1000"]
+        elif self.case.split("/", 1)[0] == "stream-limits" or self.case == "per-ingress-failure-recovery/path-capacity":
+            if self.case == "stream-limits/server-dial":
+                args += ["--test-hold-upstream-dial-ms", "3000"]
+            else:
+                args += ["--test-hold-proxy-handshake-ms", "1000"]
+            env["P2X_ENABLE_TEST_HOOKS"] = "1"
+        elif self.case == "shutdown/server-setup":
+            args += ["--test-hold-proxy-handshake-ms", "10000"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
         return self.start(name, args, env)
 
-    def start_client(self, exchange: str, name: str = "client") -> pathlib.Path:
-        args = [str(self.root / "target/debug/p2x-client"), "--identity-file", str(self.secret / "client.key"), "--exchange", exchange, "--exchange-peer-id", self.exchange_peer, "--credential-env", "P2X_TOKEN", "--routes-file", str(self.routes), "--case-id", self.case]
-        env = {"P2X_TOKEN": self.client_token}
-        if self.case.split("/", 1)[0] == "path-loss-recovery":
+    def start_client(self, exchange: str, name: str = "client", second: bool = False) -> pathlib.Path:
+        identity = self.secret / ("client2.key" if second else "client.key")
+        routes = self.routes2 if second else self.routes
+        token_value = self.client2_token if second else self.client_token
+        args = [str(self.root / "target/debug/p2x-client"), "--identity-file", str(identity), "--exchange", exchange, "--exchange-peer-id", self.exchange_peer, "--credential-env", "P2X_TOKEN", "--routes-file", str(routes), "--case-id", self.case]
+        env = {"P2X_TOKEN": token_value}
+        profile = self.case.split("/", 1)[0]
+        if self.case == "per-ingress-failure-recovery/resolve":
+            args += ["--test-fail-first-resolve"]
+            env["P2X_ENABLE_TEST_HOOKS"] = "1"
+        elif self.case == "shutdown/client-setup":
+            args += ["--test-delay-after-resolve-ms", "10000"]
+            env["P2X_ENABLE_TEST_HOOKS"] = "1"
+        if profile == "path-loss-recovery":
             args += ["--test-close-proxy-after-accept-ms", "100"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
         return self.start(name, args, env)
@@ -423,6 +475,16 @@ def recv_exact(peer: socket.socket, size: int) -> bytes:
         data.extend(chunk)
     return bytes(data)
 
+def wait_for_eof(peer: socket.socket, timeout: float = 10.0) -> None:
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        ready, _, _ = select.select([peer], [], [], min(0.2, end - time.monotonic()))
+        if not ready:
+            continue
+        if not peer.recv(65536):
+            return
+    raise Failure("socket did not close after local ingress rejection")
+
 def assert_process_terminals(paths: list[pathlib.Path]) -> bool:
     seen: set[pathlib.Path] = set()
     for path in paths:
@@ -448,6 +510,46 @@ def assert_privacy(run: Run, paths: list[pathlib.Path]) -> bool:
         if marker in output:
             raise Failure(f"privacy scan found exact run marker {marker}")
     return True
+
+def assert_named_contract(requested_case: str, client_rows: list[dict], server_rows: list[dict]) -> str:
+    client_terminals = [row for row in client_rows if row.get("event") == "tunnel_terminal"]
+    server_terminals = [row for row in server_rows if row.get("event") == "tunnel_terminal"]
+    if requested_case.startswith("per-ingress-failure-recovery/"):
+        if not any(row.get("event") == "ingress_rejected" for row in client_rows):
+            raise Failure(f"{requested_case} did not observe per-ingress rejection")
+        if not any(row.get("event") == "started" for row in client_rows):
+            raise Failure(f"{requested_case} did not keep client alive")
+        if requested_case == "per-ingress-failure-recovery/upstream":
+            if not any(row.get("event") == "proxy_authorization" and row.get("code") == "upstream.connect_failed" and not row.get("authorized") for row in server_rows):
+                raise Failure("upstream recovery did not classify the failed ingress")
+            if sum(row.get("event") == "tunnel_accepted" for row in client_rows) < 1:
+                raise Failure("upstream recovery did not accept the later ingress")
+        return "per_ingress_failure_recovery"
+    if requested_case.startswith("stream-limits/"):
+        if not any(row.get("code") == "limit.proxy_streams" and not row.get("authorized") for row in server_rows):
+            raise Failure(f"{requested_case} did not observe server N+1 rejection")
+        return "stream_limit_boundary"
+    if requested_case.startswith("shutdown/"):
+        if not any(row.get("event") == "terminal" and row.get("code") == "shutdown" for row in client_rows + server_rows):
+            raise Failure(f"{requested_case} did not observe shutdown terminal")
+        if requested_case in {"shutdown/client-setup", "shutdown/server-setup"}:
+            return "shutdown_setup_drain"
+        if not client_terminals and not server_terminals:
+            raise Failure(f"{requested_case} did not observe shutdown tunnel terminal evidence")
+        return "shutdown_active_drain"
+    if requested_case == "terminal-correlation":
+        if not client_terminals or not server_terminals:
+            raise Failure("terminal-correlation did not observe both terminal sides")
+        return "terminal_correlation"
+    if requested_case == "concurrent-streams/64-sustained":
+        if len(client_terminals) != 64 or len(server_terminals) != 64:
+            raise Failure("64-sustained did not finish exactly 64 tunnels")
+        return "64_sustained"
+    if requested_case in {"concurrent-streams/128-headroom", "resource-baseline/128"}:
+        if len(client_terminals) != 128 or len(server_terminals) != 128:
+            raise Failure(f"{requested_case} did not finish exactly 128 tunnels")
+        return "128_headroom"
+    return "base_case"
 
 def assert_tunnel_lifecycle(case: str, client_rows: list[dict], server_rows: list[dict]) -> dict[str, bool]:
     client_accepted = [row for row in client_rows if row.get("event") == "tunnel_accepted"]
@@ -513,33 +615,13 @@ def assert_tunnel_lifecycle(case: str, client_rows: list[dict], server_rows: lis
     return expected
 
 def run_case(root: pathlib.Path, case: str) -> None:
-    aliases = {
-        "per-ingress-failure-recovery/resolve": "fixed-tcp-direct",
-        "per-ingress-failure-recovery/path-capacity": "stream-limits",
-        "per-ingress-failure-recovery/upstream": "upstream-refused",
-        "per-ingress-failure-recovery/pre-accept-eof": "path-loss-recovery",
-        "stream-limits/client-ingress": "stream-limits",
-        "stream-limits/client-server": "stream-limits",
-        "stream-limits/server-global": "stream-limits",
-        "stream-limits/server-client": "stream-limits",
-        "stream-limits/server-service": "stream-limits",
-        "stream-limits/server-dial": "stream-limits",
-        "shutdown/client-setup": "shutdown-cancellation",
-        "shutdown/client-active": "shutdown-cancellation",
-        "shutdown/server-setup": "shutdown-cancellation",
-        "shutdown/server-active": "shutdown-cancellation",
-        "terminal-correlation": "fixed-tcp-direct",
-        "concurrent-streams/64-sustained": "concurrent-streams",
-        "concurrent-streams/128-headroom": "concurrent-streams",
-        "resource-baseline/128": "concurrent-streams",
-    }
     requested_case = case
-    case = aliases.get(case, case)
+    profile = case.split("/", 1)[0]
     run = Run(root, case)
     exchange_log = server_log = client_log = None
     try:
-        if case not in {"upstream-refused", "upstream-timeout"}:
-            mode = "half-close" if case.startswith("half-close") else "idle" if case == "idle-timeout" else "hold" if case in {"path-loss-recovery", "shutdown-cancellation", "concurrent-streams"} else "slow-first" if case.startswith("large-slow") else "echo"
+        if profile not in {"upstream-refused", "upstream-timeout"} and requested_case != "per-ingress-failure-recovery/upstream":
+            mode = "half-close" if profile.startswith("half-close") else "idle" if profile == "idle-timeout" else "hold" if profile in {"path-loss-recovery", "shutdown-cancellation", "shutdown", "concurrent-streams", "resource-baseline"} else "slow-first" if profile.startswith("large-slow") else "echo"
             run.upstream = Upstream(run.upstream_port, mode)
             run.upstream.start()
         exchange_log = run.start_exchange()
@@ -552,12 +634,73 @@ def run_case(root: pathlib.Path, case: str) -> None:
         wait_for(client_log, lambda row: row.get("event") == "started", 20)
         wait_for(client_log, lambda row: row.get("event") == "auth_readiness" and row.get("ready") is True, 45)
         run.start_sampler()
-        client = None if case == "concurrent-streams" else socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+        client = None if profile in {"concurrent-streams", "resource-baseline"} else socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
         if client is not None:
-            client.settimeout(900 if case.startswith("large-slow") else 60)
-            if case not in {"upstream-refused", "upstream-timeout", "idle-timeout"}:
+            client.settimeout(900 if profile.startswith("large-slow") else 60)
+            if profile not in {"upstream-refused", "upstream-timeout", "idle-timeout"} and requested_case not in {
+                "per-ingress-failure-recovery/resolve",
+                "per-ingress-failure-recovery/upstream",
+                "per-ingress-failure-recovery/pre-accept-eof",
+                "shutdown/client-setup",
+                "shutdown/server-setup",
+            }:
                 wait_for(client_log, lambda row: row.get("event") == "tunnel_accepted", 45)
-        if case == "stream-limits":
+        if requested_case == "per-ingress-failure-recovery/resolve":
+            assert client is not None
+            client.close()
+            client = None
+            wait_for(client_log, lambda row: row.get("event") == "ingress_rejected", 45)
+            later = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            later.settimeout(30)
+            payload = b"resolve-recovery"
+            later.sendall(payload)
+            if recv_exact(later, len(payload)) != payload:
+                raise Failure("resolve recovery did not carry a later ingress")
+            later.close()
+        elif requested_case == "per-ingress-failure-recovery/path-capacity":
+            assert client is not None
+            client.sendall(b"held-capacity")
+            wait_for(client_log, lambda row: row.get("event") == "tunnel_accepted", 45)
+            second = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            second.settimeout(30)
+            second.sendall(b"capacity-overflow")
+            if second.recv(1) != b"":
+                raise Failure("path-capacity forwarded N+1 ingress")
+            second.close()
+            client.close()
+            client = None
+        elif requested_case == "per-ingress-failure-recovery/upstream":
+            assert client is not None
+            wait_for(server_log, lambda row: row.get("event") == "proxy_authorization" and row.get("code") == "upstream.connect_failed", 45)
+            wait_for(client_log, lambda row: row.get("event") == "ingress_rejected", 45)
+            wait_for_eof(client)
+            client.close()
+            client = None
+            run.upstream = Upstream(run.upstream_port, "echo")
+            run.upstream.start()
+            time.sleep(0.2)
+            later = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            later.settimeout(30)
+            wait_for_count(client_log, lambda row: row.get("event") == "ingress_accepted", 2, 10)
+            payload = b"upstream-recovery"
+            later.sendall(payload)
+            if recv_exact(later, len(payload)) != payload:
+                raise Failure("upstream recovery did not carry a later ingress")
+            later.close()
+            wait_for(client_log, lambda row: row.get("event") == "tunnel_accepted", 45)
+        elif requested_case == "per-ingress-failure-recovery/pre-accept-eof":
+            assert client is not None
+            client.close()
+            client = None
+            wait_for(client_log, lambda row: row.get("event") == "ingress_rejected", 45)
+            later = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            later.settimeout(30)
+            payload = b"eof-recovery"
+            later.sendall(payload)
+            if recv_exact(later, len(payload)) != payload:
+                raise Failure("pre-accept EOF did not promote a later ingress")
+            later.close()
+        elif profile == "stream-limits":
             assert client is not None
             held = [client]
             wait_for_count(server_log, lambda row: row.get("event") == "tunnel_accepted", 1, 60)
@@ -577,7 +720,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
             if reusable.recv(len(b"released-capacity")) != b"released-capacity":
                 raise Failure("released stream capacity was not reusable")
             reusable.close()
-        elif case == "control-loss-direct":
+        elif profile == "control-loss-direct":
             assert client is not None
             wait_for(client_log, lambda row: row.get("event") == "path_selected" and row.get("selected_path") == "direct", 45)
             first = b"control-loss-before"
@@ -603,7 +746,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
             if recovered.recv(len(recovered_payload)) != recovered_payload:
                 raise Failure("control-loss-direct did not recover a later ingress")
             recovered.close()
-        elif case == "path-loss-recovery":
+        elif profile == "path-loss-recovery":
             assert client is not None
             client.sendall(b"path-loss-payload")
             time.sleep(0.3)
@@ -616,15 +759,25 @@ def run_case(root: pathlib.Path, case: str) -> None:
             if recovered.recv(len(b"path-loss-recovered")) != b"path-loss-recovered":
                 raise Failure("path-loss-recovery did not accept a later ingress")
             recovered.close()
-        elif case == "shutdown-cancellation":
+        elif profile == "shutdown-cancellation" or requested_case.startswith("shutdown/"):
             assert client is not None
-            client.sendall(b"shutdown-cancellation")
-            time.sleep(0.2)
-            run.stop(client_log)
+            if requested_case in {"shutdown/client-setup", "shutdown/server-setup"}:
+                run.mark_resources("setup_before_shutdown")
+                first = client_log if requested_case == "shutdown/client-setup" else server_log
+                second = server_log if requested_case == "shutdown/client-setup" else client_log
+                run.stop(first)
+                wait_for_terminal(first)
+                run.stop(second)
+                wait_for_terminal(second)
+            else:
+                client.sendall(b"shutdown-cancellation")
+                time.sleep(0.2)
+                run.mark_resources("active_before_shutdown")
+                run.stop(client_log)
+                run.stop(server_log)
             client.close()
             client = None
-            run.stop(server_log)
-        elif case.startswith("half-close"):
+        elif profile.startswith("half-close"):
             assert client is not None
             client.sendall(b"half-close-payload")
             client.shutdown(socket.SHUT_WR)
@@ -637,63 +790,45 @@ def run_case(root: pathlib.Path, case: str) -> None:
                 data.extend(chunk)
             if bytes(data) != expected:
                 raise Failure(f"half-close response mismatch: {data!r}")
-        elif case == "idle-timeout":
+        elif profile == "idle-timeout":
             assert client is not None
             if client.recv(1) != b"":
                 raise Failure("idle tunnel returned application data")
-        elif case == "upstream-refused":
+        elif profile == "upstream-refused":
             assert client is not None
             if client.recv(1) != b"":
                 raise Failure("refused upstream forwarded bytes")
-        elif case == "upstream-timeout":
+        elif profile == "upstream-timeout":
             assert client is not None
             if client.recv(1) != b"":
                 raise Failure("timed-out upstream forwarded bytes")
         else:
-            payload_size = 256 * 1024 * 1024 if case.startswith("large-slow") else 64
-            if case == "concurrent-streams":
+            payload_size = 256 * 1024 * 1024 if profile.startswith("large-slow") else 64
+            if profile in {"concurrent-streams", "resource-baseline"}:
+                target = 64 if requested_case == "concurrent-streams/64-sustained" else 128
                 peers: list[socket.socket] = []
+                expected_payloads: list[bytes] = []
                 try:
-                    for index in range(64):
+                    for index in range(target):
                         peer = socket.create_connection(("127.0.0.1", run.local_port), timeout=60)
                         peer.settimeout(60)
                         peers.append(peer)
-                        peer.sendall(f"stream-{index:03d}".encode() + secrets.token_bytes(32))
-                    wait_for_count(client_log, lambda row: row.get("event") == "tunnel_accepted", 64, 90)
-                    wait_for_count(server_log, lambda row: row.get("event") == "tunnel_accepted", 64, 90)
-                    run.mark_resources("64_sustained")
-                    with ThreadPoolExecutor(max_workers=64) as pool:
-                        sustained = list(pool.map(lambda item: recv_exact(item[0], len(item[1])), zip(peers, [f"stream-{index:03d}".encode() + b"x" * 32 for index in range(64)])))
-                    if any(not data for data in sustained):
-                        raise Failure("concurrent sustained stream closed before release")
-                    for peer in peers:
-                        peer.close()
-                    peers.clear()
-                    wait_for_count(client_log, lambda row: row.get("event") == "tunnel_terminal", 64, 90)
-                    wait_for_count(server_log, lambda row: row.get("event") == "tunnel_terminal", 64, 90)
-                    expected_headroom: list[bytes] = []
-                    client_accepted_before_headroom = sum(row.get("event") == "tunnel_accepted" for row in read_rows(client_log))
-                    server_accepted_before_headroom = sum(row.get("event") == "tunnel_accepted" for row in read_rows(server_log))
-                    for index in range(128):
-                        peer = socket.create_connection(("127.0.0.1", run.local_port), timeout=60)
-                        peer.settimeout(60)
-                        peers.append(peer)
-                        payload = f"headroom-{index:03d}".encode()
-                        expected_headroom.append(payload)
+                        payload = f"stream-{index:03d}-".encode() + secrets.token_bytes(32)
+                        expected_payloads.append(payload)
                         peer.sendall(payload)
-                    wait_for_count(client_log, lambda row: row.get("event") == "tunnel_accepted", client_accepted_before_headroom + 128, 120)
-                    wait_for_count(server_log, lambda row: row.get("event") == "tunnel_accepted", server_accepted_before_headroom + 128, 120)
-                    run.mark_resources("128_headroom")
-                    with ThreadPoolExecutor(max_workers=128) as pool:
-                        actuals = list(pool.map(lambda item: recv_exact(item[0], len(item[1])), zip(peers, expected_headroom)))
-                    mismatches = [(index, expected, actual) for index, (actual, expected) in enumerate(zip(actuals, expected_headroom)) if actual != expected]
-                    if mismatches:
-                        raise Failure(f"128 headroom echo mismatches={mismatches[:4]} total={len(mismatches)}")
+                    wait_for_count(client_log, lambda row: row.get("event") == "tunnel_accepted", target, 120)
+                    wait_for_count(server_log, lambda row: row.get("event") == "tunnel_accepted", target, 120)
+                    mark = "64_sustained" if target == 64 else "128_headroom"
+                    run.mark_resources(mark)
+                    with ThreadPoolExecutor(max_workers=target) as pool:
+                        actuals = list(pool.map(lambda item: recv_exact(item[0], len(item[1])), zip(peers, expected_payloads)))
+                    if actuals != expected_payloads:
+                        raise Failure(f"{requested_case} endpoint payload mismatch")
                     for peer in peers:
                         peer.close()
                     peers.clear()
-                    wait_for_count(client_log, lambda row: row.get("event") == "tunnel_terminal", 192, 120)
-                    wait_for_count(server_log, lambda row: row.get("event") == "tunnel_terminal", 192, 120)
+                    wait_for_count(client_log, lambda row: row.get("event") == "tunnel_terminal", target, 120)
+                    wait_for_count(server_log, lambda row: row.get("event") == "tunnel_terminal", target, 120)
                     run.mark_resources("after_release")
                 finally:
                     for peer in peers:
@@ -702,7 +837,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
                     "samples": run.samples,
                     "resource_marks": run.resource_marks,
                     "copy_buffer_bytes": 32768,
-                    "max_active_streams": 128,
+                    "max_active_streams": target,
                     "direction_buffers_per_component": 2,
                     "pending_client_preaccept_buffers": 1,
                     "declared_user_buffers": 9,
@@ -711,7 +846,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
                 }, sort_keys=True) + "\n")
             else:
                 assert client is not None
-                if case.startswith("large-slow"):
+                if profile.startswith("large-slow"):
                     sentinel = run.payload_sentinel.encode()
                     block = sentinel + b"x" * (64 * 1024 - len(sentinel))
                     expected = hashlib.sha256()
@@ -780,43 +915,65 @@ def run_case(root: pathlib.Path, case: str) -> None:
                     if bytes(data) != payload:
                         raise Failure("echo payload mismatch")
             selected = [row.get("selected_path") for row in read_rows(client_log) if row.get("event") == "path_selected"]
-            expected_path = "relay" if case.endswith("-relay") else "direct"
+            expected_path = "relay" if profile.endswith("-relay") else "direct"
             if expected_path not in selected:
                 raise Failure(f"expected {expected_path} selected path, saw {selected}")
-            if case == "concurrent-streams":
+            if profile in {"concurrent-streams", "resource-baseline"}:
+                target = 64 if requested_case == "concurrent-streams/64-sustained" else 128
                 accepted_rows = [row for row in read_rows(client_log) if row.get("event") == "tunnel_accepted"]
-                if len(accepted_rows) < 64:
-                    raise Failure("concurrent-streams did not produce 64 accepted stream correlations")
+                if len(accepted_rows) < target:
+                    raise Failure(f"{requested_case} did not produce {target} accepted stream correlations")
         if client is not None:
             client.close()
         time.sleep(0.3)
-        if case == "shutdown-cancellation":
-            if wait_for_terminal(client_log).get("code") != "shutdown":
-                raise Failure("shutdown-cancellation did not stop the client cleanly")
-            if not any(row.get("event") == "resources" and row.get("workers") == 1 for row in read_rows(client_log)):
-                raise Failure("shutdown-cancellation did not observe active work before cancellation")
-        if case == "control-loss-direct":
+        if profile == "shutdown-cancellation" or requested_case.startswith("shutdown/"):
+            if requested_case in {"shutdown/client-setup", "shutdown/server-setup"}:
+                for path in (client_log, server_log):
+                    if wait_for_terminal(path).get("code") != "shutdown":
+                        raise Failure(f"{requested_case} did not stop {path.name} cleanly")
+                if not any(row.get("event") == "route_owner_high_water" and row.get("opens", 0) >= 1 for row in read_rows(client_log)):
+                    raise Failure(f"{requested_case} did not hold setup ownership before shutdown")
+            else:
+                if wait_for_terminal(client_log).get("code") != "shutdown":
+                    raise Failure(f"{requested_case} did not stop the client cleanly")
+                if not any(row.get("event") == "resources" and row.get("workers") == 1 for row in read_rows(client_log)):
+                    raise Failure("shutdown-cancellation did not observe active work before cancellation")
+        if profile == "control-loss-direct":
             if not any(row.get("event") == "tunnel_terminal" and row.get("accepted") for row in read_rows(client_log)):
                 raise Failure("control-loss-direct did not complete an accepted stream")
-        if case == "path-loss-recovery":
+        if profile == "path-loss-recovery":
             if sum(row.get("event") == "tunnel_terminal" for row in read_rows(client_log)) < 2:
                 raise Failure("path-loss-recovery did not terminate and replace the active stream")
             if not any(row.get("event") == "connection_observed" and row.get("state") == "closed" for row in read_rows(client_log)):
                 raise Failure("path-loss-recovery did not observe selected path loss")
         client_rows = read_rows(client_log)
         server_rows = read_rows(server_log)
-        lifecycle_assertions = assert_tunnel_lifecycle(case, client_rows, server_rows)
-        if case == "concurrent-streams" and sum(row.get("authorized") is True for row in server_rows if row.get("event") == "proxy_authorization") < 128:
-            raise Failure("concurrent-streams did not authorize 128 independent streams")
-        if case == "stream-limits" and not any(row.get("code") == "limit.proxy_streams" and not row.get("authorized") for row in server_rows):
+        if requested_case in {"shutdown/client-setup", "shutdown/server-setup"}:
+            lifecycle_assertions = {
+                "accepted": False,
+                "terminal_correlation": False,
+                "directional_bytes": False,
+                "idle_terminal_class": False,
+                "upstream_failure_or_idle": False,
+            }
+        else:
+            lifecycle_assertions = assert_tunnel_lifecycle(profile, client_rows, server_rows)
+        named_contract = assert_named_contract(requested_case, client_rows, server_rows)
+        if profile in {"concurrent-streams", "resource-baseline"}:
+            target = 64 if requested_case == "concurrent-streams/64-sustained" else 128
+            if sum(row.get("authorized") is True for row in server_rows if row.get("event") == "proxy_authorization") < target:
+                raise Failure(f"{requested_case} did not authorize {target} independent streams")
+        if profile == "stream-limits" and not any(row.get("code") == "limit.proxy_streams" and not row.get("authorized") for row in server_rows):
             raise Failure("stream-limits did not observe N+1 rejection")
-        if case == "concurrent-streams" and not all(name in run.resource_marks for name in ("64_sustained", "128_headroom")):
-            raise Failure("concurrent-streams did not capture 64/128 resource marks")
-        if case == "stream-limits" and sum(row.get("authorized") is True for row in server_rows if row.get("event") == "proxy_authorization") < 1:
+        if profile in {"concurrent-streams", "resource-baseline"}:
+            mark = "64_sustained" if requested_case == "concurrent-streams/64-sustained" else "128_headroom"
+            if mark not in run.resource_marks or "after_release" not in run.resource_marks:
+                raise Failure(f"{requested_case} did not capture before/peak/after resource marks")
+        if profile == "stream-limits" and sum(row.get("authorized") is True for row in server_rows if row.get("event") == "proxy_authorization") < 1:
             raise Failure("stream-limits did not authorize the held stream")
-        if case == "stream-limits" and not any(row.get("event") == "resources" and row.get("workers", 0) >= 1 for row in server_rows):
+        if profile == "stream-limits" and not any(row.get("event") == "resources" and row.get("workers", 0) >= 1 for row in server_rows):
             raise Failure("stream-limits did not observe a held active worker")
-        if case == "shutdown-cancellation":
+        if profile == "shutdown-cancellation":
             for path in (client_log, server_log):
                 wait_for_terminal(path)
                 rows = read_rows(path)
@@ -825,7 +982,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
                 final_resources = [row for row in rows if row.get("event") == "resources"][-1:]
                 if final_resources and any(row.get("workers", 0) or row.get("tasks", 0) or row.get("pending_opens", 0) for row in final_resources):
                     raise Failure(f"{path.name} did not drain logical resources: {final_resources}")
-        if case.startswith("large-slow"):
+        if profile.startswith("large-slow"):
             large_terminals = [
                 row for row in read_rows(client_log)
                 if row.get("event") == "tunnel_terminal"
@@ -841,20 +998,19 @@ def run_case(root: pathlib.Path, case: str) -> None:
             if max(rss) - min(rss) > 64 * 1024 * 1024:
                 raise Failure(f"{case} RSS exceeded the bounded process delta: {rss[-3:]}")
             (run.out / "resource-samples.json").write_text(json.dumps({"samples": run.samples, "resource_marks": run.resource_marks, "copy_buffer_bytes": 32768, "max_active_streams": 128, "direction_buffers_per_component": 2, "pending_client_preaccept_buffers": 1, "declared_user_buffers": 9, "declared_bytes": 9 * 32768, "rss_delta_limit": 64 * 1024 * 1024}, sort_keys=True) + "\n")
-        if case.endswith("-relay") and not any(row.get("event") == "path_selected" and row.get("selected_path") == "relay" for row in read_rows(client_log)):
+        if profile.endswith("-relay") and not any(row.get("event") == "path_selected" and row.get("selected_path") == "relay" for row in read_rows(client_log)):
             raise Failure("forced relay path was not selected")
-        if case == "upstream-refused" and not any(row.get("code") == "upstream.connect_failed" and not row.get("authorized") for row in server_rows):
+        if profile == "upstream-refused" and not any(row.get("code") == "upstream.connect_failed" and not row.get("authorized") for row in server_rows):
             raise Failure("upstream refusal was not classified")
-        if case == "upstream-timeout" and not any(row.get("code") == "upstream.connect_timeout" and not row.get("authorized") for row in server_rows):
+        if profile == "upstream-timeout" and not any(row.get("code") == "upstream.connect_timeout" and not row.get("authorized") for row in server_rows):
             raise Failure("upstream timeout was not classified")
         accepted = [row for row in read_rows(client_log) if row.get("event") == "tunnel_accepted"]
         terminals = [row for row in read_rows(client_log) if row.get("event") == "tunnel_terminal"]
-        base_case = case.split("/", 1)[0]
-        if base_case not in {"upstream-refused", "upstream-timeout", "idle-timeout"} and not accepted:
+        if profile not in {"upstream-refused", "upstream-timeout", "idle-timeout"} and not accepted and not requested_case.startswith("shutdown/"):
             raise Failure(f"{case} did not observe tunnel acceptance")
         if len(terminals) > len(accepted):
             raise Failure(f"{case} emitted more tunnel terminals than accepted streams")
-        if case != "shutdown-cancellation":
+        if not requested_case.startswith("shutdown/"):
             run.stop(client_log)
         run.stop(server_log)
         run.stop(exchange_log)
@@ -865,10 +1021,11 @@ def run_case(root: pathlib.Path, case: str) -> None:
         client_resources = assert_final_resources(client_log)
         server_resources = assert_final_resources(server_log)
         privacy_clean = assert_privacy(run, process_logs)
-        if base_case == "concurrent-streams":
+        if profile in {"concurrent-streams", "resource-baseline"}:
+            target = 64 if requested_case == "concurrent-streams/64-sustained" else 128
             accepted_rows = [row for row in read_rows(client_log) if row.get("event") == "tunnel_accepted"]
-            if len(accepted_rows) < 128:
-                raise Failure("concurrent-streams did not produce 128 accepted stream terminals")
+            if len(accepted_rows) < target:
+                raise Failure(f"{requested_case} did not produce {target} accepted stream terminals")
         summary = {
             "case": requested_case,
             "passed": True,
@@ -881,6 +1038,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
                 "privacy_scan_clean": privacy_clean,
                 "one_terminal_each": process_terminals,
                 "resources_drained": client_resources and server_resources,
+                "named_contract": named_contract,
             },
         }
         (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
