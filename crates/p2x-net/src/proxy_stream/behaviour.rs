@@ -16,7 +16,7 @@ use std::{
 };
 
 const MAX_PENDING: usize = 128;
-const MAX_PER_PEER: usize = 64;
+const MAX_PER_PEER: usize = 128;
 const MAX_QUEUE: usize = 128;
 const OPEN_DEADLINE: Duration = Duration::from_secs(5);
 pub const MAX_INBOUND_WORKERS: usize = 256;
@@ -523,6 +523,37 @@ mod tests {
             Err("proxy.outbound_disabled")
         );
         assert!(server.inbound_admit(peer).is_ok());
+    }
+
+    #[test]
+    fn configured_outbound_per_peer_limit_allows_128_pending_streams() {
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(1);
+        let mut behaviour = ProxyStreamBehaviour::product();
+        behaviour.known.insert((peer, connection));
+        for request_id in 0..128 {
+            let mut open = OpenProxyStreamV1 {
+                request_id: [0; 16],
+                ticket: p2x_protocol::RawTicket::new(vec![7; 16]).unwrap(),
+                upstream_id: p2x_protocol::UpstreamId::new("orders").unwrap(),
+                registration_revision: p2x_protocol::RegistrationRevision::new(1).unwrap(),
+                ingress_kind: p2x_protocol::IngressKind::FixedTcp,
+            };
+            open.request_id[8..].copy_from_slice(&(request_id as u64).to_be_bytes());
+            assert!(behaviour.open_on(peer, connection, open).is_ok());
+        }
+        assert_eq!(behaviour.pending_count(), 128);
+        let open = OpenProxyStreamV1 {
+            request_id: [9; 16],
+            ticket: p2x_protocol::RawTicket::new(vec![7; 16]).unwrap(),
+            upstream_id: p2x_protocol::UpstreamId::new("orders").unwrap(),
+            registration_revision: p2x_protocol::RegistrationRevision::new(1).unwrap(),
+            ingress_kind: p2x_protocol::IngressKind::FixedTcp,
+        };
+        assert_eq!(
+            behaviour.open_on(peer, connection, open),
+            Err("limit.proxy_streams")
+        );
     }
 
     #[test]
