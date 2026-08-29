@@ -347,14 +347,123 @@ mod tests {
     use super::*;
     use futures::io::AsyncReadExt as FuturesReadExt;
     use std::{
+        io,
+        pin::Pin,
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        task::{Context, Poll},
         time::Duration,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    struct ScriptedState {
+        input: Vec<u8>,
+        read_at: usize,
+        output: Vec<u8>,
+        fail_read: bool,
+        fail_write_after: Option<usize>,
+        block_write: bool,
+        max_write: usize,
+        closed: bool,
+        drops: AtomicUsize,
+    }
+
+    struct ScriptedIo {
+        state: Arc<std::sync::Mutex<ScriptedState>>,
+    }
+
+    impl ScriptedIo {
+        fn new(input: &[u8]) -> (Self, Arc<std::sync::Mutex<ScriptedState>>) {
+            let state = Arc::new(std::sync::Mutex::new(ScriptedState {
+                input: input.to_vec(),
+                read_at: 0,
+                output: Vec::new(),
+                fail_read: false,
+                fail_write_after: None,
+                block_write: false,
+                max_write: 0,
+                closed: false,
+                drops: AtomicUsize::new(0),
+            }));
+            (
+                Self {
+                    state: state.clone(),
+                },
+                state,
+            )
+        }
+    }
+
+    impl Drop for ScriptedIo {
+        fn drop(&mut self) {
+            self.state
+                .lock()
+                .unwrap()
+                .drops
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl futures::io::AsyncRead for ScriptedIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut state = self.state.lock().unwrap();
+            if state.fail_read {
+                state.fail_read = false;
+                return Poll::Ready(Err(io::Error::other("scripted read")));
+            }
+            if state.read_at == state.input.len() {
+                return Poll::Ready(Ok(0));
+            }
+            let count = (state.input.len() - state.read_at).min(buf.len());
+            buf[..count].copy_from_slice(&state.input[state.read_at..state.read_at + count]);
+            state.read_at += count;
+            Poll::Ready(Ok(count))
+        }
+    }
+
+    impl futures::io::AsyncWrite for ScriptedIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut state = self.state.lock().unwrap();
+            state.max_write = state.max_write.max(buf.len());
+            if state.block_write {
+                return Poll::Pending;
+            }
+            if state
+                .fail_write_after
+                .is_some_and(|limit| state.output.len() >= limit)
+            {
+                return Poll::Ready(Err(io::Error::other("scripted write")));
+            }
+            let count = state.fail_write_after.map_or(buf.len(), |limit| {
+                limit.saturating_sub(state.output.len()).min(buf.len())
+            });
+            if count == 0 {
+                return Poll::Ready(Err(io::Error::other("scripted write")));
+            }
+            state.output.extend_from_slice(&buf[..count]);
+            Poll::Ready(Ok(count))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.get_mut().state.lock().unwrap().closed = true;
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn prefix_is_delivered_before_inner_bytes() {
@@ -469,6 +578,70 @@ mod tests {
         let _ = pump.await;
         writer.abort();
         reader.abort();
+    }
+
+    #[tokio::test]
+    async fn scripted_local_read_failure_preserves_prior_committed_bytes() {
+        let (local, local_state) = ScriptedIo::new(b"local");
+        local_state.lock().unwrap().fail_read = true;
+        let (remote, remote_state) = ScriptedIo::new(b"");
+        let result = pump_no_idle(local, remote, MIN_COPY_BUFFER, futures::future::pending())
+            .await
+            .unwrap();
+        assert_eq!(result.terminal, Terminal::LocalIo);
+        assert_eq!(result.local_to_remote_bytes, 0);
+        assert_eq!(result.remote_to_local_bytes, 0);
+        assert_eq!(local_state.lock().unwrap().drops.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            remote_state.lock().unwrap().drops.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_local_to_remote_write_failure_preserves_committed_prefix() {
+        let (local, _local_state) = ScriptedIo::new(b"local");
+        let (remote, remote_state) = ScriptedIo::new(b"");
+        remote_state.lock().unwrap().fail_write_after = Some(2);
+        let result = pump_no_idle(local, remote, MIN_COPY_BUFFER, futures::future::pending())
+            .await
+            .unwrap();
+        assert_eq!(result.terminal, Terminal::LocalIo);
+        assert_eq!(result.local_to_remote_bytes, 2);
+        assert_eq!(remote_state.lock().unwrap().output, b"lo");
+    }
+
+    #[tokio::test]
+    async fn blocked_writer_reaches_idle_without_growing_beyond_one_buffer() {
+        let (local, _local_state) = ScriptedIo::new(b"payload");
+        let (remote, remote_state) = ScriptedIo::new(b"");
+        remote_state.lock().unwrap().block_write = true;
+        let result = pump(
+            local,
+            remote,
+            MIN_COPY_BUFFER,
+            Duration::from_millis(10),
+            futures::future::pending(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.terminal, Terminal::IdleTimeout);
+        assert!(remote_state.lock().unwrap().max_write <= MIN_COPY_BUFFER);
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_both_scripted_objects() {
+        let (local, local_state) = ScriptedIo::new(b"");
+        let (remote, remote_state) = ScriptedIo::new(b"");
+        let result = pump_no_idle(local, remote, MIN_COPY_BUFFER, async {})
+            .await
+            .unwrap();
+        assert_eq!(result.terminal, Terminal::Cancelled);
+        assert_eq!(local_state.lock().unwrap().drops.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            remote_state.lock().unwrap().drops.load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]
