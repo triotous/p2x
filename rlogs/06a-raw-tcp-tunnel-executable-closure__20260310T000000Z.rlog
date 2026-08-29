@@ -7,3 +7,6 @@
 [commit] b3aeabe Enforce client ingress and stream bounds.
 [action] Phase C: added a single five-second server worker deadline, cancellation-aware candidate/decision/write waits, clipped cancellable upstream connect and hold paths, fresh ticket verification time, acknowledged dial promotion, collision-safe stream admission, and shutdown promotion draining.
 [validation] Phase C focused server check, owner tests, Clippy with -D warnings, fmt check, and git diff check passed.
+[action] Phase D: added closed lifecycle side/path/terminal-class fields, setup timing propagation, bounded scheduler fairness, and complete PumpResult mapping on both components.
+[validation] Workspace check, workspace tests, workspace Clippy with -D warnings, fmt check, and proxy network tests passed.
+[commit] d0490dd Complete tunnel lifecycle evidence and fairness.
