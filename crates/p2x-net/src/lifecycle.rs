@@ -92,6 +92,15 @@ pub enum LifecycleRecord<'a> {
         ingress_id: u64,
         code: &'a str,
     },
+    TunnelAccepted {
+        component_side: ComponentSide,
+        peer_id: &'a str,
+        connection_id_hash: u64,
+        request_id_hash: u64,
+        stream_id_hash: u64,
+        selected_path: Option<ProbePath>,
+        setup_duration_ms: u128,
+    },
     TunnelTerminal {
         component_side: ComponentSide,
         peer_id: &'a str,
@@ -354,6 +363,19 @@ mod tests {
 
     #[test]
     fn tunnel_terminal_serializes_side_path_and_class() {
+        let accepted = LifecycleRecord::TunnelAccepted {
+            component_side: ComponentSide::Client,
+            peer_id: "peer",
+            connection_id_hash: 1,
+            request_id_hash: 2,
+            stream_id_hash: 3,
+            selected_path: Some(ProbePath::Direct),
+            setup_duration_ms: 4,
+        };
+        let accepted_value = serde_json::to_value(&accepted).unwrap();
+        assert_eq!(accepted_value["event"], "tunnel_accepted");
+        assert_eq!(accepted_value["setup_duration_ms"], 4);
+
         let record = LifecycleRecord::TunnelTerminal {
             component_side: ComponentSide::Client,
             peer_id: "peer",

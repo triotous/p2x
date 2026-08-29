@@ -1438,6 +1438,22 @@ async fn main() -> io::Result<()> {
                                         stable_hash(handoff.stream_id),
                                     ),
                                 );
+                                let peer = handoff.server.to_string();
+                                emitter.emit(&LifecycleRecord::TunnelAccepted {
+                                    component_side: p2x_net::lifecycle::ComponentSide::Client,
+                                    peer_id: &peer,
+                                    connection_id_hash: stable_hash(handoff.connection),
+                                    request_id_hash: stable_hash(handoff.request_id),
+                                    stream_id_hash: stable_hash(handoff.stream_id),
+                                    selected_path: Some(if connections.is_direct(handoff.server, handoff.connection) {
+                                        ProbePath::Direct
+                                    } else {
+                                        ProbePath::Relay
+                                    }),
+                                    setup_duration_ms: ingress_started
+                                        .get(&ingress_id)
+                                        .map_or(0, |started| started.elapsed().as_millis()),
+                                })?;
                                 if let Some(delay) = args.test_close_proxy_after_accept_ms
                                     && !close_proxy_applied
                                 {

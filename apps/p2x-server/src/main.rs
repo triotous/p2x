@@ -649,6 +649,15 @@ async fn main() -> io::Result<()> {
                 }
                 let peer = release.peer_id.to_string();
                 if release.accepted {
+                    emitter.emit(&LifecycleRecord::TunnelAccepted {
+                        component_side: p2x_net::lifecycle::ComponentSide::Server,
+                        peer_id: &peer,
+                        connection_id_hash: stable_hash(release.connection_id),
+                        request_id_hash: release.request_id_hash,
+                        stream_id_hash: release.stream_id_hash.unwrap_or_default(),
+                        selected_path: connection_paths.get(&release.connection_id).copied(),
+                        setup_duration_ms: release.setup_duration.as_millis(),
+                    })?;
                     emitter.emit(&LifecycleRecord::TunnelTerminal {
                         component_side: p2x_net::lifecycle::ComponentSide::Server,
                         peer_id: &peer,

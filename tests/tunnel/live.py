@@ -153,6 +153,7 @@ class Run:
         self.private = ["orders", "tunnel"]
         self.client_token, client_digest = token("client")
         self.server_token, server_digest = token("server")
+        self.payload_sentinel = "p2x-" + secrets.token_urlsafe(16)
         self.exchange_peer = self.identity("exchange")
         self.server_peer = self.identity("server")
         self.client_peer = self.identity("client")
@@ -371,6 +372,47 @@ def one_terminal(path: pathlib.Path) -> dict:
         raise Failure(f"{path.name}: expected one terminal, got {len(terminals)}")
     return terminals[0]
 
+def assert_tunnel_lifecycle(case: str, client_rows: list[dict], server_rows: list[dict]) -> dict[str, bool]:
+    client_accepted = [row for row in client_rows if row.get("event") == "tunnel_accepted"]
+    server_accepted = [row for row in server_rows if row.get("event") == "tunnel_accepted"]
+    client_terminal = [row for row in client_rows if row.get("event") == "tunnel_terminal"]
+    server_terminal = [row for row in server_rows if row.get("event") == "tunnel_terminal"]
+    expected = {"accepted": False, "terminal_correlation": False, "directional_bytes": False, "idle_terminal_class": False}
+    if not client_accepted and not server_accepted:
+        if client_terminal or server_terminal:
+            raise Failure(f"{case} emitted a tunnel terminal without Accepted")
+        expected["accepted"] = case in {"upstream-refused", "upstream-timeout", "idle-timeout"}
+        if case == "idle-timeout":
+            raise Failure("idle-timeout did not reach Accepted")
+        return expected
+    if len(client_accepted) != len(server_accepted):
+        raise Failure(f"{case} Accepted cardinality differs: client={len(client_accepted)} server={len(server_accepted)}")
+    client_keys = {(row.get("request_id_hash"), row.get("stream_id_hash")) for row in client_accepted}
+    server_keys = {(row.get("request_id_hash"), row.get("stream_id_hash")) for row in server_accepted}
+    if client_keys != server_keys or len(client_keys) != len(client_accepted):
+        raise Failure(f"{case} Accepted correlation mismatch")
+    if len(client_terminal) != len(client_accepted) or len(server_terminal) != len(server_accepted):
+        raise Failure(f"{case} terminal cardinality mismatch")
+    client_terminals = {(row.get("request_id_hash"), row.get("stream_id_hash")): row for row in client_terminal}
+    server_terminals = {(row.get("request_id_hash"), row.get("stream_id_hash")): row for row in server_terminal}
+    if set(client_terminals) != client_keys or set(server_terminals) != server_keys:
+        raise Failure(f"{case} terminal correlation mismatch")
+    for key in client_keys:
+        client_row = client_terminals[key]
+        server_row = server_terminals[key]
+        if client_row.get("local_to_remote_bytes") != server_row.get("local_to_remote_bytes"):
+            raise Failure(f"{case} local-to-remote counters differ for {key}")
+        if client_row.get("remote_to_local_bytes") != server_row.get("remote_to_local_bytes"):
+            raise Failure(f"{case} remote-to-local counters differ for {key}")
+    expected["accepted"] = True
+    expected["terminal_correlation"] = True
+    expected["directional_bytes"] = True
+    if case == "idle-timeout":
+        if not any(row.get("terminal_class") == "idle_timeout" and row.get("code") == "upstream.idle_timeout" for row in server_terminal):
+            raise Failure("idle-timeout did not emit idle_timeout terminal class with public code")
+        expected["idle_terminal_class"] = True
+    return expected
+
 
 def run_case(root: pathlib.Path, case: str) -> None:
     run = Run(root, case)
@@ -393,6 +435,8 @@ def run_case(root: pathlib.Path, case: str) -> None:
         client = None if case == "concurrent-streams" else socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
         if client is not None:
             client.settimeout(900 if case.startswith("large-slow") else 60)
+            if case not in {"upstream-refused", "upstream-timeout", "idle-timeout"}:
+                wait_for(client_log, lambda row: row.get("event") == "tunnel_accepted", 45)
         if case == "stream-limits":
             assert client is not None
             wait_for(server_log, lambda row: row.get("event") == "proxy_authorization" and row.get("authorized") is True, 45)
@@ -504,7 +548,8 @@ def run_case(root: pathlib.Path, case: str) -> None:
             else:
                 assert client is not None
                 if case.startswith("large-slow"):
-                    block = b"p2x-tunnel-sentinel-" + b"x" * (64 * 1024 - 20)
+                    sentinel = run.payload_sentinel.encode()
+                    block = sentinel + b"x" * (64 * 1024 - len(sentinel))
                     expected = hashlib.sha256()
                     for offset in range(0, payload_size, len(block)):
                         expected.update(block[: min(len(block), payload_size - offset)])
@@ -551,7 +596,8 @@ def run_case(root: pathlib.Path, case: str) -> None:
                     if digest.digest() != expected.digest():
                         raise Failure("large stream hash mismatch")
                 else:
-                    payload = (b"p2x-tunnel-sentinel-" + secrets.token_bytes(max(32, payload_size - 20)))[:payload_size]
+                    sentinel = run.payload_sentinel.encode()
+                    payload = (sentinel + secrets.token_bytes(max(32, payload_size - len(sentinel))))[:payload_size]
                     send_error: list[BaseException] = []
                     def send_payload() -> None:
                         try:
@@ -593,8 +639,10 @@ def run_case(root: pathlib.Path, case: str) -> None:
                 raise Failure("path-loss-recovery did not terminate and replace the active stream")
             if not any(row.get("event") == "connection_observed" and row.get("state") == "closed" for row in read_rows(client_log)):
                 raise Failure("path-loss-recovery did not observe selected path loss")
-        all_output = "\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
+        client_rows = read_rows(client_log)
         server_rows = read_rows(server_log)
+        lifecycle_assertions = assert_tunnel_lifecycle(case, client_rows, server_rows)
+        all_output = "\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
         if case == "concurrent-streams" and sum(row.get("authorized") is True for row in server_rows if row.get("event") == "proxy_authorization") < 64:
             raise Failure("concurrent-streams did not authorize 64 independent streams")
         if case == "stream-limits" and not any(row.get("code") == "limit.proxy_streams" and not row.get("authorized") for row in server_rows):
@@ -631,7 +679,14 @@ def run_case(root: pathlib.Path, case: str) -> None:
             raise Failure("upstream refusal was not classified")
         if case == "upstream-timeout" and not any(row.get("code") == "upstream.connect_timeout" and not row.get("authorized") for row in server_rows):
             raise Failure("upstream timeout was not classified")
-        for marker in [run.client_token, run.server_token, "raw_ticket", "token_secret", "session_id", "127.0.0.1:" + str(run.upstream_port)]:
+        accepted = [row for row in read_rows(client_log) if row.get("event") == "tunnel_accepted"]
+        terminals = [row for row in read_rows(client_log) if row.get("event") == "tunnel_terminal"]
+        if case not in {"upstream-refused", "upstream-timeout", "idle-timeout"} and not accepted:
+            raise Failure(f"{case} did not observe tunnel acceptance")
+        if len(terminals) > len(accepted):
+            raise Failure(f"{case} emitted more tunnel terminals than accepted streams")
+        payload_sentinel = "p2x-tunnel-sentinel-"
+        for marker in [run.client_token, run.server_token, "raw_ticket", "token_secret", "session_id", "service: orders", "upstream_id: orders", payload_sentinel, "127.0.0.1:" + str(run.upstream_port)]:
             if marker in all_output:
                 raise Failure(f"privacy scan found {marker}")
         if case != "shutdown-cancellation":
@@ -640,7 +695,19 @@ def run_case(root: pathlib.Path, case: str) -> None:
         run.stop(exchange_log)
         for path in (client_log, server_log, exchange_log):
             one_terminal(path)
-        summary = {"case": case, "passed": True, "observed_assertions": {"accepted_and_opaque_bytes": case not in {"upstream-refused", "upstream-timeout", "idle-timeout"}, "upstream_failure_or_idle": case in {"upstream-refused", "upstream-timeout", "idle-timeout"}, "privacy_scan_clean": True, "one_terminal_each": True, "case_specific_assertions": case in {"concurrent-streams", "stream-limits", "large-slow-direct", "large-slow-relay", "control-loss-direct", "path-loss-recovery", "shutdown-cancellation"}}}
+        summary = {
+            "case": case,
+            "passed": True,
+            "observed_assertions": {
+                "accepted_and_opaque_bytes": lifecycle_assertions["accepted"],
+                "upstream_failure_or_idle": case in {"upstream-refused", "upstream-timeout", "idle-timeout"},
+                "terminal_correlation": lifecycle_assertions["terminal_correlation"],
+                "directional_bytes": lifecycle_assertions["directional_bytes"],
+                "idle_terminal_class": lifecycle_assertions["idle_terminal_class"],
+                "privacy_scan_clean": True,
+                "one_terminal_each": True,
+            },
+        }
         (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
         print(json.dumps(summary, sort_keys=True), flush=True)
     finally:
