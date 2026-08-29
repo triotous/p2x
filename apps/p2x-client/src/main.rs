@@ -250,6 +250,8 @@ struct Args {
     test_delay_after_resolve_ms: Option<u64>,
     #[arg(long, hide = true)]
     test_replay_first_ticket: bool,
+    #[arg(long, hide = true)]
+    test_fail_first_resolve: bool,
     #[arg(long, hide = true, value_enum, default_value_t = OpenMutation::None)]
     test_open_mutation: OpenMutation,
     #[arg(long, hide = true)]
@@ -685,6 +687,7 @@ async fn main() -> io::Result<()> {
         || args.test_proxy_concurrency.is_some()
         || args.test_delay_after_resolve_ms.is_some()
         || args.test_replay_first_ticket
+        || args.test_fail_first_resolve
         || !matches!(args.test_open_mutation, OpenMutation::None)
         || args.test_fail_first_direct_open_before_handshake
         || args.test_hold_proxy_handshake_ms.is_some()
@@ -950,6 +953,7 @@ async fn main() -> io::Result<()> {
     let mut proxy_request_id: Option<[u8; 16]> = None;
     let mut selected_proxy_connection: Option<libp2p::swarm::ConnectionId> = None;
     let mut test_direct_failure_applied = false;
+    let mut test_first_resolve_failure_applied = false;
     let mut proxy_setup_deadline: Option<std::time::Instant> = None;
     let mut proxy_capabilities: Option<p2x_protocol::Capabilities> = None;
     let mut proxy_attempt: Option<PathAttempt> = None;
@@ -1264,6 +1268,12 @@ async fn main() -> io::Result<()> {
                             reject_ingress(&mut ingress_owners, id, PublicErrorCode::AuthSessionRequired, &emitter).await?;
                             continue;
                         };
+                        if args.test_fail_first_resolve && !test_first_resolve_failure_applied {
+                            test_first_resolve_failure_applied = true;
+                            emitter.emit(&LifecycleRecord::TestFaultApplied { fault: "fail_first_resolve" })?;
+                            reject_ingress(&mut ingress_owners, id, PublicErrorCode::RegistryOffline, &emitter).await?;
+                            continue;
+                        }
                         let Some(owner) = route_owner.as_mut() else {
                             reject_ingress(&mut ingress_owners, id, PublicErrorCode::LimitProxyStreams, &emitter).await?;
                             continue;
@@ -1624,17 +1634,25 @@ async fn main() -> io::Result<()> {
                                         &mut route_wire_sequence,
                                         vec![action],
                                     )?;
-                                    for (_, server, _, _) in completed_actions {
-                                        if let (Some(manager), Some(server)) =
-                                            (connection_manager.as_mut(), server)
-                                        {
-                                            release_route_setup(
-                                                manager,
-                                                &mut swarm,
-                                                server,
-                                                open_id,
-                                            );
-                                        }
+                                    if complete_route_actions(
+                                        product_ingress,
+                                        completed_actions,
+                                        &mut resolver_state,
+                                        &mut route_resolve_wires,
+                                        &mut route_proxy_requests,
+                                        &mut ingress_owners,
+                                        route_owner.as_mut().expect("route owner exists"),
+                                        expected_exchange,
+                                        &connections,
+                                        &mut route_wire_sequence,
+                                        &mut connection_manager,
+                                        &mut swarm,
+                                        &emitter,
+                                        &args.case_id,
+                                    )
+                                    .await?
+                                    {
+                                        return Ok(());
                                     }
                                 }
                                 continue;

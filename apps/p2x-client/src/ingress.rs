@@ -131,7 +131,11 @@ async fn accept_loop(
             _ = shutdown.cancelled() => break,
             accepted = bound.listener.accept() => accepted,
         };
-        let Ok((socket, _)) = accepted else { break };
+        let (socket, _) = match accepted {
+            Ok(accepted) => accepted,
+            Err(_) if shutdown.is_cancelled() => break,
+            Err(_) => continue,
+        };
         let id = IngressId(next_id.fetch_add(1, Ordering::Relaxed).saturating_add(1));
         let route_id = bound.config.route_id.clone();
         let Ok(permit) = permits.clone().try_acquire_owned() else {
