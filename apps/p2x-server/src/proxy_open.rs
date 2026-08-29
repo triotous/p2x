@@ -244,6 +244,9 @@ pub async fn run_worker(
                 )
                 .await
                 {
+                    Ok(()) if Duration::from_millis(delay) >= upstream.connect_timeout => {
+                        Err(super::upstream::ConnectError::Timeout)
+                    }
                     Ok(()) => {
                         super::upstream::connect(
                             &upstream,
