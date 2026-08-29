@@ -317,6 +317,28 @@ fn finish_proxy_worker(
     finish_proxy_worker_record(release, record, admission, swarm, connection_paths, emitter)
 }
 
+fn release_from_worker_record(
+    worker_id: proxy_open::ProxyWorkerId,
+    record: p2x_server::proxy_owner::WorkerRecord,
+    code: PublicErrorCode,
+) -> proxy_open::Release {
+    proxy_open::Release {
+        worker_id,
+        peer_id: record.peer_id,
+        connection_id: record.connection_id,
+        selected_path: record.selected_path,
+        setup_duration: record.setup_duration,
+        admission: record
+            .admission
+            .unwrap_or_else(stream_admission::AdmissionToken::empty),
+        request_id_hash: record.request_id_hash,
+        stream_id_hash: record.stream_id_hash,
+        accepted: record.accepted,
+        code: Some(code),
+        pump: None,
+    }
+}
+
 fn finish_proxy_worker_record(
     release: proxy_open::Release,
     record: p2x_server::proxy_owner::WorkerRecord,
@@ -771,19 +793,11 @@ async fn main() -> io::Result<()> {
                         let record = proxy_worker_table
                             .remove(worker_id)
                             .ok_or_else(|| io::Error::other("proxy worker panic owner missing"))?;
-                        let release = proxy_open::Release {
+                        let release = release_from_worker_record(
                             worker_id,
-                            peer_id: record.peer_id,
-                            connection_id: record.connection_id,
-                            selected_path: record.selected_path,
-                            setup_duration: record.setup_duration,
-                            admission: record.admission.unwrap_or_else(stream_admission::AdmissionToken::empty),
-                            request_id_hash: record.request_id_hash,
-                            stream_id_hash: record.stream_id_hash,
-                            accepted: record.accepted,
-                            code: Some(PublicErrorCode::PeerConnectionFailed),
-                            pump: None,
-                        };
+                            record,
+                            PublicErrorCode::PeerConnectionFailed,
+                        );
                         finish_proxy_worker_record(release, record, proxy_owner.stream_admission_mut(), &mut swarm, &connection_paths, &emitter)?;
                     }
                 }
@@ -1462,6 +1476,46 @@ async fn main() -> io::Result<()> {
     proxy_owner.clear_tickets();
     connection_paths.clear();
     if !proxy_worker_table.is_empty() {
+        proxy_workers.abort_all();
+        while let Some(result) = proxy_workers.join_next_with_id().await {
+            match result {
+                Ok((task_id, release)) => {
+                    proxy_worker_tasks.remove(&task_id);
+                    finish_proxy_worker(
+                        release,
+                        &mut proxy_worker_table,
+                        proxy_owner.stream_admission_mut(),
+                        &mut swarm,
+                        &connection_paths,
+                        &emitter,
+                    )?;
+                }
+                Err(error) => {
+                    let task_id = error.id();
+                    let worker_id = proxy_worker_tasks
+                        .remove(&task_id)
+                        .ok_or_else(|| io::Error::other("aborted proxy worker owner missing"))?;
+                    let record = proxy_worker_table
+                        .remove(worker_id)
+                        .ok_or_else(|| io::Error::other("aborted proxy worker record missing"))?;
+                    let release = release_from_worker_record(
+                        worker_id,
+                        record,
+                        PublicErrorCode::PeerDraining,
+                    );
+                    finish_proxy_worker_record(
+                        release,
+                        record,
+                        proxy_owner.stream_admission_mut(),
+                        &mut swarm,
+                        &connection_paths,
+                        &emitter,
+                    )?;
+                }
+            }
+        }
+    }
+    if !proxy_worker_table.is_empty() || !proxy_worker_tasks.is_empty() {
         return Err(io::Error::other(
             "proxy worker table leaked during shutdown",
         ));
