@@ -252,14 +252,15 @@ impl ClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
     fn file(body: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "p2x-routes-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::write(&path, body).unwrap();
         path

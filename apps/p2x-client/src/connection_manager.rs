@@ -73,11 +73,7 @@ impl ConnectionManager {
         if let Some(state) = self.peers.get_mut(&server) {
             if state.draining
                 || state.pending >= self.limits.max_pending_per_server
-                || state.pending.saturating_add(state.active)
-                    >= self
-                        .limits
-                        .max_streams_per_server
-                        .max(self.limits.max_pending_per_server)
+                || state.pending.saturating_add(state.active) >= self.limits.max_streams_per_server
             {
                 return Err(PublicErrorCode::LimitPeerConnections);
             }
@@ -256,12 +252,19 @@ impl ConnectionManager {
         self.pending -= 1;
         true
     }
-    pub fn mark_active(&mut self, server: PeerId) {
-        if let Some(state) = self.peers.get_mut(&server) {
-            state.active += 1;
-            self.sequence = self.sequence.saturating_add(1);
-            state.last_used = self.sequence;
+    pub fn promote_active(&mut self, server: PeerId) -> bool {
+        let Some(state) = self.peers.get_mut(&server) else {
+            return false;
+        };
+        if state.pending == 0 {
+            return false;
         }
+        state.pending -= 1;
+        self.pending -= 1;
+        state.active += 1;
+        self.sequence = self.sequence.saturating_add(1);
+        state.last_used = self.sequence;
+        true
     }
 
     pub fn on_connection_established(
@@ -302,10 +305,15 @@ impl ConnectionManager {
             .on_dcutr_succeeded(server, connection_id, now)
     }
 
-    pub fn close_active(&mut self, server: PeerId) {
-        if let Some(state) = self.peers.get_mut(&server) {
-            state.active = state.active.saturating_sub(1);
+    pub fn close_active(&mut self, server: PeerId) -> bool {
+        let Some(state) = self.peers.get_mut(&server) else {
+            return false;
+        };
+        if state.active == 0 {
+            return false;
         }
+        state.active -= 1;
+        true
     }
 
     pub fn waiter_count(&self, server: PeerId) -> usize {
@@ -410,10 +418,11 @@ impl ConnectionManager {
         Ok((attempt, actions))
     }
 
-    pub fn finish_path(&mut self, server: PeerId, selected: Option<PathDecision>) {
-        self.release(server);
+    pub fn finish_path(&mut self, server: PeerId, selected: Option<PathDecision>) -> bool {
         if selected.is_some() {
-            self.mark_active(server);
+            self.promote_active(server)
+        } else {
+            self.release(server)
         }
     }
 
@@ -544,6 +553,29 @@ mod tests {
         assert!(manager.release(second));
         assert!(!manager.release(second));
         assert_eq!(manager.pending_count(), 0);
+    }
+
+    #[test]
+    fn asymmetric_total_limit_is_not_widened_by_pending_limit() {
+        let mut manager = ConnectionManager::new(
+            PeerId::random(),
+            PathPolicy::default(),
+            SetupLimits {
+                max_peer_states: 1,
+                max_pending_setups: 8,
+                max_pending_per_server: 8,
+                max_streams_per_server: 1,
+            },
+        );
+        let server = PeerId::random();
+        manager.admit(server).unwrap();
+        assert_eq!(
+            manager.admit(server),
+            Err(PublicErrorCode::LimitPeerConnections)
+        );
+        assert!(manager.release(server));
+        assert!(manager.admit(server).is_ok());
+        assert!(manager.release(server));
     }
 
     #[test]
@@ -727,7 +759,10 @@ mod tests {
         );
         manager.finish_path(server, Some(PathDecision::Direct(direct)));
         assert_eq!(manager.active_count(server), 1);
-        manager.finish_path(server, None);
+        assert!(manager.close_active(server));
+        assert!(!manager.close_active(server));
+        assert!(manager.release(server));
+        assert!(!manager.finish_path(server, None));
         assert_eq!(manager.pending_count(), 0);
     }
 

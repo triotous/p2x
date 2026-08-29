@@ -1264,6 +1264,7 @@ async fn main() -> io::Result<()> {
                             ingress::PreAcceptCause::Deadline => PublicErrorCode::PeerSetupTimeout,
                             ingress::PreAcceptCause::Shutdown => PublicErrorCode::ExchangeDraining,
                         };
+                        let route_id = ingress_route.remove(&id).unwrap_or_default();
                         let _ = ingress_by_id.remove(&id);
                         if let Some(cancel) = ingress_cancel.remove(&id) { cancel.cancel(); }
                         if let Some(open_id) = open_by_ingress
@@ -1293,7 +1294,7 @@ async fn main() -> io::Result<()> {
                             }
                         }
                         emitter.emit(&LifecycleRecord::IngressRejected {
-                            route_id_hash: 0,
+                            route_id_hash: stable_hash(&route_id),
                             ingress_id: id.0,
                             code: code.as_str(),
                         })?;
@@ -1321,7 +1322,9 @@ async fn main() -> io::Result<()> {
                         if let Some((server, _connection, open_id, _, _)) = active_ingress.remove(&id)
                             && let Some(manager) = connection_manager.as_mut()
                         {
-                            manager.close_active(server);
+                            if !manager.close_active(server) {
+                                return Err(io::Error::other("connection manager active release missing"));
+                            }
                             manager.release_waiter(server, open_id.0);
                         }
                     }
@@ -1402,7 +1405,9 @@ async fn main() -> io::Result<()> {
                                 let command = ingress_by_id.remove(&ingress_id).ok_or_else(|| io::Error::other("ingress command missing"))?;
                                 if let Some(manager) = connection_manager.as_mut() {
                                     let selected = if connections.is_direct(handoff.server, handoff.connection) { PathDecision::Direct(handoff.connection) } else { PathDecision::Relay(handoff.connection) };
-                                    manager.finish_path(handoff.server, Some(selected));
+                                    if !manager.finish_path(handoff.server, Some(selected)) {
+                                    return Err(io::Error::other("connection manager active promotion missing"));
+                                }
                                 }
                                 active_ingress.insert(
                                     ingress_id,
@@ -1427,7 +1432,9 @@ async fn main() -> io::Result<()> {
                                 if command.send(IngressCommand::StartTunnel { stream: Box::new(stream) }).await.is_err() {
                                     active_ingress.remove(&ingress_id);
                                     if let Some(manager) = connection_manager.as_mut() {
-                                        manager.close_active(handoff.server);
+                                        if !manager.close_active(handoff.server) {
+                                            return Err(io::Error::other("connection manager active release missing"));
+                                        }
                                         manager.release_waiter(handoff.server, open_id.0);
                                     }
                                 }
@@ -1590,8 +1597,12 @@ async fn main() -> io::Result<()> {
                                 } else {
                                     PathDecision::Relay(connection)
                                 };
-                                manager.finish_path(server, Some(selected));
-                                manager.close_active(server);
+                                if !manager.finish_path(server, Some(selected)) {
+                                    return Err(io::Error::other("connection manager active promotion missing"));
+                                }
+                                if !manager.close_active(server) {
+                                    return Err(io::Error::other("connection manager active release missing"));
+                                }
                             }
                             let peer = proxy_server.ok_or_else(|| io::Error::other("proxy authorization peer missing"))?;
                             proxy_completed = proxy_completed.saturating_add(1);
