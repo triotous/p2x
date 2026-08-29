@@ -1,0 +1,23 @@
+[session] 20260829T130431Z
+[plan] 06b-raw-tcp-tunnel-phase-gate-closure.md
+[baseline] Started from clean feat/06-raw-tcp-proxy-tunnel at 66fe260; Plans 06, 06a, and 06b were not modified.
+[decision] Do not claim Plan 06b closure from the existing representative loopback runner or from partial owner scaffolds. Any unconnected scaffold was discarded before final validation.
+[validation] Existing committed local corrections were retained: c03c5d8 deterministic proxy pump failure/drop coverage; ee3b4ff preserved pump setup/runtime errors; e74f9b8 bounded server promotion/ack/Accepted transitions; 53f7264 expired server transition tests; 7e20e0e shutdown admission leak detection; cc85e74 route waiter promotion; 3804bc9 deterministic pump cancellation test; cc7afc3 server cancellation test; 66fe260 mandatory final zero server resource emission.
+[action] Re-ran cargo fmt --all -- --check.
+[result] cargo fmt passed.
+[action] Re-ran cargo clippy --workspace --all-targets --all-features -- -D warnings.
+[result] workspace Clippy passed.
+[action] Re-ran cargo test --workspace --all-targets --all-features.
+[result] workspace all-target tests passed: all package/library/binary/network/owner/pump tests green; p2x-proxy 10 tests, p2x-server 23 library + 9 binary + owner pipeline tests, and all other workspace targets passed.
+[action] Re-ran cargo deny check.
+[result] advisories, bans, licenses, and sources passed; duplicate-version findings remain warnings.
+[action] Re-ran cargo tree -e features.
+[result] feature tree passed (1993 output lines).
+[action] Re-ran python3 -m compileall -q tests and removed generated __pycache__ directories.
+[result] Python syntax check passed; bytecode removed.
+[action] Re-ran git diff --check, plan diff scan, process scan, and worktree scan.
+[result] diff check passed; no plan changes, no residual P2X process, no Python cache, and final worktree clean.
+[blocker] 06b Definition of Done is not complete: client parallel ingress maps and active_ingress remain; the centralized product completion transaction and immutable Accepted handoff are not connected; server proxy workers still use a release channel, saturating worker decrement, and task ownership outside JoinSet/owner table; owner_pipeline.rs still manually recreates production admission ordering; tunnel/live.py still has unconditional privacy_scan_clean and one_terminal_each, stale hard-coded privacy markers, representative 64-only concurrency, optional final resources, and four-buffer resource claim; explicit 06b recovery/limit/shutdown/deadline/correlation/128/resource subcases are absent.
+[blocker] Plan 06 §5.5 remains owner-executed and incomplete: Linux namespace/firewall, cross-host/NAT topology, native/container matrix, and long-running 64/128 loss/reconnect/churn/RSS/FD soak.
+[status] This session does not certify Plan 06b completion and does not make Plan 07 eligible. The canonical manual/local entry point remains ./tests/tunnel/local.sh --case all, but it is not evidence for the missing 06b gates.
+[commit] pending append-only session log commit.
