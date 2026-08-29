@@ -2,28 +2,36 @@ use crate::{config::LocalUpstream, stream_admission::AdmissionToken};
 use futures::io::{AsyncRead, AsyncWrite};
 use libp2p::{PeerId, swarm::ConnectionId};
 use p2x_config::ticket_key::VerificationKeyRing;
-use p2x_net::proxy_codec;
+use p2x_net::{probe::ProbePath, proxy_codec};
 use p2x_protocol::{OpenProxyStreamV1, ProxyOpenResponseV1, PublicError, PublicErrorCode};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProxyWorkerId(pub u64);
+
 pub struct Promotion {
+    pub worker_id: ProxyWorkerId,
     pub admission: AdmissionToken,
     pub acknowledged: oneshot::Sender<bool>,
 }
 
 #[derive(Clone)]
 pub struct Accepted {
+    pub worker_id: ProxyWorkerId,
     pub peer_id: PeerId,
     pub connection_id: ConnectionId,
+    pub selected_path: ProbePath,
     pub setup_duration: Duration,
     pub request_id_hash: u64,
     pub stream_id_hash: u64,
 }
 
 pub struct Release {
+    pub worker_id: ProxyWorkerId,
     pub peer_id: PeerId,
     pub connection_id: ConnectionId,
+    pub selected_path: ProbePath,
     pub setup_duration: Duration,
     pub admission: AdmissionToken,
     pub request_id_hash: u64,
@@ -44,8 +52,10 @@ pub enum ServerDecision {
 }
 
 pub struct Candidate {
+    pub worker_id: ProxyWorkerId,
     pub peer_id: PeerId,
     pub connection_id: ConnectionId,
+    pub selected_path: ProbePath,
     pub deadline: std::time::Instant,
     pub open: Result<OpenProxyStreamV1, PublicErrorCode>,
     pub validation: Result<super::ticket_admission::ValidationCandidate, PublicErrorCode>,
@@ -89,18 +99,17 @@ async fn bounded_ack(
     }
 }
 
-async fn bounded_accepted(
+async fn reserve_accepted(
     accepts: &mpsc::Sender<Accepted>,
-    accepted: Accepted,
     deadline: std::time::Instant,
     cancel: &tokio_util::sync::CancellationToken,
-) -> bool {
+) -> Option<mpsc::OwnedPermit<Accepted>> {
     tokio::select! {
-        _ = cancel.cancelled() => false,
-        sent = tokio::time::timeout(
+        _ = cancel.cancelled() => None,
+        permit = tokio::time::timeout(
             deadline.saturating_duration_since(std::time::Instant::now()),
-            accepts.send(accepted),
-        ) => sent.is_ok_and(|result| result.is_ok()),
+            accepts.clone().reserve_owned(),
+        ) => permit.ok().and_then(Result::ok),
     }
 }
 
@@ -119,10 +128,20 @@ async fn write_response_bounded<T: AsyncWrite + Unpin>(
     }
 }
 
+fn transition_failure_code(shutdown: &tokio_util::sync::CancellationToken) -> PublicErrorCode {
+    if shutdown.is_cancelled() {
+        PublicErrorCode::PeerDraining
+    } else {
+        PublicErrorCode::PeerSetupTimeout
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_worker(
+    worker_id: ProxyWorkerId,
     peer_id: PeerId,
     connection_id: ConnectionId,
+    selected_path: ProbePath,
     mut stream: libp2p::swarm::Stream,
     verification_ring: Option<VerificationKeyRing>,
     now: i64,
@@ -130,11 +149,10 @@ pub async fn run_worker(
     hold_handshake_ms: Option<u64>,
     hold_dial_ms: Option<u64>,
     candidates: mpsc::Sender<Candidate>,
-    releases: mpsc::Sender<Release>,
     accepts: mpsc::Sender<Accepted>,
     promotions: mpsc::Sender<Promotion>,
     shutdown: tokio_util::sync::CancellationToken,
-) {
+) -> Release {
     let (decision, response) = oneshot::channel();
     let started = std::time::Instant::now();
     let worker_deadline = started + Duration::from_secs(5);
@@ -157,39 +175,30 @@ pub async fn run_worker(
             .await
             .is_err()
         {
-            let code = if shutdown.is_cancelled() {
-                PublicErrorCode::PeerDraining
-            } else {
-                PublicErrorCode::PeerSetupTimeout
-            };
+            let code = transition_failure_code(&shutdown);
             if let Ok(open) = open.as_ref() {
                 let response = ProxyOpenResponseV1::Rejected {
                     request_id: Some(open.request_id),
                     error: PublicError::new(code, true),
                 };
-                let _ = tokio::time::timeout(
-                    worker_deadline.saturating_duration_since(std::time::Instant::now()),
-                    proxy_codec::write_response(&mut stream, &response),
-                )
-                .await;
+                let _ =
+                    write_response_bounded(&mut stream, &response, worker_deadline, &cancel).await;
             }
-            let request_id_hash = request_id
-                .map(p2x_net::lifecycle::stable_hash)
-                .unwrap_or_default();
-            release(
-                &releases,
+            return release(
+                worker_id,
                 peer_id,
                 connection_id,
+                selected_path,
                 started.elapsed(),
                 AdmissionToken::empty(),
-                request_id_hash,
+                request_id
+                    .map(p2x_net::lifecycle::stable_hash)
+                    .unwrap_or_default(),
                 None,
                 false,
                 Some(code),
                 None,
-            )
-            .await;
-            return;
+            );
         }
     }
     let validation = match (&verification_ring, open.as_ref()) {
@@ -211,8 +220,10 @@ pub async fn run_worker(
         (_, Err(_)) => Err(PublicErrorCode::ProtocolMalformed),
     };
     let candidate = Candidate {
+        worker_id,
         peer_id,
         connection_id,
+        selected_path,
         deadline: worker_deadline,
         open: open.clone(),
         validation,
@@ -226,10 +237,11 @@ pub async fn run_worker(
         ) => result.is_ok_and(|result| result.is_ok()),
     };
     if !candidate_sent {
-        release(
-            &releases,
+        return release(
+            worker_id,
             peer_id,
             connection_id,
+            selected_path,
             started.elapsed(),
             AdmissionToken::empty(),
             request_id
@@ -237,11 +249,9 @@ pub async fn run_worker(
                 .unwrap_or_default(),
             None,
             false,
-            Some(PublicErrorCode::PeerSetupTimeout),
+            Some(transition_failure_code(&shutdown)),
             None,
-        )
-        .await;
-        return;
+        );
     }
     let decision = tokio::select! {
         _ = cancel.cancelled() => ServerDecision::Reject(ProxyOpenResponseV1::Rejected {
@@ -265,6 +275,7 @@ pub async fn run_worker(
     let mut accepted = false;
     let mut code = None;
     let mut pump = None;
+    let mut accepted_setup_duration = None;
     let admission = match decision {
         ServerDecision::Reject(response) => {
             if let ProxyOpenResponseV1::Rejected { error, .. } = &response {
@@ -281,20 +292,19 @@ pub async fn run_worker(
         } => {
             stream_id_hash = Some(p2x_net::lifecycle::stable_hash(stream_id));
             let Ok(open) = open.as_ref() else {
-                release(
-                    &releases,
+                return release(
+                    worker_id,
                     peer_id,
                     connection_id,
+                    selected_path,
                     started.elapsed(),
                     admission,
                     request_id_hash,
                     stream_id_hash,
                     false,
+                    Some(PublicErrorCode::ProtocolMalformed),
                     None,
-                    None,
-                )
-                .await;
-                return;
+                );
             };
             let remaining = worker_deadline.saturating_duration_since(std::time::Instant::now());
             let dial = match hold_dial_ms {
@@ -326,6 +336,7 @@ pub async fn run_worker(
                     if !bounded_promotion(
                         &promotions,
                         Promotion {
+                            worker_id,
                             admission,
                             acknowledged,
                         },
@@ -336,21 +347,50 @@ pub async fn run_worker(
                         || !bounded_ack(ack, worker_deadline, &cancel).await
                     {
                         drop(socket);
-                        release(
-                            &releases,
+                        return release(
+                            worker_id,
                             peer_id,
                             connection_id,
+                            selected_path,
                             started.elapsed(),
                             admission,
                             request_id_hash,
                             stream_id_hash,
                             false,
-                            Some(PublicErrorCode::ExchangeDraining),
+                            Some(transition_failure_code(&shutdown)),
                             None,
+                        );
+                    }
+                    let Some(accepted_permit) =
+                        reserve_accepted(&accepts, worker_deadline, &cancel).await
+                    else {
+                        let failure = transition_failure_code(&shutdown);
+                        let response = ProxyOpenResponseV1::Rejected {
+                            request_id: Some(open.request_id),
+                            error: PublicError::new(failure, true),
+                        };
+                        let _ = write_response_bounded(
+                            &mut stream,
+                            &response,
+                            worker_deadline,
+                            &cancel,
                         )
                         .await;
-                        return;
-                    }
+                        drop(socket);
+                        return release(
+                            worker_id,
+                            peer_id,
+                            connection_id,
+                            selected_path,
+                            started.elapsed(),
+                            admission,
+                            request_id_hash,
+                            stream_id_hash,
+                            false,
+                            Some(failure),
+                            None,
+                        );
+                    };
                     let response = ProxyOpenResponseV1::Accepted {
                         request_id: open.request_id,
                         stream_id,
@@ -360,26 +400,17 @@ pub async fn run_worker(
                         .await
                     {
                         accepted = true;
-                        if !bounded_accepted(
-                            &accepts,
-                            Accepted {
-                                peer_id,
-                                connection_id,
-                                setup_duration: started.elapsed(),
-                                request_id_hash,
-                                stream_id_hash: p2x_net::lifecycle::stable_hash(stream_id),
-                            },
-                            worker_deadline,
-                            &cancel,
-                        )
-                        .await
-                        {
-                            code = Some(if shutdown.is_cancelled() {
-                                PublicErrorCode::PeerDraining
-                            } else {
-                                PublicErrorCode::PeerSetupTimeout
-                            });
-                        }
+                        let setup_duration = started.elapsed();
+                        accepted_setup_duration = Some(setup_duration);
+                        accepted_permit.send(Accepted {
+                            worker_id,
+                            peer_id,
+                            connection_id,
+                            selected_path,
+                            setup_duration,
+                            request_id_hash,
+                            stream_id_hash: p2x_net::lifecycle::stable_hash(stream_id),
+                        });
                         pump = p2x_proxy::pump(
                             stream,
                             tokio_util::compat::TokioAsyncReadCompatExt::compat(socket),
@@ -396,13 +427,18 @@ pub async fn run_worker(
                         }
                     } else {
                         code = Some(PublicErrorCode::ProtocolMalformed);
+                        drop(socket);
                     }
                 }
                 Err(error) => {
-                    code = Some(error.code());
+                    code = Some(if cancel.is_cancelled() && shutdown.is_cancelled() {
+                        PublicErrorCode::PeerDraining
+                    } else {
+                        error.code()
+                    });
                     let response = ProxyOpenResponseV1::Rejected {
                         request_id: Some(open.request_id),
-                        error: PublicError::new(error.code(), true),
+                        error: PublicError::new(code.expect("dial code is set"), true),
                     };
                     let _ =
                         write_response_bounded(&mut stream, &response, worker_deadline, &cancel)
@@ -413,10 +449,11 @@ pub async fn run_worker(
         }
     };
     release(
-        &releases,
+        worker_id,
         peer_id,
         connection_id,
-        started.elapsed(),
+        selected_path,
+        accepted_setup_duration.unwrap_or_else(|| started.elapsed()),
         admission,
         request_id_hash,
         stream_id_hash,
@@ -424,14 +461,14 @@ pub async fn run_worker(
         code,
         pump,
     )
-    .await;
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn release(
-    releases: &mpsc::Sender<Release>,
+fn release(
+    worker_id: ProxyWorkerId,
     peer_id: PeerId,
     connection_id: ConnectionId,
+    selected_path: ProbePath,
     setup_duration: Duration,
     admission: AdmissionToken,
     request_id_hash: u64,
@@ -439,20 +476,20 @@ async fn release(
     accepted: bool,
     code: Option<PublicErrorCode>,
     pump: Option<p2x_proxy::PumpResult>,
-) {
-    let _ = releases
-        .send(Release {
-            peer_id,
-            connection_id,
-            setup_duration,
-            admission,
-            request_id_hash,
-            stream_id_hash,
-            accepted,
-            code,
-            pump,
-        })
-        .await;
+) -> Release {
+    Release {
+        worker_id,
+        peer_id,
+        connection_id,
+        selected_path,
+        setup_duration,
+        admission,
+        request_id_hash,
+        stream_id_hash,
+        accepted,
+        code,
+        pump,
+    }
 }
 
 pub async fn reject_stream<T: AsyncRead + AsyncWrite + Unpin>(
@@ -508,8 +545,9 @@ mod tests {
             bounded_promotion(
                 &promotions,
                 Promotion {
+                    worker_id: ProxyWorkerId(1),
                     admission: AdmissionToken::empty(),
-                    acknowledged
+                    acknowledged,
                 },
                 std::time::Instant::now() + Duration::from_secs(1),
                 &tokio_util::sync::CancellationToken::new(),
@@ -531,12 +569,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_channel_reservation_is_bounded() {
+        let (accepts, mut received) = mpsc::channel(1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let permit = reserve_accepted(
+            &accepts,
+            deadline,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        permit.send(Accepted {
+            worker_id: ProxyWorkerId(1),
+            peer_id: PeerId::random(),
+            connection_id: ConnectionId::new_unchecked(1),
+            selected_path: ProbePath::Direct,
+            setup_duration: Duration::ZERO,
+            request_id_hash: 1,
+            stream_id_hash: 2,
+        });
+        assert!(received.recv().await.is_some());
+        accepts
+            .send(Accepted {
+                worker_id: ProxyWorkerId(2),
+                peer_id: PeerId::random(),
+                connection_id: ConnectionId::new_unchecked(2),
+                selected_path: ProbePath::Direct,
+                setup_duration: Duration::ZERO,
+                request_id_hash: 3,
+                stream_id_hash: 4,
+            })
+            .await
+            .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        assert!(
+            reserve_accepted(&accepts, deadline, &cancel)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn expired_transition_returns_without_waiting() {
         let (promotions, mut received) = mpsc::channel(1);
         let (filler_ack, _filler_rx) = oneshot::channel();
         let (acknowledged, _ack) = oneshot::channel();
         promotions
             .send(Promotion {
+                worker_id: ProxyWorkerId(1),
                 admission: AdmissionToken::empty(),
                 acknowledged: filler_ack,
             })
@@ -548,8 +629,9 @@ mod tests {
             !bounded_promotion(
                 &promotions,
                 Promotion {
+                    worker_id: ProxyWorkerId(2),
                     admission: AdmissionToken::empty(),
-                    acknowledged
+                    acknowledged,
                 },
                 deadline,
                 &cancel,
@@ -557,65 +639,6 @@ mod tests {
             .await
         );
         let _ = received.recv().await;
-        let (accepts, mut accepted_received) = mpsc::channel(1);
-        accepts
-            .send(Accepted {
-                peer_id: PeerId::random(),
-                connection_id: ConnectionId::new_unchecked(2),
-                setup_duration: Duration::ZERO,
-                request_id_hash: 3,
-                stream_id_hash: 4,
-            })
-            .await
-            .unwrap();
-        assert!(
-            !bounded_accepted(
-                &accepts,
-                Accepted {
-                    peer_id: PeerId::random(),
-                    connection_id: ConnectionId::new_unchecked(1),
-                    setup_duration: Duration::ZERO,
-                    request_id_hash: 1,
-                    stream_id_hash: 2,
-                },
-                deadline,
-                &cancel,
-            )
-            .await
-        );
-        let _ = accepted_received.recv().await;
-    }
-
-    #[tokio::test]
-    async fn full_accepted_channel_expires_without_waiting() {
-        let (accepts, _received) = mpsc::channel(1);
-        let accepted = Accepted {
-            peer_id: PeerId::random(),
-            connection_id: ConnectionId::new_unchecked(1),
-            setup_duration: Duration::ZERO,
-            request_id_hash: 1,
-            stream_id_hash: 2,
-        };
-        assert!(
-            bounded_accepted(
-                &accepts,
-                accepted.clone(),
-                std::time::Instant::now() + Duration::from_secs(1),
-                &tokio_util::sync::CancellationToken::new(),
-            )
-            .await
-        );
-        let cancel = tokio_util::sync::CancellationToken::new();
-        cancel.cancel();
-        assert!(
-            !bounded_accepted(
-                &accepts,
-                accepted,
-                std::time::Instant::now() + Duration::from_secs(1),
-                &cancel,
-            )
-            .await
-        );
     }
 
     #[test]

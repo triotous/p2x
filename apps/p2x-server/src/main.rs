@@ -31,9 +31,11 @@ use p2x_protocol::{
     AuthRequest, AuthResponse, Capabilities, InstanceId, PublicErrorCode, RegistryRequestV1,
     RegistryResponseV1, Role,
 };
-use p2x_server::{config, proxy_open, stream_admission, ticket_admission};
+use p2x_server::{
+    config, proxy_open, proxy_owner::ProxyWorkerTable, stream_admission, ticket_admission,
+};
 use std::{collections::HashMap, io, path::PathBuf};
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinSet};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -288,6 +290,105 @@ fn registry_retry_at(operation: &mut RegistryOperation, now_millis: i64, jitter:
     let delay = (250i64 << shift).min(10_000);
     now_millis.saturating_add(delay + delay * i64::from(jitter.clamp(-100, 100)) / 1000)
 }
+
+fn proxy_terminal_class(terminal: p2x_proxy::Terminal) -> p2x_net::lifecycle::TunnelTerminalClass {
+    match terminal {
+        p2x_proxy::Terminal::Complete => p2x_net::lifecycle::TunnelTerminalClass::Complete,
+        p2x_proxy::Terminal::IdleTimeout => p2x_net::lifecycle::TunnelTerminalClass::IdleTimeout,
+        p2x_proxy::Terminal::Cancelled => p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
+        p2x_proxy::Terminal::LocalIo => p2x_net::lifecycle::TunnelTerminalClass::LocalIo,
+        p2x_proxy::Terminal::RemoteIo => p2x_net::lifecycle::TunnelTerminalClass::RemoteIo,
+    }
+}
+
+fn finish_proxy_worker(
+    release: proxy_open::Release,
+    workers: &mut ProxyWorkerTable,
+    admission: &mut stream_admission::StreamAdmission,
+    swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
+    connection_paths: &HashMap<libp2p::swarm::ConnectionId, ProbePath>,
+    emitter: &Emitter,
+) -> io::Result<()> {
+    let record = workers
+        .remove(release.worker_id)
+        .ok_or_else(|| io::Error::other("proxy worker completion missing owner"))?;
+    if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
+        proxy.inbound_release_on(release.peer_id, release.connection_id);
+    }
+    let owned_admission = record
+        .admission
+        .or_else(|| (!release.admission.is_empty()).then_some(release.admission));
+    if let Some(admission_token) = owned_admission
+        && !admission.release(admission_token)
+    {
+        return Err(io::Error::other(
+            "proxy stream admission released more than once",
+        ));
+    }
+    let accepted = release.accepted || record.accepted;
+    let selected_path = if accepted {
+        record.selected_path
+    } else {
+        release.selected_path
+    };
+    let setup_duration = if record.accepted {
+        record.setup_duration
+    } else {
+        release.setup_duration
+    };
+    let request_id_hash = if record.accepted {
+        record.request_id_hash
+    } else {
+        release.request_id_hash
+    };
+    let stream_id_hash = if record.accepted {
+        record.stream_id_hash
+    } else {
+        release.stream_id_hash
+    };
+    let peer = release.peer_id.to_string();
+    if accepted {
+        let pump = release.pump;
+        emitter.emit(&LifecycleRecord::TunnelTerminal {
+            component_side: p2x_net::lifecycle::ComponentSide::Server,
+            peer_id: &peer,
+            connection_id_hash: stable_hash(release.connection_id),
+            request_id_hash,
+            stream_id_hash,
+            selected_path: Some(selected_path),
+            accepted: true,
+            code: release.code.map(PublicErrorCode::as_str),
+            terminal_class: pump.as_ref().map_or(
+                p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
+                |result| proxy_terminal_class(result.terminal),
+            ),
+            setup_duration_ms: setup_duration.as_millis(),
+            local_to_remote_bytes: pump
+                .as_ref()
+                .map_or(0, |result| result.local_to_remote_bytes),
+            remote_to_local_bytes: pump
+                .as_ref()
+                .map_or(0, |result| result.remote_to_local_bytes),
+            local_eof: pump.as_ref().is_some_and(|result| result.local_eof),
+            remote_eof: pump.as_ref().is_some_and(|result| result.remote_eof),
+            duration_ms: pump
+                .as_ref()
+                .map_or(0, |result| result.duration.as_millis()),
+        })?;
+    } else if let Some(code) = release.code {
+        emitter.emit(&LifecycleRecord::ProxyAuthorization {
+            peer_id: &peer,
+            connection_id_hash: stable_hash(release.connection_id),
+            request_id_hash,
+            stream_id_hash,
+            authorized: false,
+            code: Some(code.as_str()),
+        })?;
+    }
+    let _ = connection_paths;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args = Args::parse();
@@ -443,8 +544,6 @@ async fn main() -> io::Result<()> {
         .as_ref()
         .map_or(256, |config| config.proxy.max_workers);
     let (proxy_tx, mut proxy_rx) = mpsc::channel::<proxy_open::Candidate>(proxy_limit);
-    let (proxy_release_tx, mut proxy_release_rx) =
-        mpsc::channel::<proxy_open::Release>(proxy_limit);
     let (proxy_promotion_tx, mut proxy_promotion_rx) =
         mpsc::channel::<proxy_open::Promotion>(proxy_limit);
     let (proxy_accept_tx, mut proxy_accept_rx) = mpsc::channel::<proxy_open::Accepted>(proxy_limit);
@@ -458,7 +557,8 @@ async fn main() -> io::Result<()> {
             )
         },
     );
-    let mut proxy_workers = 0usize;
+    let mut proxy_workers = JoinSet::new();
+    let mut proxy_worker_table = ProxyWorkerTable::default();
     let mut resource_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut first_probe_dropped = false;
     let mut request_ids = p2x_protocol::CorrelationIdGenerator::new(request_id_start()?);
@@ -628,68 +728,26 @@ async fn main() -> io::Result<()> {
                 let connections = connection_book.as_ref().map(ConnectionBook::len).unwrap_or(connection_paths.len());
                 let pending_opens = swarm.behaviour().probe_stream.as_ref().map_or(0, |probe| probe.pending_count())
                     + swarm.behaviour().proxy_stream.as_ref().map_or(0, |proxy| proxy.pending_count());
-                let configured_proxy_workers = swarm
-                    .behaviour()
-                    .proxy_stream
-                    .as_ref()
-                    .map_or(0, |proxy| proxy.inbound_count());
+                let configured_proxy_workers = proxy_worker_table.len();
                 emitter.emit(&LifecycleRecord::Resources { connections, pending_opens, workers: worker_admission.admitted() + configured_proxy_workers, tasks: worker_admission.admitted() + configured_proxy_workers })?;
                 if !proxy_admission.is_empty() {
                     emitter.emit(&LifecycleRecord::Resources {
                         connections,
                         pending_opens,
-                        workers: proxy_admission.len(),
+                        workers: proxy_worker_table.len(),
                         tasks: proxy_admission.dialing(),
                     })?;
                 }
             }
-            Some(release) = proxy_release_rx.recv() => {
-                if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() { proxy.inbound_release_on(release.peer_id, release.connection_id); }
-                if !release.admission.is_empty() && !proxy_admission.release(release.admission) {
-                    return Err(io::Error::other("proxy stream admission released more than once"));
-                }
-                let peer = release.peer_id.to_string();
-                if release.accepted {
-                    emitter.emit(&LifecycleRecord::TunnelTerminal {
-                        component_side: p2x_net::lifecycle::ComponentSide::Server,
-                        peer_id: &peer,
-                        connection_id_hash: stable_hash(release.connection_id),
-                        request_id_hash: release.request_id_hash,
-                        stream_id_hash: release.stream_id_hash,
-                        selected_path: connection_paths.get(&release.connection_id).copied(),
-                        accepted: true,
-                        code: release.code.map(PublicErrorCode::as_str),
-                        terminal_class: release.pump.map_or(
-                            p2x_net::lifecycle::TunnelTerminalClass::Complete,
-                            |result| match result.terminal {
-                                p2x_proxy::Terminal::Complete => p2x_net::lifecycle::TunnelTerminalClass::Complete,
-                                p2x_proxy::Terminal::IdleTimeout => p2x_net::lifecycle::TunnelTerminalClass::IdleTimeout,
-                                p2x_proxy::Terminal::Cancelled => p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
-                                p2x_proxy::Terminal::LocalIo => p2x_net::lifecycle::TunnelTerminalClass::LocalIo,
-                                p2x_proxy::Terminal::RemoteIo => p2x_net::lifecycle::TunnelTerminalClass::RemoteIo,
-                            },
-                        ),
-                        setup_duration_ms: release.setup_duration.as_millis(),
-                        local_to_remote_bytes: release.pump.map_or(0, |result| result.local_to_remote_bytes),
-                        remote_to_local_bytes: release.pump.map_or(0, |result| result.remote_to_local_bytes),
-                        local_eof: release.pump.is_some_and(|result| result.local_eof),
-                        remote_eof: release.pump.is_some_and(|result| result.remote_eof),
-                        duration_ms: release.pump.map_or(0, |result| result.duration.as_millis()),
-                    })?;
-                } else if let Some(code) = release.code {
-                    emitter.emit(&LifecycleRecord::ProxyAuthorization {
-                        peer_id: &peer,
-                        connection_id_hash: stable_hash(release.connection_id),
-                        request_id_hash: release.request_id_hash,
-                        stream_id_hash: release.stream_id_hash,
-                        authorized: false,
-                        code: Some(code.as_str()),
-                    })?;
-                }
-                proxy_workers = proxy_workers.saturating_sub(1);
+            Some(result) = proxy_workers.join_next() => {
+                let release = result.map_err(|_| io::Error::other("proxy worker panicked"))?;
+                finish_proxy_worker(release, &mut proxy_worker_table, &mut proxy_admission, &mut swarm, &connection_paths, &emitter)?;
             }
             Some(promotion) = proxy_promotion_rx.recv() => {
-                let acknowledged = proxy_admission.promote(promotion.admission);
+                let acknowledged = proxy_worker_table
+                    .get(promotion.worker_id)
+                    .is_some_and(|record| record.admission == Some(promotion.admission))
+                    && proxy_admission.promote(promotion.admission);
                 let _ = promotion.acknowledged.send(acknowledged);
                 if !acknowledged {
                     return Err(io::Error::other("proxy stream promotion failed"));
@@ -703,7 +761,7 @@ async fn main() -> io::Result<()> {
                     connection_id_hash: stable_hash(accepted.connection_id),
                     request_id_hash: accepted.request_id_hash,
                     stream_id_hash: accepted.stream_id_hash,
-                    selected_path: connection_paths.get(&accepted.connection_id).copied(),
+                    selected_path: Some(accepted.selected_path),
                     setup_duration_ms: accepted.setup_duration.as_millis(),
                 })?;
             }
@@ -832,6 +890,11 @@ async fn main() -> io::Result<()> {
                     authorized,
                     code,
                 })?;
+                if let proxy_open::ServerDecision::Admit { admission, .. } = &decision {
+                    proxy_worker_table
+                        .attach_admission(candidate.worker_id, *admission)
+                        .map_err(io::Error::other)?;
+                }
                 if let Err(proxy_open::ServerDecision::Admit { admission, .. }) = candidate.decision.send(decision) {
                     let _ = proxy_admission.release(admission);
                 }
@@ -1010,11 +1073,14 @@ async fn main() -> io::Result<()> {
                         let message = format!("{reason:?}"); emitter.emit(&LifecycleRecord::OperationalError { code: "listener.closed", message: &message })?;
                     }
                     SwarmEvent::Behaviour(PeerEvent::Proxy(p2x_net::proxy_stream::behaviour::ProxyOutput::InboundOpened { peer_id, connection_id, stream })) => {
-                        proxy_workers += 1;
+                        let selected_path = connection_paths.get(&connection_id).copied().unwrap_or(ProbePath::Relay);
+                        let worker_id = proxy_worker_table.insert(peer_id, connection_id, selected_path);
                         let tx = proxy_tx.clone();
-                        tokio::spawn(proxy_open::run_worker(
+                        proxy_workers.spawn(proxy_open::run_worker(
+                            worker_id,
                             peer_id,
                             connection_id,
+                            selected_path,
                             stream,
                             verification_ring.clone(),
                             unix_now(),
@@ -1022,7 +1088,6 @@ async fn main() -> io::Result<()> {
                             args.test_hold_proxy_handshake_ms,
                             args.test_hold_upstream_dial_ms,
                             tx,
-                            proxy_release_tx.clone(),
                             proxy_accept_tx.clone(),
                             proxy_promotion_tx.clone(),
                             shutdown.child_token(),
@@ -1293,7 +1358,7 @@ async fn main() -> io::Result<()> {
         proxy.set_draining(true);
     }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while (worker_admission.admitted() > 0 || proxy_workers > 0)
+    while (worker_admission.admitted() > 0 || !proxy_worker_table.is_empty())
         && tokio::time::Instant::now() < deadline
     {
         tokio::select! {
@@ -1325,6 +1390,14 @@ async fn main() -> io::Result<()> {
                 ));
             }
             Some(accepted) = proxy_accept_rx.recv() => {
+                proxy_worker_table
+                    .mark_accepted(
+                        accepted.worker_id,
+                        accepted.setup_duration,
+                        accepted.request_id_hash,
+                        accepted.stream_id_hash,
+                    )
+                    .map_err(io::Error::other)?;
                 let peer = accepted.peer_id.to_string();
                 emitter.emit(&LifecycleRecord::TunnelAccepted {
                     component_side: p2x_net::lifecycle::ComponentSide::Server,
@@ -1332,53 +1405,13 @@ async fn main() -> io::Result<()> {
                     connection_id_hash: stable_hash(accepted.connection_id),
                     request_id_hash: accepted.request_id_hash,
                     stream_id_hash: accepted.stream_id_hash,
-                    selected_path: connection_paths.get(&accepted.connection_id).copied(),
+                    selected_path: Some(accepted.selected_path),
                     setup_duration_ms: accepted.setup_duration.as_millis(),
                 })?;
             }
-            Some(release) = proxy_release_rx.recv() => {
-                if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
-                    proxy.inbound_release_on(release.peer_id, release.connection_id);
-                }
-                if release.accepted {
-                    let peer = release.peer_id.to_string();
-                    emitter.emit(&LifecycleRecord::TunnelTerminal {
-                        component_side: p2x_net::lifecycle::ComponentSide::Server,
-                        peer_id: &peer,
-                        connection_id_hash: stable_hash(release.connection_id),
-                        request_id_hash: release.request_id_hash,
-                        stream_id_hash: release.stream_id_hash,
-                        selected_path: connection_paths.get(&release.connection_id).copied(),
-                        accepted: true,
-                        code: release.code.map(PublicErrorCode::as_str),
-                        terminal_class: release.pump.map_or(
-                            p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
-                            |result| match result.terminal {
-                                p2x_proxy::Terminal::Complete => p2x_net::lifecycle::TunnelTerminalClass::Complete,
-                                p2x_proxy::Terminal::IdleTimeout => p2x_net::lifecycle::TunnelTerminalClass::IdleTimeout,
-                                p2x_proxy::Terminal::Cancelled => p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
-                                p2x_proxy::Terminal::LocalIo => p2x_net::lifecycle::TunnelTerminalClass::LocalIo,
-                                p2x_proxy::Terminal::RemoteIo => p2x_net::lifecycle::TunnelTerminalClass::RemoteIo,
-                            },
-                        ),
-                        setup_duration_ms: release.setup_duration.as_millis(),
-                        local_to_remote_bytes: release.pump.map_or(0, |result| result.local_to_remote_bytes),
-                        remote_to_local_bytes: release.pump.map_or(0, |result| result.remote_to_local_bytes),
-                        local_eof: release.pump.is_some_and(|result| result.local_eof),
-                        remote_eof: release.pump.is_some_and(|result| result.remote_eof),
-                        duration_ms: release.pump.map_or(0, |result| result.duration.as_millis()),
-                    })?;
-                } else if let Some(code) = release.code {
-                    emitter.emit(&LifecycleRecord::ProxyAuthorization {
-                        peer_id: &release.peer_id.to_string(),
-                        connection_id_hash: stable_hash(release.connection_id),
-                        request_id_hash: release.request_id_hash,
-                        stream_id_hash: release.stream_id_hash,
-                        authorized: false,
-                        code: Some(code.as_str()),
-                    })?;
-                }
-                proxy_workers = proxy_workers.saturating_sub(1);
+            Some(result) = proxy_workers.join_next() => {
+                let release = result.map_err(|_| io::Error::other("proxy worker panicked during shutdown"))?;
+                finish_proxy_worker(release, &mut proxy_worker_table, &mut proxy_admission, &mut swarm, &connection_paths, &emitter)?;
             }
             Some(promotion) = proxy_promotion_rx.recv() => {
                 let _ = promotion.acknowledged.send(false);
@@ -1447,6 +1480,11 @@ async fn main() -> io::Result<()> {
     availability.stopped();
     ticket_admission.clear();
     connection_paths.clear();
+    if !proxy_worker_table.is_empty() {
+        return Err(io::Error::other(
+            "proxy worker table leaked during shutdown",
+        ));
+    }
     emitter.emit(&LifecycleRecord::Resources {
         connections: 0,
         pending_opens: 0,
