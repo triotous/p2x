@@ -9,9 +9,9 @@ use p2x_protocol::{
     ServiceAdvertisementV1, ServiceSet, Tenant, TokenDigest, UpstreamId,
 };
 use p2x_server::{
-    config::LocalUpstream,
-    stream_admission::{AdmissionToken, StreamAdmission},
-    ticket_admission::{TicketAdmission, TicketAdmissionLedger},
+    proxy_open::{Candidate, ProxyWorkerId, ServerDecision},
+    proxy_owner::{ProxyDecisionContext, ServerProxyOwner},
+    ticket_admission::TicketAdmissionLedger,
     upstream,
 };
 use std::{
@@ -171,31 +171,66 @@ async fn actual_resolution_ticket_flows_through_server_owner_once() {
             socket.write_all(&buffer[..count]).await.unwrap();
         }
     });
-    let upstream = Arc::new(LocalUpstream {
-        advertisement: service.clone(),
-        connect: upstream_address,
-        connect_timeout: Duration::from_secs(1),
-        idle_timeout: Duration::from_secs(1),
-        concurrency_limit: 1,
-    });
-    let mut admission = TicketAdmissionLedger::new(8, 0).unwrap();
-    let candidate = admission
+    let verification_admission = TicketAdmissionLedger::new(8, 0).unwrap();
+    let candidate = verification_admission
         .verify_candidate(&ring, open.ticket.as_bytes(), 1)
         .unwrap();
-    let stream_id = admission.allocate_stream_id(&candidate, 1).unwrap();
-    let token = AdmissionToken::new(stream_id);
-    let mut streams = StreamAdmission::new(1, 1, 1);
-    streams
-        .reserve(token, client, open.upstream_id.clone(), 1)
-        .unwrap();
-    assert_eq!(
-        admission.consume_candidate_with_stream_id(candidate.clone(), stream_id, 1),
-        TicketAdmission::Authorized(stream_id)
+    let config_path =
+        std::env::temp_dir().join(format!("p2x-owner-service-{}", std::process::id()));
+    std::fs::write(
+        &config_path,
+        format!(
+            "schema_version: 1\nregistration: {{}}\nservices:\n- upstream_id: orders\n  selector:\n    protocol: tcp\n    metadata: {{service: orders}}\n  enabled: true\n  connect: {}\n  connect_timeout_ms: 1000\n  idle_timeout_ms: 1000\n  concurrency_limit: 1\nproxy:\n  max_workers: 1\n  max_workers_per_client: 1\n  max_upstream_dials: 1\n  copy_buffer_bytes: 32768\n  max_replay_entries: 8\n  ticket_clock_skew: 0\n",
+            upstream_address
+        ),
+    )
+    .unwrap();
+    let service_config = p2x_server::config::ServiceConfig::load(&config_path).unwrap();
+    let mut owner = ServerProxyOwner::new(
+        TicketAdmissionLedger::new(8, 0).unwrap(),
+        Some(service_config),
     );
+    let (decision_tx, _decision_rx) = tokio::sync::oneshot::channel();
+    let candidate_for_owner = Candidate {
+        worker_id: ProxyWorkerId(1),
+        peer_id: client,
+        connection_id: ConnectionId::new_unchecked(1),
+        selected_path: p2x_net::probe::ProbePath::Direct,
+        deadline: std::time::Instant::now() + Duration::from_secs(5),
+        open: Ok(open.clone()),
+        validation: Ok(candidate.clone()),
+        decision: decision_tx,
+    };
+    let decision = owner.decide(
+        &candidate_for_owner,
+        ProxyDecisionContext {
+            issuer: exchange,
+            server,
+            tenant: &tenant,
+            registration_revision: Some(registration_revision),
+            registration_expires_at,
+            authorization_revision: 1,
+            now: 1,
+        },
+    );
+    let (stream_id, token, upstream, copy_buffer_bytes) = match decision {
+        ServerDecision::Admit {
+            stream_id,
+            admission,
+            upstream,
+            copy_buffer_bytes,
+        } => {
+            assert_eq!(stream_id, admission.stream_id);
+            (stream_id, admission, upstream, copy_buffer_bytes)
+        }
+        ServerDecision::Reject(response) => {
+            panic!("production owner rejected valid open: {response:?}")
+        }
+    };
     let socket = upstream::connect(&upstream, Duration::from_secs(1), CancellationToken::new())
         .await
         .unwrap();
-    assert!(streams.promote(token));
+    assert!(owner.promote(token));
     let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
     let accepted = p2x_protocol::ProxyOpenResponseV1::Accepted {
         request_id: open.request_id,
@@ -211,7 +246,7 @@ async fn actual_resolution_ticket_flows_through_server_owner_once() {
         p2x_proxy::pump(
             server_stream,
             socket.compat(),
-            p2x_proxy::MIN_COPY_BUFFER,
+            copy_buffer_bytes,
             Duration::from_secs(1),
             futures::future::pending(),
         )
@@ -246,24 +281,36 @@ async fn actual_resolution_ticket_flows_through_server_owner_once() {
     assert_eq!(pump.remote_to_local_bytes, 18);
     assert_eq!(pump.terminal, p2x_proxy::Terminal::Complete);
     assert_eq!(upstream_connections.load(Ordering::Relaxed), 1);
-    assert!(streams.release(token));
-    assert!(streams.is_empty());
-    assert_eq!(
-        admission.authorize_candidate(
-            candidate,
-            exchange,
-            client,
-            server,
-            &tenant,
-            &service,
-            Some(registration_revision),
-            registration_expires_at,
-            1,
-            &open,
-            1,
+    assert!(owner.release(token));
+    assert!(owner.stream_admission().is_empty());
+    let (replay_tx, _replay_rx) = tokio::sync::oneshot::channel();
+    let replay = Candidate {
+        worker_id: ProxyWorkerId(2),
+        peer_id: client,
+        connection_id: ConnectionId::new_unchecked(1),
+        selected_path: p2x_net::probe::ProbePath::Direct,
+        deadline: std::time::Instant::now() + Duration::from_secs(5),
+        open: Ok(open),
+        validation: Ok(candidate),
+        decision: replay_tx,
+    };
+    assert!(matches!(
+        owner.decide(
+            &replay,
+            ProxyDecisionContext {
+                issuer: exchange,
+                server,
+                tenant: &tenant,
+                registration_revision: Some(registration_revision),
+                registration_expires_at,
+                authorization_revision: 1,
+                now: 1,
+            },
         ),
-        TicketAdmission::Rejected(p2x_protocol::PublicErrorCode::AuthTicketReplayed)
-    );
+        ServerDecision::Reject(p2x_protocol::ProxyOpenResponseV1::Rejected { error, .. })
+            if error.code == p2x_protocol::PublicErrorCode::AuthTicketReplayed
+    ));
     assert_eq!(upstream_connections.load(Ordering::Relaxed), 1);
+    let _ = std::fs::remove_file(config_path);
     echo.abort();
 }
