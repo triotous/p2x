@@ -12,6 +12,7 @@ pub struct Promotion {
     pub acknowledged: oneshot::Sender<bool>,
 }
 
+#[derive(Clone)]
 pub struct Accepted {
     pub peer_id: PeerId,
     pub connection_id: ConnectionId,
@@ -57,6 +58,50 @@ async fn read_open<T: AsyncRead + Unpin>(
     proxy_codec::read_open(stream)
         .await
         .map_err(|_| PublicErrorCode::ProtocolMalformed)
+}
+
+async fn bounded_promotion(
+    promotions: &mpsc::Sender<Promotion>,
+    promotion: Promotion,
+    deadline: std::time::Instant,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> bool {
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        sent = tokio::time::timeout(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            promotions.send(promotion),
+        ) => sent.is_ok_and(|result| result.is_ok()),
+    }
+}
+
+async fn bounded_ack(
+    ack: oneshot::Receiver<bool>,
+    deadline: std::time::Instant,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> bool {
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        result = tokio::time::timeout(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            ack,
+        ) => result.is_ok_and(|result| result.unwrap_or(false)),
+    }
+}
+
+async fn bounded_accepted(
+    accepts: &mpsc::Sender<Accepted>,
+    accepted: Accepted,
+    deadline: std::time::Instant,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> bool {
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        sent = tokio::time::timeout(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            accepts.send(accepted),
+        ) => sent.is_ok_and(|result| result.is_ok()),
+    }
 }
 
 async fn write_response_bounded<T: AsyncWrite + Unpin>(
@@ -278,17 +323,17 @@ pub async fn run_worker(
             match dial {
                 Ok(socket) => {
                     let (acknowledged, ack) = oneshot::channel();
-                    if promotions
-                        .send(Promotion {
+                    if !bounded_promotion(
+                        &promotions,
+                        Promotion {
                             admission,
                             acknowledged,
-                        })
-                        .await
-                        .is_err()
-                        || !tokio::select! {
-                            _ = cancel.cancelled() => false,
-                            acknowledged = ack => acknowledged.unwrap_or(false),
-                        }
+                        },
+                        worker_deadline,
+                        &cancel,
+                    )
+                    .await
+                        || !bounded_ack(ack, worker_deadline, &cancel).await
                     {
                         drop(socket);
                         release(
@@ -315,15 +360,26 @@ pub async fn run_worker(
                         .await
                     {
                         accepted = true;
-                        let _ = accepts
-                            .send(Accepted {
+                        if !bounded_accepted(
+                            &accepts,
+                            Accepted {
                                 peer_id,
                                 connection_id,
                                 setup_duration: started.elapsed(),
                                 request_id_hash,
                                 stream_id_hash: p2x_net::lifecycle::stable_hash(stream_id),
-                            })
-                            .await;
+                            },
+                            worker_deadline,
+                            &cancel,
+                        )
+                        .await
+                        {
+                            code = Some(if shutdown.is_cancelled() {
+                                PublicErrorCode::PeerDraining
+                            } else {
+                                PublicErrorCode::PeerSetupTimeout
+                            });
+                        }
                         pump = p2x_proxy::pump(
                             stream,
                             tokio_util::compat::TokioAsyncReadCompatExt::compat(socket),
@@ -442,6 +498,68 @@ mod tests {
         frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
         frame.extend_from_slice(&body);
         frame
+    }
+
+    #[tokio::test]
+    async fn promotion_and_ack_are_bounded_by_deadline_and_cancellation() {
+        let (promotions, mut received) = mpsc::channel(1);
+        let (acknowledged, ack) = oneshot::channel();
+        assert!(
+            bounded_promotion(
+                &promotions,
+                Promotion {
+                    admission: AdmissionToken::empty(),
+                    acknowledged
+                },
+                std::time::Instant::now() + Duration::from_secs(1),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+        );
+        let promotion = received.recv().await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let _ = promotion.acknowledged.send(true);
+        assert!(
+            !bounded_ack(
+                ack,
+                std::time::Instant::now() + Duration::from_secs(1),
+                &cancel,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn full_accepted_channel_expires_without_waiting() {
+        let (accepts, _received) = mpsc::channel(1);
+        let accepted = Accepted {
+            peer_id: PeerId::random(),
+            connection_id: ConnectionId::new_unchecked(1),
+            setup_duration: Duration::ZERO,
+            request_id_hash: 1,
+            stream_id_hash: 2,
+        };
+        assert!(
+            bounded_accepted(
+                &accepts,
+                accepted.clone(),
+                std::time::Instant::now() + Duration::from_secs(1),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        assert!(
+            !bounded_accepted(
+                &accepts,
+                accepted,
+                std::time::Instant::now() + Duration::from_secs(1),
+                &cancel,
+            )
+            .await
+        );
     }
 
     #[test]
