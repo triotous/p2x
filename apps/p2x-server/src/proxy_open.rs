@@ -112,6 +112,22 @@ pub async fn run_worker(
             .await
             .is_err()
         {
+            let code = if shutdown.is_cancelled() {
+                PublicErrorCode::PeerDraining
+            } else {
+                PublicErrorCode::PeerSetupTimeout
+            };
+            if let Ok(open) = open.as_ref() {
+                let response = ProxyOpenResponseV1::Rejected {
+                    request_id: Some(open.request_id),
+                    error: PublicError::new(code, true),
+                };
+                let _ = tokio::time::timeout(
+                    worker_deadline.saturating_duration_since(std::time::Instant::now()),
+                    proxy_codec::write_response(&mut stream, &response),
+                )
+                .await;
+            }
             let request_id_hash = request_id
                 .map(p2x_net::lifecycle::stable_hash)
                 .unwrap_or_default();
@@ -124,7 +140,7 @@ pub async fn run_worker(
                 request_id_hash,
                 None,
                 false,
-                Some(PublicErrorCode::PeerSetupTimeout),
+                Some(code),
                 None,
             )
             .await;

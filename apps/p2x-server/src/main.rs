@@ -676,9 +676,7 @@ async fn main() -> io::Result<()> {
                         remote_eof: release.pump.is_some_and(|result| result.remote_eof),
                         duration_ms: release.pump.map_or(0, |result| result.duration.as_millis()),
                     })?;
-                } else if !release.admission.is_empty()
-                    && let Some(code) = release.code
-                {
+                } else if let Some(code) = release.code {
                     emitter.emit(&LifecycleRecord::ProxyAuthorization {
                         peer_id: &peer,
                         connection_id_hash: stable_hash(release.connection_id),
@@ -1369,6 +1367,15 @@ async fn main() -> io::Result<()> {
                         local_eof: release.pump.is_some_and(|result| result.local_eof),
                         remote_eof: release.pump.is_some_and(|result| result.remote_eof),
                         duration_ms: release.pump.map_or(0, |result| result.duration.as_millis()),
+                    })?;
+                } else if let Some(code) = release.code {
+                    emitter.emit(&LifecycleRecord::ProxyAuthorization {
+                        peer_id: &release.peer_id.to_string(),
+                        connection_id_hash: stable_hash(release.connection_id),
+                        request_id_hash: release.request_id_hash,
+                        stream_id_hash: release.stream_id_hash,
+                        authorized: false,
+                        code: Some(code.as_str()),
                     })?;
                 }
                 proxy_workers = proxy_workers.saturating_sub(1);
