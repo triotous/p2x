@@ -1378,14 +1378,27 @@ async fn main() -> io::Result<()> {
                         let Some(active) = ingress_owners.take_active(id) else {
                             continue;
                         };
-                        let result = result.map_err(io::Error::other)?;
-                        emit_client_tunnel_terminal(
-                            &emitter,
-                            &active,
-                            Some(&result),
-                            tunnel_terminal_class(result.terminal),
-                            None,
-                        )?;
+                        match result {
+                            Ok(result) => {
+                                emit_client_tunnel_terminal(
+                                    &emitter,
+                                    &active,
+                                    Some(&result),
+                                    tunnel_terminal_class(result.terminal),
+                                    None,
+                                )?;
+                            }
+                            Err(error) => {
+                                emit_client_tunnel_terminal(
+                                    &emitter,
+                                    &active,
+                                    None,
+                                    p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
+                                    Some("internal.pump_setup"),
+                                )?;
+                                let _ = error;
+                            }
+                        }
                         if let Some(manager) = connection_manager.as_mut() {
                             if !manager.close_active(active.server) {
                                 return Err(io::Error::other("connection manager active release missing"));
