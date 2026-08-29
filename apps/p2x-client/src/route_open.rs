@@ -487,6 +487,16 @@ impl RouteOpenSupervisor {
         })
     }
 
+    pub fn cancel_with_promotion(
+        &mut self,
+        resolver: &mut ResolverState,
+        open_id: OpenId,
+    ) -> (Option<RouteAction>, Vec<RouteAction>) {
+        let completed = self.cancel(resolver, open_id);
+        let promoted = self.promote_waiters(resolver);
+        (completed, promoted)
+    }
+
     pub fn accepted(
         &mut self,
         open_id: OpenId,
@@ -819,6 +829,23 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    #[test]
+    fn cancellation_promotes_the_next_same_selector_waiter() {
+        let mut owner = RouteOpenSupervisor::new(2);
+        let mut resolver = ResolverState::default();
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        let (first, _) = owner
+            .admit(&mut resolver, binding(), [2; 16], selector(), 1, deadline)
+            .unwrap();
+        let (second, _) = owner
+            .admit(&mut resolver, binding(), [2; 16], selector(), 1, deadline)
+            .unwrap();
+        let (completed, promoted) = owner.cancel_with_promotion(&mut resolver, first);
+        assert!(completed.is_some());
+        assert!(promoted.iter().any(|action| matches!(action, RouteAction::SendResolve { open_id, .. } if *open_id == second)));
+        assert_eq!(resolver.pending(), 1);
     }
 
     #[test]
