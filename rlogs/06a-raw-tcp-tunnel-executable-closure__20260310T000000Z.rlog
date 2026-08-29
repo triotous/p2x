@@ -10,3 +10,6 @@
 [action] Phase D: added closed lifecycle side/path/terminal-class fields, setup timing propagation, bounded scheduler fairness, and complete PumpResult mapping on both components.
 [validation] Workspace check, workspace tests, workspace Clippy with -D warnings, fmt check, and proxy network tests passed.
 [commit] d0490dd Complete tunnel lifecycle evidence and fairness.
+[action] Phase E: reordered server admission so capacity reservation precedes replay consume, added explicit stream-ID allocation/consume APIs with fresh time validation, and extended owner_pipeline through immutable TCP connect, Accepted, opaque bytes, pump counters, release, and replay rejection.
+[validation] Workspace check, workspace tests, workspace Clippy with -D warnings, fmt check, and owner_pipeline test passed.
+[commit] 1026946 Extend raw tunnel owner pipeline.
