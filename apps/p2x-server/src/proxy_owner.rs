@@ -121,6 +121,7 @@ pub struct ProxyDecisionContext<'a> {
 pub struct ServerProxyOwner {
     ticket_admission: TicketAdmissionLedger,
     stream_admission: StreamAdmission,
+    worker_admissions: HashMap<ProxyWorkerId, AdmissionToken>,
     service_config: Option<ServiceConfig>,
 }
 
@@ -144,6 +145,7 @@ impl ServerProxyOwner {
                 max_workers_per_client,
                 max_upstream_dials,
             ),
+            worker_admissions: HashMap::new(),
             service_config,
         }
     }
@@ -247,6 +249,14 @@ impl ServerProxyOwner {
         ) {
             return reject(Some(open.request_id), code);
         }
+        if self
+            .worker_admissions
+            .insert(candidate.worker_id, admission)
+            .is_some()
+        {
+            let _ = self.stream_admission.release(admission);
+            return reject(Some(open.request_id), PublicErrorCode::ProtocolMalformed);
+        }
         ServerDecision::Admit {
             stream_id,
             admission,
@@ -255,12 +265,47 @@ impl ServerProxyOwner {
         }
     }
 
-    pub fn promote(&mut self, admission: AdmissionToken) -> bool {
-        self.stream_admission.promote(admission)
+    pub fn promote(
+        &mut self,
+        worker_id: ProxyWorkerId,
+        admission: AdmissionToken,
+    ) -> Result<(), &'static str> {
+        if self.worker_admissions.get(&worker_id) != Some(&admission) {
+            return Err("proxy worker admission correlation mismatch");
+        }
+        self.stream_admission
+            .promote(admission)
+            .then_some(())
+            .ok_or("proxy stream promotion is not valid")
+    }
+
+    pub fn complete(
+        &mut self,
+        worker_id: ProxyWorkerId,
+        admission: Option<AdmissionToken>,
+    ) -> Result<(), &'static str> {
+        let owned = self.worker_admissions.remove(&worker_id);
+        let admission = match (owned, admission) {
+            (Some(expected), Some(actual)) if expected != actual => {
+                return Err("proxy worker admission release correlation mismatch");
+            }
+            (Some(expected), _) => expected,
+            (None, Some(actual)) => actual,
+            (None, None) => return Ok(()),
+        };
+        if self.stream_admission.release(admission) {
+            Ok(())
+        } else {
+            Err("proxy stream admission released more than once")
+        }
     }
 
     pub fn release(&mut self, admission: AdmissionToken) -> bool {
         self.stream_admission.release(admission)
+    }
+
+    pub fn worker_count(&self) -> usize {
+        self.worker_admissions.len()
     }
 
     pub fn stream_admission(&self) -> &StreamAdmission {
@@ -315,8 +360,8 @@ mod tests {
         let tickets = TicketAdmissionLedger::new(1, 0).unwrap();
         let mut owner = ServerProxyOwner::new(tickets, None);
         let admission = AdmissionToken::new([8; 16]);
-        assert!(!owner.promote(admission));
-        assert!(!owner.release(admission));
+        assert!(owner.promote(ProxyWorkerId(1), admission).is_err());
+        assert!(owner.complete(ProxyWorkerId(1), None).is_ok());
         assert!(owner.stream_admission().is_empty());
     }
 }

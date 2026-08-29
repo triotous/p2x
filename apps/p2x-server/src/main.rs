@@ -306,7 +306,7 @@ fn proxy_terminal_class(terminal: p2x_proxy::Terminal) -> p2x_net::lifecycle::Tu
 fn finish_proxy_worker(
     release: proxy_open::Release,
     workers: &mut ProxyWorkerTable,
-    admission: &mut stream_admission::StreamAdmission,
+    owner: &mut ServerProxyOwner,
     swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
     connection_paths: &HashMap<libp2p::swarm::ConnectionId, ProbePath>,
     emitter: &Emitter,
@@ -314,7 +314,7 @@ fn finish_proxy_worker(
     let record = workers
         .remove(release.worker_id)
         .ok_or_else(|| io::Error::other("proxy worker completion missing owner"))?;
-    finish_proxy_worker_record(release, record, admission, swarm, connection_paths, emitter)
+    finish_proxy_worker_record(release, record, owner, swarm, connection_paths, emitter)
 }
 
 fn release_from_worker_record(
@@ -342,7 +342,7 @@ fn release_from_worker_record(
 fn finish_proxy_worker_record(
     release: proxy_open::Release,
     record: p2x_server::proxy_owner::WorkerRecord,
-    admission: &mut stream_admission::StreamAdmission,
+    owner: &mut ServerProxyOwner,
     swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
     connection_paths: &HashMap<libp2p::swarm::ConnectionId, ProbePath>,
     emitter: &Emitter,
@@ -350,16 +350,9 @@ fn finish_proxy_worker_record(
     if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
         proxy.inbound_release_on(release.peer_id, release.connection_id);
     }
-    let owned_admission = record
-        .admission
-        .or_else(|| (!release.admission.is_empty()).then_some(release.admission));
-    if let Some(admission_token) = owned_admission
-        && !admission.release(admission_token)
-    {
-        return Err(io::Error::other(
-            "proxy stream admission released more than once",
-        ));
-    }
+    owner
+        .complete(release.worker_id, record.admission)
+        .map_err(io::Error::other)?;
     let accepted = release.accepted || record.accepted;
     if accepted && !record.accepted {
         emitter.emit(&LifecycleRecord::TunnelAccepted {
@@ -783,7 +776,7 @@ async fn main() -> io::Result<()> {
                 match result {
                     Ok((task_id, release)) => {
                         proxy_worker_tasks.remove(&task_id);
-                        finish_proxy_worker(release, &mut proxy_worker_table, proxy_owner.stream_admission_mut(), &mut swarm, &connection_paths, &emitter)?;
+                        finish_proxy_worker(release, &mut proxy_worker_table, &mut proxy_owner, &mut swarm, &connection_paths, &emitter)?;
                     }
                     Err(error) => {
                         let task_id = error.id();
@@ -798,7 +791,7 @@ async fn main() -> io::Result<()> {
                             record,
                             PublicErrorCode::PeerConnectionFailed,
                         );
-                        finish_proxy_worker_record(release, record, proxy_owner.stream_admission_mut(), &mut swarm, &connection_paths, &emitter)?;
+                        finish_proxy_worker_record(release, record, &mut proxy_owner, &mut swarm, &connection_paths, &emitter)?;
                     }
                 }
             }
@@ -806,7 +799,7 @@ async fn main() -> io::Result<()> {
                 let acknowledged = proxy_worker_table
                     .get(promotion.worker_id)
                     .is_some_and(|record| record.admission == Some(promotion.admission))
-                    && proxy_owner.promote(promotion.admission);
+                    && proxy_owner.promote(promotion.worker_id, promotion.admission).is_ok();
                 let _ = promotion.acknowledged.send(acknowledged);
                 if !acknowledged {
                     return Err(io::Error::other("proxy stream promotion failed"));
@@ -1407,7 +1400,7 @@ async fn main() -> io::Result<()> {
             Some(result) = proxy_workers.join_next_with_id() => {
                 let (task_id, release) = result.map_err(|_| io::Error::other("proxy worker panicked during shutdown"))?;
                 proxy_worker_tasks.remove(&task_id);
-                finish_proxy_worker(release, &mut proxy_worker_table, proxy_owner.stream_admission_mut(), &mut swarm, &connection_paths, &emitter)?;
+                finish_proxy_worker(release, &mut proxy_worker_table, &mut proxy_owner, &mut swarm, &connection_paths, &emitter)?;
             }
             Some(promotion) = proxy_promotion_rx.recv() => {
                 let _ = promotion.acknowledged.send(false);
@@ -1485,7 +1478,7 @@ async fn main() -> io::Result<()> {
                     finish_proxy_worker(
                         release,
                         &mut proxy_worker_table,
-                        proxy_owner.stream_admission_mut(),
+                        &mut proxy_owner,
                         &mut swarm,
                         &connection_paths,
                         &emitter,
@@ -1507,7 +1500,7 @@ async fn main() -> io::Result<()> {
                     finish_proxy_worker_record(
                         release,
                         record,
-                        proxy_owner.stream_admission_mut(),
+                        &mut proxy_owner,
                         &mut swarm,
                         &connection_paths,
                         &emitter,

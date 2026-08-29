@@ -230,7 +230,7 @@ async fn actual_resolution_ticket_flows_through_server_owner_once() {
     let socket = upstream::connect(&upstream, Duration::from_secs(1), CancellationToken::new())
         .await
         .unwrap();
-    assert!(owner.promote(token));
+    owner.promote(ProxyWorkerId(1), token).unwrap();
     let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
     let accepted = p2x_protocol::ProxyOpenResponseV1::Accepted {
         request_id: open.request_id,
