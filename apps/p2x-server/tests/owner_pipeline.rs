@@ -231,6 +231,7 @@ async fn actual_resolution_ticket_flows_through_server_owner_once() {
         .await
         .unwrap();
     owner.promote(ProxyWorkerId(1), token).unwrap();
+    assert_eq!(owner.snapshot().0, 1);
     let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
     let accepted = p2x_protocol::ProxyOpenResponseV1::Accepted {
         request_id: open.request_id,
@@ -281,8 +282,9 @@ async fn actual_resolution_ticket_flows_through_server_owner_once() {
     assert_eq!(pump.remote_to_local_bytes, 18);
     assert_eq!(pump.terminal, p2x_proxy::Terminal::Complete);
     assert_eq!(upstream_connections.load(Ordering::Relaxed), 1);
-    assert!(owner.release(token));
+    owner.complete(ProxyWorkerId(1), None).unwrap();
     assert!(owner.stream_admission().is_empty());
+    assert_eq!(owner.snapshot().0, 0);
     let (replay_tx, _replay_rx) = tokio::sync::oneshot::channel();
     let replay = Candidate {
         worker_id: ProxyWorkerId(2),

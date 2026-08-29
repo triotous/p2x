@@ -1398,9 +1398,23 @@ async fn main() -> io::Result<()> {
                 })?;
             }
             Some(result) = proxy_workers.join_next_with_id() => {
-                let (task_id, release) = result.map_err(|_| io::Error::other("proxy worker panicked during shutdown"))?;
-                proxy_worker_tasks.remove(&task_id);
-                finish_proxy_worker(release, &mut proxy_worker_table, &mut proxy_owner, &mut swarm, &connection_paths, &emitter)?;
+                match result {
+                    Ok((task_id, release)) => {
+                        proxy_worker_tasks.remove(&task_id);
+                        finish_proxy_worker(release, &mut proxy_worker_table, &mut proxy_owner, &mut swarm, &connection_paths, &emitter)?;
+                    }
+                    Err(error) => {
+                        let task_id = error.id();
+                        let worker_id = proxy_worker_tasks
+                            .remove(&task_id)
+                            .ok_or_else(|| io::Error::other("shutdown proxy worker owner missing"))?;
+                        let record = proxy_worker_table
+                            .remove(worker_id)
+                            .ok_or_else(|| io::Error::other("shutdown proxy worker record missing"))?;
+                        let release = release_from_worker_record(worker_id, record, PublicErrorCode::PeerDraining);
+                        finish_proxy_worker_record(release, record, &mut proxy_owner, &mut swarm, &connection_paths, &emitter)?;
+                    }
+                }
             }
             Some(promotion) = proxy_promotion_rx.recv() => {
                 let _ = promotion.acknowledged.send(false);

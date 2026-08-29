@@ -308,6 +308,26 @@ impl ServerProxyOwner {
         self.worker_admissions.len()
     }
 
+    pub fn snapshot(
+        &self,
+    ) -> (
+        usize,
+        usize,
+        usize,
+        HashMap<PeerId, usize>,
+        HashMap<p2x_protocol::UpstreamId, usize>,
+        usize,
+    ) {
+        (
+            self.worker_count(),
+            self.stream_admission.dialing(),
+            self.stream_admission.active(),
+            self.stream_admission.peer_counts(),
+            self.stream_admission.service_counts(),
+            self.ticket_admission.len(),
+        )
+    }
+
     pub fn stream_admission(&self) -> &StreamAdmission {
         &self.stream_admission
     }
@@ -363,5 +383,8 @@ mod tests {
         assert!(owner.promote(ProxyWorkerId(1), admission).is_err());
         assert!(owner.complete(ProxyWorkerId(1), None).is_ok());
         assert!(owner.stream_admission().is_empty());
+        let (workers, dialing, active, peers, services, replay) = owner.snapshot();
+        assert_eq!((workers, dialing, active, replay), (0, 0, 0, 0));
+        assert!(peers.is_empty() && services.is_empty());
     }
 }

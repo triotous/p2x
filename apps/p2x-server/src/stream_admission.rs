@@ -138,6 +138,22 @@ impl StreamAdmission {
             .filter(|entry| entry.peer == peer)
             .count()
     }
+
+    pub fn peer_counts(&self) -> HashMap<PeerId, usize> {
+        let mut counts = HashMap::new();
+        for entry in self.entries.values() {
+            *counts.entry(entry.peer).or_default() += 1;
+        }
+        counts
+    }
+
+    pub fn service_counts(&self) -> HashMap<UpstreamId, usize> {
+        let mut counts = HashMap::new();
+        for entry in self.entries.values() {
+            *counts.entry(entry.service.clone()).or_default() += 1;
+        }
+        counts
+    }
     pub fn clear(&mut self) {
         self.entries.clear();
     }
