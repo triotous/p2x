@@ -1,0 +1,4 @@
+[status] Plan 06a session started at 20260829T080412Z; baseline ba6e8b1; plan file will not be modified.
+[action] Phase A: centralized product route completion cleanup, preserved finite diagnostic terminals, added request correlation to route completion, and made pre-Accept ingress closure explicit and exactly-once guarded.
+[validation] Phase A focused client check, unit tests, Clippy with -D warnings, fmt check, and git diff check passed.
+[commit] 715ba74 Isolate product ingress route failures.
