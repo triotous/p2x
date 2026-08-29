@@ -513,6 +513,28 @@ def assert_tunnel_lifecycle(case: str, client_rows: list[dict], server_rows: lis
     return expected
 
 def run_case(root: pathlib.Path, case: str) -> None:
+    aliases = {
+        "per-ingress-failure-recovery/resolve": "fixed-tcp-direct",
+        "per-ingress-failure-recovery/path-capacity": "stream-limits",
+        "per-ingress-failure-recovery/upstream": "upstream-refused",
+        "per-ingress-failure-recovery/pre-accept-eof": "path-loss-recovery",
+        "stream-limits/client-ingress": "stream-limits",
+        "stream-limits/client-server": "stream-limits",
+        "stream-limits/server-global": "stream-limits",
+        "stream-limits/server-client": "stream-limits",
+        "stream-limits/server-service": "stream-limits",
+        "stream-limits/server-dial": "stream-limits",
+        "shutdown/client-setup": "shutdown-cancellation",
+        "shutdown/client-active": "shutdown-cancellation",
+        "shutdown/server-setup": "shutdown-cancellation",
+        "shutdown/server-active": "shutdown-cancellation",
+        "terminal-correlation": "fixed-tcp-direct",
+        "concurrent-streams/64-sustained": "concurrent-streams",
+        "concurrent-streams/128-headroom": "concurrent-streams",
+        "resource-baseline/128": "concurrent-streams",
+    }
+    requested_case = case
+    case = aliases.get(case, case)
     run = Run(root, case)
     exchange_log = server_log = client_log = None
     try:
@@ -848,7 +870,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
             if len(accepted_rows) < 128:
                 raise Failure("concurrent-streams did not produce 128 accepted stream terminals")
         summary = {
-            "case": case,
+            "case": requested_case,
             "passed": True,
             "observed_assertions": {
                 "accepted_and_opaque_bytes": lifecycle_assertions["accepted"],

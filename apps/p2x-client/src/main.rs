@@ -2129,17 +2129,40 @@ async fn main() -> io::Result<()> {
                                     code: None,
                                 })?;
                                 let (server, capabilities, relay_address, revision, registration_expires_at, deadline) = route_owner.as_ref().expect("multi-open owner exists").path_input(open_id).ok_or_else(|| io::Error::other("resolved route path input missing"))?;
-                                let manager = connection_manager.as_mut().ok_or_else(|| io::Error::other("connection manager missing"))?;
+                                let Some(manager) = connection_manager.as_mut() else {
+                                    if let Some(action) = route_owner.as_mut().expect("multi-open owner exists").complete(open_id, Err(PublicErrorCode::PeerConnectionFailed)) { actions.push(action); }
+                                    continue;
+                                };
                                 let started = std::time::Instant::now();
-                                let (attempt, path_actions) = manager.begin_path_at_deadline_with_capabilities(server, started, deadline, capabilities).map_err(|code| io::Error::other(code.as_str()))?;
-                                if !manager.track_waiter(server, open_id.0) { return Err(io::Error::other("connection manager rejected route waiter")); }
-                                manager.update_metadata(server, ResolvedPeerMetadata {
+                                let (attempt, path_actions) = match manager.begin_path_at_deadline_with_capabilities(server, started, deadline, capabilities) {
+                                    Ok(value) => value,
+                                    Err(code) => {
+                                        if let Some(action) = route_owner.as_mut().expect("multi-open owner exists").complete(open_id, Err(code)) { actions.push(action); }
+                                        continue;
+                                    }
+                                };
+                                if !manager.track_waiter(server, open_id.0) {
+                                    if let Some(action) = route_owner.as_mut().expect("multi-open owner exists").complete(open_id, Err(PublicErrorCode::LimitPeerConnections)) { actions.push(action); }
+                                    continue;
+                                }
+                                if let Err(code) = manager.update_metadata(server, ResolvedPeerMetadata {
                                     relay_addresses: vec![relay_address],
                                     capabilities,
                                     registration_revision: revision,
                                     registration_expires_at,
-                                }).map_err(|code| io::Error::other(code.as_str()))?;
-                                actions.extend(route_owner.as_mut().expect("multi-open owner exists").begin_path(open_id, attempt, path_actions).ok_or_else(|| io::Error::other("route path admission missing"))?);
+                                }) {
+                                    let _ = manager.release_waiter(server, open_id.0);
+                                    let _ = manager.release(server);
+                                    if let Some(action) = route_owner.as_mut().expect("multi-open owner exists").complete(open_id, Err(code)) { actions.push(action); }
+                                    continue;
+                                }
+                                if let Some(path_actions) = route_owner.as_mut().expect("multi-open owner exists").begin_path(open_id, attempt, path_actions) {
+                                    actions.extend(path_actions);
+                                } else {
+                                    let _ = manager.release_waiter(server, open_id.0);
+                                    let _ = manager.release(server);
+                                    return Err(io::Error::other(format!("route path admission missing for open {open_id:?}")));
+                                }
                             }
                             Err(code) => {
                                 emitter.emit(&LifecycleRecord::ResolutionOutcome {
