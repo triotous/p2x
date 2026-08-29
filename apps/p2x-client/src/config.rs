@@ -134,7 +134,7 @@ impl ClientConfig {
         if limits.max_peer_states == 0
             || limits.max_peer_states > 256
             || limits.max_pending_setups == 0
-            || limits.max_pending_setups > 512
+            || limits.max_pending_setups > 128
             || limits.max_pending_per_server == 0
             || limits.max_pending_per_server > 128
             || limits.max_route_opens == 0

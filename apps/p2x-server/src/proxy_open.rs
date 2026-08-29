@@ -58,6 +58,7 @@ pub async fn run_worker(
     candidates: mpsc::Sender<Candidate>,
     releases: mpsc::Sender<Release>,
     promotions: mpsc::Sender<AdmissionToken>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     let (decision, response) = oneshot::channel();
     let open = tokio::time::timeout(Duration::from_secs(5), read_open(&mut stream))
@@ -178,7 +179,7 @@ pub async fn run_worker(
                             tokio_util::compat::TokioAsyncReadCompatExt::compat(socket),
                             copy_buffer_bytes,
                             upstream.idle_timeout,
-                            futures::future::pending(),
+                            shutdown.cancelled(),
                         )
                         .await
                         .ok();

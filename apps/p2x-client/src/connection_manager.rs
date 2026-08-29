@@ -417,27 +417,8 @@ impl ConnectionManager {
         }
     }
 
-    pub fn admit_stream(&mut self, server: PeerId) -> Result<(), PublicErrorCode> {
-        let state = self
-            .peers
-            .get_mut(&server)
-            .ok_or(PublicErrorCode::LimitPeerConnections)?;
-        if state.active >= self.limits.max_streams_per_server {
-            return Err(PublicErrorCode::LimitProxyStreams);
-        }
-        state.active += 1;
-        Ok(())
-    }
-
-    pub fn release_stream(&mut self, server: PeerId) -> bool {
-        let Some(state) = self.peers.get_mut(&server) else {
-            return false;
-        };
-        if state.active == 0 {
-            return false;
-        }
-        state.active -= 1;
-        true
+    pub fn active_count(&self, server: PeerId) -> usize {
+        self.peers.get(&server).map_or(0, |state| state.active)
     }
 
     pub fn setup_deadline(&self, started: Instant) -> Instant {
@@ -745,6 +726,7 @@ mod tests {
             vec![p2x_net::PathAction::OpenExact { connection: direct }]
         );
         manager.finish_path(server, Some(PathDecision::Direct(direct)));
+        assert_eq!(manager.active_count(server), 1);
         manager.finish_path(server, None);
         assert_eq!(manager.pending_count(), 0);
     }

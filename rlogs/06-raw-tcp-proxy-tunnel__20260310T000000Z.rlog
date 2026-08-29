@@ -36,3 +36,8 @@
 [validation] Full tunnel harness run passed all 14 named cases; repeated resolution concurrent-opens passed; auth exchange-restart passed on rerun; workspace fmt/clippy/tests passed.
 [action] Improved ingress terminal reporting on pump errors/cancellation so one terminal event is always emitted and active ownership can release.
 [review] Remaining limitation is evidence quality: large/slow, concurrency, control-loss, path-loss, shutdown case names currently reuse the common local smoke flow and do not prove their full plan-specific scenarios.
+[action] Definition-of-Done hardening: inspected live artifacts and found smoke-only cases plus misleading pre-accept authorization timing.
+[decision] Keep existing architecture; make process gate case-specific for large transfer, 64 concurrency, limits, control loss, path reset, and shutdown, and expose Accepted/terminal evidence without logging private addresses.
+[action] Hardening: preserved accepted stream accounting through terminal; emitted hashed request/stream terminal evidence; added client ingress cancellation tokens; made tunnel tests case-specific for multi-stream, large transfer, limits, control loss, path recovery, and shutdown.
+[validation] workspace fmt/clippy/tests passed; tunnel all 14 cases passed; direct/relay/half-close/idle/refusal/timeout and 16-stream/256MiB/limit assertions ran.
+[blocker] Full Plan 06 §5.3 semantics are not all proven: process harness still lacks exact 64/128 stream profile, real firewall-forced relay, deterministic path-loss retry, RSS/file-descriptor sampling, and complete shutdown resource assertions.

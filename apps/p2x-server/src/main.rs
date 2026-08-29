@@ -386,6 +386,7 @@ async fn main() -> io::Result<()> {
             .map_err(io::Error::other)?,
         )
     };
+    let shutdown = tokio_util::sync::CancellationToken::new();
     let mut ticket_admission = ticket_admission::TicketAdmissionLedger::new(
         service_config
             .as_ref()
@@ -559,7 +560,7 @@ async fn main() -> io::Result<()> {
     })?;
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::signal::ctrl_c() => { shutdown.cancel(); break },
             _ = resource_tick.tick() => {
                 if !config.is_connectivity_lab() {
                     match availability.tick(unix_now()) {
@@ -632,6 +633,14 @@ async fn main() -> io::Result<()> {
                     .as_ref()
                     .map_or(0, |proxy| proxy.inbound_count());
                 emitter.emit(&LifecycleRecord::Resources { connections, pending_opens, workers: worker_admission.admitted() + configured_proxy_workers, tasks: worker_admission.admitted() + configured_proxy_workers })?;
+                if !proxy_admission.is_empty() {
+                    emitter.emit(&LifecycleRecord::Resources {
+                        connections,
+                        pending_opens,
+                        workers: proxy_admission.len(),
+                        tasks: proxy_admission.dialing(),
+                    })?;
+                }
             }
             Some(release) = proxy_release_rx.recv() => {
                 if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() { proxy.inbound_release_on(release.peer_id, release.connection_id); }
@@ -979,6 +988,7 @@ async fn main() -> io::Result<()> {
                             tx,
                             proxy_release_tx.clone(),
                             proxy_promotion_tx.clone(),
+                            shutdown.child_token(),
                         ));
                     }
                     SwarmEvent::Behaviour(PeerEvent::Proxy(p2x_net::proxy_stream::behaviour::ProxyOutput::InboundRejected { peer_id, connection_id, stream, code })) => {
@@ -1239,6 +1249,7 @@ async fn main() -> io::Result<()> {
             }
         }
     }
+    shutdown.cancel();
     if !config.is_connectivity_lab()
         && let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut()
     {
@@ -1345,6 +1356,7 @@ async fn main() -> io::Result<()> {
     }
     availability.stopped();
     ticket_admission.clear();
+    proxy_admission.clear();
     worker_admission.close_and_discard();
     emitter.terminal(&TerminalResult::simple(
         &args.case_id,

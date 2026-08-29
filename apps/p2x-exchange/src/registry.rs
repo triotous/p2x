@@ -199,6 +199,7 @@ impl Registry {
         if services.as_slice().is_empty()
             || !(10..=60).contains(&lease)
             || !capabilities.contains(Capabilities::RELAY_V2)
+            || !capabilities.contains(Capabilities::PROXY_STREAM_V1)
             || !capabilities.direct_transport()
         {
             return Err(RegistryError::InvalidAdvertisement);

@@ -139,6 +139,9 @@ impl StreamAdmission {
             .filter(|entry| entry.peer == peer)
             .count()
     }
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 #[cfg(test)]

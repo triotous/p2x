@@ -34,6 +34,7 @@ pub enum IngressEvent {
         route_id: String,
         deadline: Instant,
         command: mpsc::Sender<IngressCommand>,
+        cancel: CancellationToken,
     },
     Closed {
         id: IngressId,
@@ -102,25 +103,29 @@ async fn accept_loop(
     events: mpsc::Sender<IngressEvent>,
     shutdown: CancellationToken,
 ) {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         let accepted = tokio::select! {
-            _ = shutdown.cancelled() => return,
+            _ = shutdown.cancelled() => break,
             accepted = bound.listener.accept() => accepted,
         };
-        let Ok((socket, _)) = accepted else { return };
+        let Ok((socket, _)) = accepted else { break };
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             drop(socket);
             continue;
         };
         let id = IngressId(next_id.fetch_add(1, Ordering::Relaxed).saturating_add(1));
         let route_id = bound.config.route_id.clone();
+        let deadline = Instant::now() + setup_timeout;
         let (command, commands) = mpsc::channel(1);
+        let cancel = shutdown.child_token();
         if events
             .send(IngressEvent::Accepted {
                 id,
                 route_id: route_id.clone(),
-                deadline: Instant::now() + setup_timeout,
+                deadline,
                 command,
+                cancel: cancel.clone(),
             })
             .await
             .is_err()
@@ -130,18 +135,20 @@ async fn accept_loop(
         }
         let events = events.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(run_connection(
+        connections.spawn(run_connection(
             id,
             route_id,
             socket,
             commands,
             permit,
             copy_buffer_bytes,
-            Instant::now() + setup_timeout,
+            deadline,
             events,
-            shutdown,
+            cancel,
+            shutdown.clone(),
         ));
     }
+    while connections.join_next().await.is_some() {}
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -154,6 +161,7 @@ async fn run_connection(
     copy_buffer_bytes: usize,
     deadline_at: Instant,
     events: mpsc::Sender<IngressEvent>,
+    cancel: CancellationToken,
     shutdown: CancellationToken,
 ) {
     let mut prebuffer = vec![0; copy_buffer_bytes];
@@ -172,7 +180,7 @@ async fn run_connection(
                 Some(IngressCommand::StartTunnel { stream }) => {
                     prebuffer.truncate(filled);
                     let local = PrefixedIo::new(prebuffer, socket.compat());
-                    let result = p2x_proxy::pump_no_idle(local, stream, copy_buffer_bytes, shutdown.cancelled()).await;
+                    let result = p2x_proxy::pump_no_idle(local, stream, copy_buffer_bytes, cancel.cancelled()).await;
                     let _ = events.send(IngressEvent::TunnelFinished {
                         id,
                         result: result.unwrap_or(p2x_proxy::PumpResult {
@@ -189,9 +197,7 @@ async fn run_connection(
                 Some(IngressCommand::Reject) | None => return,
             },
             read = socket.read(&mut prebuffer[filled..]), if filled < prebuffer.len() && !local_eof => match read {
-                Ok(0) => {
-                    local_eof = true;
-                }
+                Ok(0) => local_eof = true,
                 Ok(count) => filled += count,
                 Err(_) => {
                     let _ = events.send(IngressEvent::Closed { id }).await;
@@ -230,6 +236,7 @@ mod tests {
             p2x_proxy::MIN_COPY_BUFFER,
             Instant::now() + Duration::from_secs(1),
             events,
+            shutdown.child_token(),
             shutdown.clone(),
         ));
         let (mut remote_peer, remote) = tokio::io::duplex(64);
