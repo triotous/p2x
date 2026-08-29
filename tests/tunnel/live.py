@@ -69,6 +69,7 @@ class Upstream:
         self.listener: socket.socket | None = None
         self.ready = threading.Event()
         self.error: BaseException | None = None
+        self.release_event = threading.Event()
         self.accepted_connections = 0
 
     def start(self) -> None:
@@ -100,12 +101,15 @@ class Upstream:
 
     def handle(self, client: socket.socket, connection_number: int) -> None:
         with client:
-            if self.mode == "hold":
+            if self.mode in {"hold", "hold-until-release"}:
                 while True:
                     data = client.recv(65536)
                     if not data:
                         return
-                    time.sleep(0.5)
+                    if self.mode == "hold":
+                        time.sleep(0.5)
+                    else:
+                        self.release_event.wait()
                     client.sendall(data)
             if self.mode == "slow" or (self.mode == "slow-first" and connection_number == 1):
                 while True:
@@ -138,8 +142,12 @@ class Upstream:
                     return
                 client.sendall(data)
 
+    def release(self) -> None:
+        self.release_event.set()
+
     def close(self) -> None:
         self.stop.set()
+        self.release_event.set()
         if self.listener is not None:
             self.listener.close()
         self.thread.join(timeout=2)
@@ -521,13 +529,13 @@ def assert_final_exchange_resources(path: pathlib.Path) -> bool:
         raise Failure(f"{path.name}: final exchange resources are not zero: {final}")
     return True
 
-def assert_resource_profile(run: Run, client_rows: list[dict], server_rows: list[dict], target: int) -> bool:
-    required = ("before", "128_headroom", "after_release")
+def assert_resource_profile(run: Run, client_rows: list[dict], server_rows: list[dict], target: int, peak_mark: str) -> bool:
+    required = ("before", peak_mark, "after_release")
     if any(mark not in run.resource_marks for mark in required):
         raise Failure(f"resource profile is missing marks: {run.resource_marks}")
     for component in ("p2x-client", "p2x-server"):
         before = run.resource_marks["before"]
-        peak = run.resource_marks["128_headroom"]
+        peak = run.resource_marks[peak_mark]
         after = run.resource_marks["after_release"]
         values = [(mark, snapshot.get(f"rss_{component}"), snapshot.get(f"fds_{component}")) for mark, snapshot in (("before", before), ("peak", peak), ("after", after))]
         if any(rss is None or fds is None for _, rss, fds in values):
@@ -713,7 +721,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
     exchange_log = server_log = client_log = None
     try:
         if profile not in {"upstream-refused", "upstream-timeout"} and requested_case != "per-ingress-failure-recovery/upstream":
-            mode = "half-close" if profile.startswith("half-close") else "idle-first" if profile == "idle-timeout" else "hold" if profile in {"path-loss-recovery", "shutdown-cancellation", "shutdown", "concurrent-streams", "resource-baseline"} else "slow-first" if profile.startswith("large-slow") else "echo"
+            mode = "half-close" if profile.startswith("half-close") else "idle-first" if profile == "idle-timeout" else "hold-until-release" if profile in {"concurrent-streams", "resource-baseline"} else "hold" if profile in {"path-loss-recovery", "shutdown-cancellation", "shutdown"} else "slow-first" if profile.startswith("large-slow") else "echo"
             run.upstream = Upstream(run.upstream_port, mode)
             run.upstream.start()
         exchange_log = run.start_exchange()
@@ -810,6 +818,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
             later.close()
         elif requested_case == "idle-timeout":
             assert client is not None
+            wait_for(client_log, lambda row: row.get("event") == "tunnel_accepted", 45)
             second = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
             second.settimeout(10)
             payload = b"idle-isolation"
@@ -1057,8 +1066,11 @@ def run_case(root: pathlib.Path, case: str) -> None:
                         peer.sendall(payload)
                     wait_for_count(client_log, lambda row: row.get("event") == "tunnel_accepted", target, 120)
                     wait_for_count(server_log, lambda row: row.get("event") == "tunnel_accepted", target, 120)
+                    wait_for(server_log, lambda row: row.get("event") == "resources" and row.get("workers", 0) >= target, 30)
                     mark = "64_sustained" if target == 64 else "128_headroom"
                     run.mark_resources(mark)
+                    assert run.upstream is not None
+                    run.upstream.release()
                     with ThreadPoolExecutor(max_workers=target) as pool:
                         actuals = list(pool.map(lambda item: recv_exact(item[0], len(item[1])), zip(peers, expected_payloads)))
                     if actuals != expected_payloads:
@@ -1081,6 +1093,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
                     "pending_client_preaccept_buffers": 1,
                     "declared_user_buffers": target * 4 + 1,
                     "declared_bytes": (target * 4 + 1) * 32768,
+                    "buffer_formula": "client directions 2 + server directions 2 per active tunnel + one client pre-Accept buffer",
                     "rss_delta_limit": 64 * 1024 * 1024,
                 }, sort_keys=True) + "\n")
             else:
@@ -1202,6 +1215,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
         else:
             lifecycle_assertions = assert_tunnel_lifecycle(profile, client_rows, server_rows)
         named_contract = assert_named_contract(requested_case, client_rows, server_rows)
+        resource_profile = False
         if profile in {"concurrent-streams", "resource-baseline"}:
             target = 64 if requested_case == "concurrent-streams/64-sustained" else 128
             if sum(row.get("authorized") is True for row in server_rows if row.get("event") == "proxy_authorization") < target:
@@ -1212,10 +1226,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
             mark = "64_sustained" if requested_case == "concurrent-streams/64-sustained" else "128_headroom"
             if mark not in run.resource_marks or "before" not in run.resource_marks or "after_release" not in run.resource_marks:
                 raise Failure(f"{requested_case} did not capture before/peak/after resource marks")
-            if requested_case == "resource-baseline/128":
-                resource_profile = assert_resource_profile(run, client_rows, server_rows, 128)
-            else:
-                resource_profile = True
+            resource_profile = assert_resource_profile(run, client_rows, server_rows, target, mark)
         if requested_case == "stream-limits" and sum(row.get("authorized") is True for row in server_rows if row.get("event") == "proxy_authorization") < 1:
             raise Failure("stream-limits did not authorize the held stream")
         if requested_case == "stream-limits" and not any(row.get("event") == "resources" and row.get("workers", 0) >= 1 for row in server_rows):
@@ -1244,7 +1255,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
                 raise Failure(f"{case} resource samples did not drain: rss={rss[-3:]} fds={fds[-3:]}")
             if max(rss) - min(rss) > 64 * 1024 * 1024:
                 raise Failure(f"{case} RSS exceeded the bounded process delta: {rss[-3:]}")
-            (run.out / "resource-samples.json").write_text(json.dumps({"samples": run.samples, "resource_marks": run.resource_marks, "copy_buffer_bytes": 32768, "max_active_streams": 128, "direction_buffers_per_component": 2, "pending_client_preaccept_buffers": 1, "declared_user_buffers": 9, "declared_bytes": 9 * 32768, "rss_delta_limit": 64 * 1024 * 1024}, sort_keys=True) + "\n")
+            (run.out / "resource-samples.json").write_text(json.dumps({"samples": run.samples, "resource_marks": run.resource_marks, "copy_buffer_bytes": 32768, "max_active_streams": 128, "direction_buffers_per_component": 2, "pending_client_preaccept_buffers": 1, "declared_user_buffers": 513, "declared_bytes": 513 * 32768, "buffer_formula": "client directions 2 + server directions 2 per active tunnel + one client pre-Accept buffer", "rss_delta_limit": 64 * 1024 * 1024}, sort_keys=True) + "\n")
         if profile.endswith("-relay") and not any(row.get("event") == "path_selected" and row.get("selected_path") == "relay" for row in read_rows(client_log)):
             raise Failure("forced relay path was not selected")
         if profile == "upstream-refused" and not any(row.get("code") == "upstream.connect_failed" and not row.get("authorized") for row in server_rows):
@@ -1279,21 +1290,29 @@ def run_case(root: pathlib.Path, case: str) -> None:
             accepted_rows = [row for row in read_rows(client_log) if row.get("event") == "tunnel_accepted"]
             if len(accepted_rows) < target:
                 raise Failure(f"{requested_case} did not produce {target} accepted stream terminals")
+        required_assertions = {"privacy_scan_clean", "one_terminal_each", "resources_drained", "named_contract"}
+        if profile in {"concurrent-streams", "resource-baseline"}:
+            required_assertions.add("resource_profile")
+        if requested_case == "idle-timeout":
+            required_assertions.add("idle_terminal_class")
+        observed_assertions = {
+            "accepted_and_opaque_bytes": lifecycle_assertions["accepted"],
+            "upstream_failure_or_idle": lifecycle_assertions["upstream_failure_or_idle"],
+            "terminal_correlation": lifecycle_assertions["terminal_correlation"],
+            "directional_bytes": lifecycle_assertions["directional_bytes"],
+            "idle_terminal_class": lifecycle_assertions["idle_terminal_class"],
+            "privacy_scan_clean": privacy_clean,
+            "one_terminal_each": process_terminals,
+            "resources_drained": client_resources and server_resources and exchange_resources,
+            "resource_profile": resource_profile if profile in {"concurrent-streams", "resource-baseline"} else False,
+            "named_contract": named_contract,
+        }
+        if not required_assertions.issubset(observed_assertions) or not all(observed_assertions[key] for key in required_assertions):
+            raise Failure(f"{requested_case} missing or failed required assertions: {required_assertions} / {observed_assertions}")
         summary = {
             "case": requested_case,
             "passed": True,
-            "observed_assertions": {
-                "accepted_and_opaque_bytes": lifecycle_assertions["accepted"],
-                "upstream_failure_or_idle": lifecycle_assertions["upstream_failure_or_idle"],
-                "terminal_correlation": lifecycle_assertions["terminal_correlation"],
-                "directional_bytes": lifecycle_assertions["directional_bytes"],
-                "idle_terminal_class": lifecycle_assertions["idle_terminal_class"],
-                "privacy_scan_clean": privacy_clean,
-                "one_terminal_each": process_terminals,
-                "resources_drained": client_resources and server_resources and exchange_resources,
-                "resource_profile": resource_profile if profile in {"concurrent-streams", "resource-baseline"} else False,
-                "named_contract": named_contract,
-            },
+            "observed_assertions": observed_assertions,
         }
         (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
         print(json.dumps(summary, sort_keys=True), flush=True)
