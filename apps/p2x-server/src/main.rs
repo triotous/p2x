@@ -1446,7 +1446,11 @@ async fn main() -> io::Result<()> {
     }
     availability.stopped();
     ticket_admission.clear();
-    proxy_admission.clear();
+    if !proxy_admission.is_empty() {
+        return Err(io::Error::other(
+            "proxy stream admission leaked during shutdown",
+        ));
+    }
     worker_admission.close_and_discard();
     emitter.terminal(&TerminalResult::simple(
         &args.case_id,
