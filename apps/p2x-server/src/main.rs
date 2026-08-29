@@ -767,6 +767,17 @@ async fn main() -> io::Result<()> {
                 }
             }
             Some(accepted) = proxy_accept_rx.recv() => {
+                if proxy_worker_table.get(accepted.worker_id).is_none() {
+                    continue;
+                }
+                proxy_worker_table
+                    .mark_accepted(
+                        accepted.worker_id,
+                        accepted.setup_duration,
+                        accepted.request_id_hash,
+                        accepted.stream_id_hash,
+                    )
+                    .map_err(io::Error::other)?;
                 let peer = accepted.peer_id.to_string();
                 emitter.emit(&LifecycleRecord::TunnelAccepted {
                     component_side: p2x_net::lifecycle::ComponentSide::Server,
