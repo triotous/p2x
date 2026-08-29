@@ -519,7 +519,7 @@ mod tests {
         let promotion = received.recv().await.unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
-        let _ = promotion.acknowledged.send(true);
+        drop(promotion);
         assert!(
             !bounded_ack(
                 ack,
