@@ -12,6 +12,14 @@ pub struct Promotion {
     pub acknowledged: oneshot::Sender<bool>,
 }
 
+pub struct Accepted {
+    pub peer_id: PeerId,
+    pub connection_id: ConnectionId,
+    pub setup_duration: Duration,
+    pub request_id_hash: u64,
+    pub stream_id_hash: u64,
+}
+
 pub struct Release {
     pub peer_id: PeerId,
     pub connection_id: ConnectionId,
@@ -78,6 +86,7 @@ pub async fn run_worker(
     hold_dial_ms: Option<u64>,
     candidates: mpsc::Sender<Candidate>,
     releases: mpsc::Sender<Release>,
+    accepts: mpsc::Sender<Accepted>,
     promotions: mpsc::Sender<Promotion>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
@@ -287,6 +296,15 @@ pub async fn run_worker(
                         .await
                     {
                         accepted = true;
+                        let _ = accepts
+                            .send(Accepted {
+                                peer_id,
+                                connection_id,
+                                setup_duration: started.elapsed(),
+                                request_id_hash,
+                                stream_id_hash: p2x_net::lifecycle::stable_hash(stream_id),
+                            })
+                            .await;
                         pump = p2x_proxy::pump(
                             stream,
                             tokio_util::compat::TokioAsyncReadCompatExt::compat(socket),

@@ -447,6 +447,7 @@ async fn main() -> io::Result<()> {
         mpsc::channel::<proxy_open::Release>(proxy_limit);
     let (proxy_promotion_tx, mut proxy_promotion_rx) =
         mpsc::channel::<proxy_open::Promotion>(proxy_limit);
+    let (proxy_accept_tx, mut proxy_accept_rx) = mpsc::channel::<proxy_open::Accepted>(proxy_limit);
     let mut proxy_admission = service_config.as_ref().map_or_else(
         || stream_admission::StreamAdmission::new(256, 32, 64),
         |services| {
@@ -649,15 +650,6 @@ async fn main() -> io::Result<()> {
                 }
                 let peer = release.peer_id.to_string();
                 if release.accepted {
-                    emitter.emit(&LifecycleRecord::TunnelAccepted {
-                        component_side: p2x_net::lifecycle::ComponentSide::Server,
-                        peer_id: &peer,
-                        connection_id_hash: stable_hash(release.connection_id),
-                        request_id_hash: release.request_id_hash,
-                        stream_id_hash: release.stream_id_hash.unwrap_or_default(),
-                        selected_path: connection_paths.get(&release.connection_id).copied(),
-                        setup_duration_ms: release.setup_duration.as_millis(),
-                    })?;
                     emitter.emit(&LifecycleRecord::TunnelTerminal {
                         component_side: p2x_net::lifecycle::ComponentSide::Server,
                         peer_id: &peer,
@@ -704,6 +696,18 @@ async fn main() -> io::Result<()> {
                 if !acknowledged {
                     return Err(io::Error::other("proxy stream promotion failed"));
                 }
+            }
+            Some(accepted) = proxy_accept_rx.recv() => {
+                let peer = accepted.peer_id.to_string();
+                emitter.emit(&LifecycleRecord::TunnelAccepted {
+                    component_side: p2x_net::lifecycle::ComponentSide::Server,
+                    peer_id: &peer,
+                    connection_id_hash: stable_hash(accepted.connection_id),
+                    request_id_hash: accepted.request_id_hash,
+                    stream_id_hash: accepted.stream_id_hash,
+                    selected_path: connection_paths.get(&accepted.connection_id).copied(),
+                    setup_duration_ms: accepted.setup_duration.as_millis(),
+                })?;
             }
             Some(candidate) = proxy_rx.recv() => {
                 let peer_name = candidate.peer_id.to_string();
@@ -1021,6 +1025,7 @@ async fn main() -> io::Result<()> {
                             args.test_hold_upstream_dial_ms,
                             tx,
                             proxy_release_tx.clone(),
+                            proxy_accept_tx.clone(),
                             proxy_promotion_tx.clone(),
                             shutdown.child_token(),
                         ));
@@ -1321,9 +1326,50 @@ async fn main() -> io::Result<()> {
                     },
                 ));
             }
+            Some(accepted) = proxy_accept_rx.recv() => {
+                let peer = accepted.peer_id.to_string();
+                emitter.emit(&LifecycleRecord::TunnelAccepted {
+                    component_side: p2x_net::lifecycle::ComponentSide::Server,
+                    peer_id: &peer,
+                    connection_id_hash: stable_hash(accepted.connection_id),
+                    request_id_hash: accepted.request_id_hash,
+                    stream_id_hash: accepted.stream_id_hash,
+                    selected_path: connection_paths.get(&accepted.connection_id).copied(),
+                    setup_duration_ms: accepted.setup_duration.as_millis(),
+                })?;
+            }
             Some(release) = proxy_release_rx.recv() => {
                 if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
                     proxy.inbound_release_on(release.peer_id, release.connection_id);
+                }
+                if release.accepted {
+                    let peer = release.peer_id.to_string();
+                    emitter.emit(&LifecycleRecord::TunnelTerminal {
+                        component_side: p2x_net::lifecycle::ComponentSide::Server,
+                        peer_id: &peer,
+                        connection_id_hash: stable_hash(release.connection_id),
+                        request_id_hash: release.request_id_hash,
+                        stream_id_hash: release.stream_id_hash,
+                        selected_path: connection_paths.get(&release.connection_id).copied(),
+                        accepted: true,
+                        code: release.code.map(PublicErrorCode::as_str),
+                        terminal_class: release.pump.map_or(
+                            p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
+                            |result| match result.terminal {
+                                p2x_proxy::Terminal::Complete => p2x_net::lifecycle::TunnelTerminalClass::Complete,
+                                p2x_proxy::Terminal::IdleTimeout => p2x_net::lifecycle::TunnelTerminalClass::IdleTimeout,
+                                p2x_proxy::Terminal::Cancelled => p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
+                                p2x_proxy::Terminal::LocalIo => p2x_net::lifecycle::TunnelTerminalClass::LocalIo,
+                                p2x_proxy::Terminal::RemoteIo => p2x_net::lifecycle::TunnelTerminalClass::RemoteIo,
+                            },
+                        ),
+                        setup_duration_ms: release.setup_duration.as_millis(),
+                        local_to_remote_bytes: release.pump.map_or(0, |result| result.local_to_remote_bytes),
+                        remote_to_local_bytes: release.pump.map_or(0, |result| result.remote_to_local_bytes),
+                        local_eof: release.pump.is_some_and(|result| result.local_eof),
+                        remote_eof: release.pump.is_some_and(|result| result.remote_eof),
+                        duration_ms: release.pump.map_or(0, |result| result.duration.as_millis()),
+                    })?;
                 }
                 proxy_workers = proxy_workers.saturating_sub(1);
             }

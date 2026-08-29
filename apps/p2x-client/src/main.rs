@@ -2746,12 +2746,85 @@ async fn main() -> io::Result<()> {
             let _ = task.await;
         }
     }
-    for cancel in ingress_cancel.into_values() {
+    for cancel in ingress_cancel.values() {
         cancel.cancel();
     }
-    for (id, (server, _, open_id, _, _)) in active_ingress.drain() {
+    while let Ok(event) = ingress_rx.try_recv() {
+        if let IngressEvent::TunnelFinished { id, result } = event
+            && let Some((server, connection, open_id, request_id_hash, stream_id_hash)) =
+                active_ingress.remove(&id)
+        {
+            let peer = server.to_string();
+            emitter.emit(&LifecycleRecord::TunnelTerminal {
+                component_side: p2x_net::lifecycle::ComponentSide::Client,
+                peer_id: &peer,
+                connection_id_hash: stable_hash(connection),
+                request_id_hash,
+                stream_id_hash: Some(stream_id_hash),
+                selected_path: Some(if connections.is_direct(server, connection) {
+                    ProbePath::Direct
+                } else {
+                    ProbePath::Relay
+                }),
+                accepted: true,
+                code: None,
+                terminal_class: match result.terminal {
+                    p2x_proxy::Terminal::Complete => {
+                        p2x_net::lifecycle::TunnelTerminalClass::Complete
+                    }
+                    p2x_proxy::Terminal::IdleTimeout => {
+                        p2x_net::lifecycle::TunnelTerminalClass::IdleTimeout
+                    }
+                    p2x_proxy::Terminal::Cancelled => {
+                        p2x_net::lifecycle::TunnelTerminalClass::Cancelled
+                    }
+                    p2x_proxy::Terminal::LocalIo => {
+                        p2x_net::lifecycle::TunnelTerminalClass::LocalIo
+                    }
+                    p2x_proxy::Terminal::RemoteIo => {
+                        p2x_net::lifecycle::TunnelTerminalClass::RemoteIo
+                    }
+                },
+                setup_duration_ms: 0,
+                local_to_remote_bytes: result.local_to_remote_bytes,
+                remote_to_local_bytes: result.remote_to_local_bytes,
+                local_eof: result.local_eof,
+                remote_eof: result.remote_eof,
+                duration_ms: result.duration.as_millis(),
+            })?;
+            if let Some(manager) = connection_manager.as_mut() {
+                let _ = manager.close_active(server);
+                manager.release_waiter(server, open_id.0);
+            }
+        }
+    }
+    for (id, (server, connection, open_id, request_id_hash, stream_id_hash)) in
+        active_ingress.drain()
+    {
+        let peer = server.to_string();
+        emitter.emit(&LifecycleRecord::TunnelTerminal {
+            component_side: p2x_net::lifecycle::ComponentSide::Client,
+            peer_id: &peer,
+            connection_id_hash: stable_hash(connection),
+            request_id_hash,
+            stream_id_hash: Some(stream_id_hash),
+            selected_path: Some(if connections.is_direct(server, connection) {
+                ProbePath::Direct
+            } else {
+                ProbePath::Relay
+            }),
+            accepted: true,
+            code: None,
+            terminal_class: p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
+            setup_duration_ms: 0,
+            local_to_remote_bytes: 0,
+            remote_to_local_bytes: 0,
+            local_eof: false,
+            remote_eof: false,
+            duration_ms: 0,
+        })?;
         if let Some(manager) = connection_manager.as_mut() {
-            manager.close_active(server);
+            let _ = manager.close_active(server);
             manager.release_waiter(server, open_id.0);
         }
         let _ = id;
