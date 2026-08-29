@@ -1446,6 +1446,13 @@ async fn main() -> io::Result<()> {
     }
     availability.stopped();
     ticket_admission.clear();
+    connection_paths.clear();
+    emitter.emit(&LifecycleRecord::Resources {
+        connections: 0,
+        pending_opens: 0,
+        workers: 0,
+        tasks: 0,
+    })?;
     if !proxy_admission.is_empty() {
         return Err(io::Error::other(
             "proxy stream admission leaked during shutdown",
