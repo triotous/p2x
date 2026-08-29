@@ -644,6 +644,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn invalid_copy_buffer_is_rejected_before_io_is_started() {
+        let error = futures::executor::block_on(pump_no_idle(
+            futures::io::Cursor::new(Vec::<u8>::new()),
+            futures::io::Cursor::new(Vec::<u8>::new()),
+            MIN_COPY_BUFFER - 1,
+            futures::future::pending(),
+        ))
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
     #[tokio::test]
     async fn idle_timeout_and_cancellation_are_terminal_and_bounded() {
         let (_local_peer, local) = tokio::io::duplex(16);

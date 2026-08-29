@@ -1307,6 +1307,7 @@ async fn main() -> io::Result<()> {
                         })?;
                     }
                     IngressEvent::TunnelFinished { id, result } => {
+                        let result = result.map_err(io::Error::other)?;
                         let _ = result.duration;
                         if let Some((server, connection, _, request_id_hash, stream_id_hash)) = active_ingress.get(&id).copied() {
                             let peer = server.to_string();
@@ -2759,6 +2760,7 @@ async fn main() -> io::Result<()> {
             && let Some((server, connection, open_id, request_id_hash, stream_id_hash)) =
                 active_ingress.remove(&id)
         {
+            let result = result.map_err(io::Error::other)?;
             let peer = server.to_string();
             emitter.emit(&LifecycleRecord::TunnelTerminal {
                 component_side: p2x_net::lifecycle::ComponentSide::Client,

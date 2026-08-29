@@ -8,6 +8,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use thiserror::Error;
 use tokio::{
     io::AsyncReadExt,
     net::{TcpListener, TcpStream},
@@ -36,6 +37,12 @@ pub enum PreAcceptCause {
     Shutdown,
 }
 
+#[derive(Debug, Error)]
+pub enum PumpFailure {
+    #[error("pump setup failed: {0}")]
+    Setup(#[from] io::Error),
+}
+
 pub enum IngressEvent {
     Accepted {
         id: IngressId,
@@ -56,7 +63,7 @@ pub enum IngressEvent {
     },
     TunnelFinished {
         id: IngressId,
-        result: PumpResult,
+        result: Result<PumpResult, PumpFailure>,
     },
 }
 
@@ -227,17 +234,12 @@ async fn run_connection(
                     prebuffer.truncate(filled);
                     let local = PrefixedIo::new(prebuffer, socket.compat());
                     let result = p2x_proxy::pump_no_idle(local, stream, copy_buffer_bytes, cancel.cancelled()).await;
-                    let _ = events.send(IngressEvent::TunnelFinished {
-                        id,
-                        result: result.unwrap_or(p2x_proxy::PumpResult {
-                            local_to_remote_bytes: 0,
-                            remote_to_local_bytes: 0,
-                            local_eof: false,
-                            remote_eof: false,
-                            duration: Duration::ZERO,
-                            terminal: p2x_proxy::Terminal::Cancelled,
-                        }),
-                    }).await;
+                    let _ = events
+                        .send(IngressEvent::TunnelFinished {
+                            id,
+                            result: result.map_err(PumpFailure::Setup),
+                        })
+                        .await;
                     return;
                 }
                 Some(IngressCommand::Reject) | None => return,
