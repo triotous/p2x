@@ -2142,7 +2142,7 @@ async fn main() -> io::Result<()> {
                         return Ok(());
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Auth(RequestResponseEvent::OutboundFailure { request_id, error: libp2p::request_response::OutboundFailure::ConnectionClosed, .. })) if credential.is_some() => { pending_auth.complete(&request_id); }
-                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Resolve(RequestResponseEvent::OutboundFailure { request_id: outbound_id, error: libp2p::request_response::OutboundFailure::Timeout, .. })) if route_resolve_wires.contains_key(&outbound_id) => {
+                    SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Resolve(RequestResponseEvent::OutboundFailure { request_id: outbound_id, .. })) if route_resolve_wires.contains_key(&outbound_id) => {
                         let (open_id, wire_id, _) = route_resolve_wires.remove(&outbound_id).expect("checked route wire exists");
                         let Some(request_id) = route_owner.as_ref().and_then(|owner| owner.resolve_request_id(open_id)) else { continue; };
                         let owner = route_owner.as_mut().expect("multi-open owner exists");
