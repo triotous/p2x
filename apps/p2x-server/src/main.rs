@@ -663,7 +663,7 @@ async fn main() -> io::Result<()> {
         auth_fault: None,
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
-    start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
+    let peer_listener_ids = start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
     if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut()
         && let Some(service_config) = service_config.as_ref()
     {
@@ -1431,6 +1431,7 @@ async fn main() -> io::Result<()> {
         }
     }
     shutdown.cancel();
+    worker_admission.close();
     if !config.is_connectivity_lab()
         && let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut()
     {
@@ -1565,12 +1566,54 @@ async fn main() -> io::Result<()> {
     if let Some(listener_id) = circuit_listener_id {
         swarm.remove_listener(listener_id);
     }
+    for listener_id in peer_listener_ids {
+        swarm.remove_listener(listener_id);
+    }
     if let Some(connection_id) = relay_connection_id {
         swarm.close_connection(connection_id);
     }
+    for peer in swarm.connected_peers().copied().collect::<Vec<_>>() {
+        let _ = swarm.disconnect_peer_id(peer);
+    }
+    let network_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while swarm.network_info().connection_counters().num_connections() != 0
+        && tokio::time::Instant::now() < network_deadline
+    {
+        tokio::select! {
+            _ = tokio::time::sleep_until(network_deadline) => break,
+            Some(worker) = worker_rx.recv() => {
+                if !worker_admission.release(worker.peer_id) {
+                    return Err(io::Error::other("shutdown worker permit released more than once"));
+                }
+                if let Some(probe) = swarm.behaviour_mut().probe_stream.as_mut() {
+                    probe.inbound_release(worker.peer_id);
+                }
+            }
+            event = swarm.select_next_some() => match event {
+                SwarmEvent::ConnectionClosed { peer_id, connection_id, .. } => {
+                    if let Some(book) = connection_book.as_mut() {
+                        book.on_connection_closed(peer_id, connection_id).map_err(io::Error::other)?;
+                    }
+                    connection_paths.remove(&connection_id);
+                }
+                SwarmEvent::Behaviour(PeerEvent::Proxy(
+                    p2x_net::proxy_stream::behaviour::ProxyOutput::InboundOpened {
+                        peer_id,
+                        connection_id,
+                        stream,
+                    },
+                )) => {
+                    if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
+                        proxy.inbound_release_on(peer_id, connection_id);
+                    }
+                    drop(stream);
+                }
+                _ => {}
+            },
+        }
+    }
     availability.stopped();
     proxy_owner.clear_tickets();
-    connection_paths.clear();
     if !proxy_worker_table.is_empty() || !proxy_worker_tasks.is_empty() {
         return Err(io::Error::other(
             "proxy worker table leaked during shutdown",
@@ -1586,13 +1629,42 @@ async fn main() -> io::Result<()> {
             "proxy worker tasks leaked during shutdown",
         ));
     }
+    let connections = swarm.network_info().connection_counters().num_connections() as usize;
+    let pending_opens = swarm
+        .behaviour()
+        .probe_stream
+        .as_ref()
+        .map_or(0, |probe| probe.pending_count())
+        + swarm
+            .behaviour()
+            .proxy_stream
+            .as_ref()
+            .map_or(0, |proxy| proxy.pending_count());
+    let inbound_proxy_workers = swarm
+        .behaviour()
+        .proxy_stream
+        .as_ref()
+        .map_or(0, |proxy| proxy.inbound_count());
+    let workers = worker_admission.admitted() + proxy_worker_table.len();
+    let tasks = worker_admission.admitted() + proxy_workers.len();
+    if connections != 0
+        || pending_opens != 0
+        || inbound_proxy_workers != 0
+        || workers != 0
+        || tasks != 0
+        || !connection_paths.is_empty()
+        || connection_book
+            .as_ref()
+            .is_some_and(|book| !book.is_empty())
+    {
+        return Err(io::Error::other("server shutdown left logical resources"));
+    }
     emitter.emit(&LifecycleRecord::Resources {
-        connections: 0,
-        pending_opens: 0,
-        workers: 0,
-        tasks: 0,
+        connections,
+        pending_opens,
+        workers,
+        tasks,
     })?;
-    worker_admission.close_and_discard();
     emitter.terminal(&TerminalResult::simple(
         &args.case_id,
         "stopped",
