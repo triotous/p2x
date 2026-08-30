@@ -518,13 +518,17 @@ fn drive_route_actions(
                 );
             }
             route_open::RouteAction::DialRelay {
-                open_id: _,
+                open_id,
                 peer: _,
                 address,
-            } => {
-                let address = Multiaddr::try_from(address).map_err(io::Error::other)?;
-                swarm.dial(address).map_err(io::Error::other)?;
-            }
+            } => match dispatch_route_dial(address, |address| swarm.dial(address)) {
+                Ok(()) => {}
+                Err(code) => {
+                    if let Some(action) = owner.complete(open_id, Err(code)) {
+                        actions.push_back(action);
+                    }
+                }
+            },
             route_open::RouteAction::OpenExact {
                 open_id,
                 connection,
@@ -675,6 +679,15 @@ fn route_proxy_rejection_needs_fresh_ticket(code: PublicErrorCode) -> bool {
             | PublicErrorCode::PeerSetupTimeout
             | PublicErrorCode::ExchangeTimeout
     )
+}
+
+fn dispatch_route_dial<E>(
+    address: Vec<u8>,
+    dial: impl FnOnce(Multiaddr) -> Result<(), E>,
+) -> Result<(), PublicErrorCode> {
+    let address =
+        Multiaddr::try_from(address).map_err(|_| PublicErrorCode::PeerConnectionFailed)?;
+    dial(address).map_err(|_| PublicErrorCode::PeerConnectionFailed)
 }
 
 async fn cancel_and_join_proxy_tasks(
@@ -2475,7 +2488,13 @@ async fn main() -> io::Result<()> {
                             emitter.emit(&LifecycleRecord::TestFaultApplied { fault: "hold_client_proxy_handshake" })?;
                         }
                         let tx = proxy_result_tx.clone();
-                        let cancel = shutdown.child_token();
+                        let cancel = if product_ingress {
+                            ingress_owners.cancel_for_open(open_id).ok_or_else(|| {
+                                io::Error::other("route ingress cancellation owner missing")
+                            })?
+                        } else {
+                            shutdown.child_token()
+                        };
                         proxy_tasks.spawn(async move {
                             let result = tokio::select! {
                                 _ = cancel.cancelled() => return,
@@ -3121,6 +3140,19 @@ mod tests {
         assert!(route_proxy_rejection_needs_fresh_ticket(
             PublicErrorCode::RegistryStaleRevision
         ));
+    }
+
+    #[test]
+    fn route_dial_failure_is_an_ingress_result() {
+        let address: Multiaddr = "/ip4/127.0.0.1/tcp/1".parse().unwrap();
+        assert_eq!(
+            dispatch_route_dial(address.to_vec(), |_| Err(())),
+            Err(PublicErrorCode::PeerConnectionFailed)
+        );
+        assert_eq!(
+            dispatch_route_dial(vec![0xff], |_| Ok::<_, ()>(())),
+            Err(PublicErrorCode::PeerConnectionFailed)
+        );
     }
 
     #[tokio::test]

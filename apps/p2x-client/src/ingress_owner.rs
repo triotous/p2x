@@ -79,6 +79,12 @@ impl IngressOwnerBook {
         self.by_open.get(&open_id).copied()
     }
 
+    pub fn cancel_for_open(&self, open_id: OpenId) -> Option<CancellationToken> {
+        self.ingress_for_open(open_id)
+            .and_then(|ingress_id| self.setup.get(&ingress_id))
+            .map(|owner| owner.cancel.clone())
+    }
+
     pub fn take_setup(&mut self, ingress_id: IngressId) -> Option<IngressSetupOwner> {
         let owner = self.setup.remove(&ingress_id)?;
         if let Some(open_id) = owner.open_id {
