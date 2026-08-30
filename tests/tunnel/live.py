@@ -195,6 +195,7 @@ class Run:
         self.ticket_key = self.secret / "ticket.key"
         self.ticket_key.write_bytes(b"\x01" + secrets.token_bytes(32))
         self.ticket_key.chmod(0o600)
+        self.ticket_marker = base64.urlsafe_b64encode(self.ticket_key.read_bytes()).decode().rstrip("=")
         self.verification_keys = self.secret / "verification-keys.yaml"
         subprocess.run(
             [str(root / "target/debug/examples/ticket-verification"), str(self.ticket_key), str(self.verification_keys)],
@@ -521,8 +522,9 @@ def assert_final_resources(path: pathlib.Path) -> bool:
     if not rows:
         raise Failure(f"{path.name}: no resource record")
     final = rows[-1]
-    if any(final.get(field, 0) != 0 for field in ("connections", "pending_opens", "workers", "tasks")):
-        raise Failure(f"{path.name}: final resources are not zero: {final}")
+    fields = ("connections", "pending_opens", "workers", "tasks")
+    if any(field not in final for field in fields) or any(final[field] != 0 for field in fields):
+        raise Failure(f"{path.name}: final resources are incomplete or nonzero: {final}")
     return True
 
 def assert_final_exchange_resources(path: pathlib.Path) -> bool:
@@ -531,8 +533,8 @@ def assert_final_exchange_resources(path: pathlib.Path) -> bool:
         raise Failure(f"{path.name}: no exchange resource record")
     final = rows[-1]
     fields = ("sessions", "relay_admissions", "reservations", "circuits", "registrations", "selector_owners", "auth_requests", "registry_requests")
-    if any(final.get(field, 0) != 0 for field in fields):
-        raise Failure(f"{path.name}: final exchange resources are not zero: {final}")
+    if any(field not in final for field in fields) or any(final[field] != 0 for field in fields):
+        raise Failure(f"{path.name}: final exchange resources are incomplete or nonzero: {final}")
     return True
 
 def assert_resource_profile(run: Run, client_rows: list[dict], server_rows: list[dict], target: int, peak_mark: str) -> bool:
@@ -561,12 +563,30 @@ def assert_resource_profile(run: Run, client_rows: list[dict], server_rows: list
         raise Failure(f"upstream did not expose {target} independent sockets: {run.upstream and run.upstream.accepted_connections}")
     return True
 
+def private_markers_in(output: str, markers: list[str]) -> list[str]:
+    return [marker for marker in markers if marker in output]
+
+
 def assert_privacy(run: Run, paths: list[pathlib.Path]) -> bool:
+    markers = [run.client_token, run.client2_token, run.server_token, *run.private, run.ticket_marker, run.payload_sentinel, f"127.0.0.1:{run.upstream_port}"]
+    if private_markers_in("\n".join(markers), markers) != markers:
+        raise Failure("privacy scanner did not detect every exact run marker in its canary")
     output = "\n".join(path.read_text(errors="replace") for path in paths)
-    markers = [run.client_token, run.client2_token, run.server_token, *run.private, run.payload_sentinel, f"127.0.0.1:{run.upstream_port}"]
-    for marker in markers:
-        if marker in output:
-            raise Failure(f"privacy scan found exact run marker {marker}")
+    if leaked := private_markers_in(output, markers):
+        raise Failure(f"privacy scan found exact run marker {leaked[0]}")
+    return True
+
+
+def assert_run_stopped(run: Run) -> bool:
+    live = [process.pid for process, _, _ in run.processes if process.poll() is None]
+    if live:
+        raise Failure(f"run still owns P2X processes: {live}")
+    if run.upstream is not None:
+        upstream = run.upstream
+        run.upstream = None
+        upstream.close()
+        if upstream.thread.is_alive():
+            raise Failure("run still owns the upstream fixture socket")
     return True
 
 def assert_named_contract(requested_case: str, client_rows: list[dict], server_rows: list[dict]) -> str:
@@ -632,8 +652,11 @@ def assert_named_contract(requested_case: str, client_rows: list[dict], server_r
             raise Failure(f"{requested_case} did not observe shutdown tunnel terminal evidence")
         return "shutdown_active_drain"
     if requested_case == "terminal-correlation":
-        if not client_terminals or not server_terminals:
-            raise Failure("terminal-correlation did not observe both terminal sides")
+        if len(client_terminals) != 1 or len(server_terminals) != 1:
+            raise Failure("terminal-correlation did not observe exactly one terminal per side")
+        for row in (client_terminals[0], server_terminals[0]):
+            if row.get("local_to_remote_bytes") != 64 or row.get("remote_to_local_bytes") != 64:
+                raise Failure(f"terminal-correlation counters do not match endpoint bytes: {row}")
         return "terminal_correlation"
     if requested_case == "idle-timeout":
         if not any(row.get("terminal_class") == "idle_timeout" for row in server_terminals):
@@ -696,20 +719,23 @@ def assert_tunnel_lifecycle(case: str, client_rows: list[dict], server_rows: lis
     for key in client_keys:
         client_row = client_terminals[key]
         server_row = server_terminals[key]
+        client_accept = next(row for row in client_accepted if (row.get("request_id_hash"), row.get("stream_id_hash")) == key)
+        server_accept = next(row for row in server_accepted if (row.get("request_id_hash"), row.get("stream_id_hash")) == key)
+        if client_row.get("component_side") != "client" or server_row.get("component_side") != "server" or not client_row.get("accepted") or not server_row.get("accepted"):
+            raise Failure(f"{case} terminal side/Accepted evidence differs for {key}")
         if client_row.get("local_to_remote_bytes") != server_row.get("local_to_remote_bytes"):
             raise Failure(f"{case} local-to-remote counters differ for {key}")
         if client_row.get("remote_to_local_bytes") != server_row.get("remote_to_local_bytes"):
             raise Failure(f"{case} remote-to-local counters differ for {key}")
-        client_accepted_path = next(row.get("selected_path") for row in client_accepted if (row.get("request_id_hash"), row.get("stream_id_hash")) == key)
-        server_accepted_path = next(row.get("selected_path") for row in server_accepted if (row.get("request_id_hash"), row.get("stream_id_hash")) == key)
-        if client_row.get("selected_path") != client_accepted_path or server_row.get("selected_path") != server_accepted_path:
-            raise Failure(f"{case} terminal path was not frozen for {key}")
-        if client_row.get("setup_duration_ms", -1) < 0 or server_row.get("setup_duration_ms", -1) < 0:
-            raise Failure(f"{case} setup duration was not frozen for {key}")
-        if client_row.get("selected_path") not in {"direct", "relay"}:
-            raise Failure(f"{case} client terminal path missing for {key}")
-        if server_row.get("selected_path") not in {"direct", "relay"}:
-            raise Failure(f"{case} server terminal path missing for {key}")
+        for side, accepted_row, terminal_row in (("client", client_accept, client_row), ("server", server_accept, server_row)):
+            if terminal_row.get("connection_id_hash") != accepted_row.get("connection_id_hash"):
+                raise Failure(f"{case} {side} terminal connection changed for {key}")
+            if terminal_row.get("selected_path") != accepted_row.get("selected_path"):
+                raise Failure(f"{case} {side} terminal path was not frozen for {key}")
+            if terminal_row.get("setup_duration_ms") != accepted_row.get("setup_duration_ms"):
+                raise Failure(f"{case} {side} terminal setup duration changed for {key}")
+            if terminal_row.get("selected_path") not in {"direct", "relay"}:
+                raise Failure(f"{case} {side} terminal path missing for {key}")
     expected["accepted"] = True
     expected["terminal_correlation"] = True
     expected["directional_bytes"] = True
@@ -1293,12 +1319,13 @@ def run_case(root: pathlib.Path, case: str) -> None:
         server_resources = assert_final_resources(server_log)
         exchange_resources = all(assert_final_exchange_resources(path) for path in process_logs if "exchange" in path.name)
         privacy_clean = assert_privacy(run, process_logs)
+        run_stopped = assert_run_stopped(run)
         if profile in {"concurrent-streams", "resource-baseline"}:
             target = 64 if requested_case == "concurrent-streams/64-sustained" else 128
             accepted_rows = [row for row in read_rows(client_log) if row.get("event") == "tunnel_accepted"]
             if len(accepted_rows) < target:
                 raise Failure(f"{requested_case} did not produce {target} accepted stream terminals")
-        required_assertions = {"privacy_scan_clean", "one_terminal_each", "resources_drained", "named_contract"}
+        required_assertions = {"privacy_scan_clean", "one_terminal_each", "resources_drained", "run_stopped", "named_contract"}
         if profile in {"concurrent-streams", "resource-baseline"}:
             required_assertions.add("resource_profile")
         if requested_case == "idle-timeout":
@@ -1312,6 +1339,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
             "privacy_scan_clean": privacy_clean,
             "one_terminal_each": process_terminals,
             "resources_drained": client_resources and server_resources and exchange_resources,
+            "run_stopped": run_stopped,
             "resource_profile": resource_profile if profile in {"concurrent-streams", "resource-baseline"} else False,
             "named_contract": named_contract,
         }
