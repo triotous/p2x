@@ -677,6 +677,15 @@ fn route_proxy_rejection_needs_fresh_ticket(code: PublicErrorCode) -> bool {
     )
 }
 
+async fn cancel_and_join_proxy_tasks(
+    shutdown: &tokio_util::sync::CancellationToken,
+    tasks: &mut tokio::task::JoinSet<()>,
+) {
+    shutdown.cancel();
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let started_at = std::time::Instant::now();
@@ -806,7 +815,7 @@ async fn main() -> io::Result<()> {
         auth_fault: args.auth_fault.map(Into::into),
     };
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
-    start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
+    let listener_ids = start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
     let shutdown = tokio_util::sync::CancellationToken::new();
     let (ingress_tx, mut ingress_rx) = mpsc::channel::<IngressEvent>(128);
     let mut ingress_tasks = if product_ingress {
@@ -987,6 +996,7 @@ async fn main() -> io::Result<()> {
     }
     let (worker_tx, mut worker_rx) = mpsc::channel::<WorkerResult>(128);
     let (proxy_result_tx, mut proxy_result_rx) = mpsc::channel::<ProxyResult>(16);
+    let mut proxy_tasks = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
@@ -2465,10 +2475,16 @@ async fn main() -> io::Result<()> {
                             emitter.emit(&LifecycleRecord::TestFaultApplied { fault: "hold_client_proxy_handshake" })?;
                         }
                         let tx = proxy_result_tx.clone();
-                        tokio::spawn(async move {
-                            if hold > 0 { tokio::time::sleep(std::time::Duration::from_millis(hold)).await; }
-                            let timeout = deadline.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_secs(5));
-                            let result = proxy_open::open_accepted_stream(stream, &open, timeout).await;
+                        let cancel = shutdown.child_token();
+                        proxy_tasks.spawn(async move {
+                            let result = tokio::select! {
+                                _ = cancel.cancelled() => return,
+                                result = async {
+                                    if hold > 0 { tokio::time::sleep(std::time::Duration::from_millis(hold)).await; }
+                                    let timeout = deadline.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_secs(5));
+                                    proxy_open::open_accepted_stream(stream, &open, timeout).await
+                                } => result,
+                            };
                             let _ = tx.send(ProxyResult { open_id: Some(open_id), request_id: open.request_id, result }).await;
                         });
                     }
@@ -2521,8 +2537,12 @@ async fn main() -> io::Result<()> {
                             .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_secs(5)))
                             .unwrap_or_else(|| std::time::Duration::from_secs(5));
                         let tx = proxy_result_tx.clone();
-                        tokio::spawn(async move {
-                            let result = proxy_open::open_accepted_stream(stream, &open, timeout).await;
+                        let cancel = shutdown.child_token();
+                        proxy_tasks.spawn(async move {
+                            let result = tokio::select! {
+                                _ = cancel.cancelled() => return,
+                                result = proxy_open::open_accepted_stream(stream, &open, timeout) => result,
+                            };
                             let _ = tx
                                 .send(ProxyResult {
                                     open_id: None,
@@ -2873,6 +2893,74 @@ async fn main() -> io::Result<()> {
         }
     }
     shutdown.cancel();
+    if let Some(owner) = route_owner.as_mut() {
+        let mut actions = Vec::new();
+        for open_id in owner.open_ids() {
+            if let Some(action) = owner.cancel_with_code(
+                &mut resolver_state,
+                open_id,
+                PublicErrorCode::ExchangeDraining,
+            ) {
+                actions.push(action);
+            }
+        }
+        let completions = drive_route_actions(
+            &mut swarm,
+            owner,
+            expected_exchange,
+            &emitter,
+            &connections,
+            &mut route_resolve_wires,
+            &mut route_proxy_requests,
+            &mut route_wire_sequence,
+            actions,
+        )?;
+        let _ = complete_route_actions(
+            product_ingress,
+            completions,
+            &mut resolver_state,
+            &mut route_resolve_wires,
+            &mut route_proxy_requests,
+            &mut ingress_owners,
+            owner,
+            expected_exchange,
+            &connections,
+            &mut route_wire_sequence,
+            &mut connection_manager,
+            &mut swarm,
+            &emitter,
+            &args.case_id,
+        )
+        .await?;
+    }
+    if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
+        proxy.shutdown();
+    }
+    let proxy_drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while swarm
+        .behaviour()
+        .proxy_stream
+        .as_ref()
+        .is_some_and(|proxy| proxy.pending_count() > 0)
+    {
+        match tokio::time::timeout_at(proxy_drain_deadline, swarm.next()).await {
+            Ok(Some(SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Proxy(
+                ProxyOutput::OutboundFailed { request_id, .. },
+            )))) => {
+                route_proxy_requests.remove(&request_id);
+                if pending_proxy == Some(request_id) {
+                    pending_proxy = None;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                return Err(io::Error::other(
+                    "client shutdown could not drain proxy opens",
+                ));
+            }
+        }
+    }
+    cancel_and_join_proxy_tasks(&shutdown, &mut proxy_tasks).await;
     for mut task in ingress_tasks.drain(..) {
         if tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
             .await
@@ -2882,28 +2970,40 @@ async fn main() -> io::Result<()> {
             let _ = task.await;
         }
     }
-    for id in ingress_owners.setup_ids().collect::<Vec<_>>() {
-        if let Some(owner) = ingress_owners.take_setup(id) {
-            owner.cancel.cancel();
-        }
-    }
     while let Ok(event) = ingress_rx.try_recv() {
         if let IngressEvent::TunnelFinished { id, result } = event
             && let Some(active) = ingress_owners.take_active(id)
         {
-            let result = result.map_err(io::Error::other)?;
-            emit_client_tunnel_terminal(
-                &emitter,
-                &active,
-                Some(&result),
-                tunnel_terminal_class(result.terminal),
-                None,
-            )?;
-            if let Some(manager) = connection_manager.as_mut() {
-                let _ = manager.close_active(active.server);
-                let _ = manager.release_waiter(active.server, active.open_id.0);
+            match result {
+                Ok(result) => emit_client_tunnel_terminal(
+                    &emitter,
+                    &active,
+                    Some(&result),
+                    tunnel_terminal_class(result.terminal),
+                    None,
+                )?,
+                Err(_) => emit_client_tunnel_terminal(
+                    &emitter,
+                    &active,
+                    None,
+                    p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
+                    Some("internal.pump_setup"),
+                )?,
+            }
+            if let Some(manager) = connection_manager.as_mut()
+                && (!manager.close_active(active.server)
+                    || !manager.release_waiter(active.server, active.open_id.0))
+            {
+                return Err(io::Error::other(
+                    "connection manager active release missing",
+                ));
             }
             active.cancel.cancel();
+        }
+    }
+    for id in ingress_owners.setup_ids().collect::<Vec<_>>() {
+        if let Some(owner) = ingress_owners.take_setup(id) {
+            owner.cancel.cancel();
         }
     }
     for id in ingress_owners.active_ids().collect::<Vec<_>>() {
@@ -2916,20 +3016,68 @@ async fn main() -> io::Result<()> {
                 Some(PublicErrorCode::ExchangeDraining.as_str()),
             )?;
             active.cancel.cancel();
-            if let Some(manager) = connection_manager.as_mut() {
-                let _ = manager.close_active(active.server);
-                let _ = manager.release_waiter(active.server, active.open_id.0);
+            if let Some(manager) = connection_manager.as_mut()
+                && (!manager.close_active(active.server)
+                    || !manager.release_waiter(active.server, active.open_id.0))
+            {
+                return Err(io::Error::other(
+                    "connection manager active release missing",
+                ));
             }
         }
     }
-    route_resolve_wires.clear();
-    route_proxy_requests.clear();
+    let proxy_pending = swarm
+        .behaviour()
+        .proxy_stream
+        .as_ref()
+        .map_or(0, |proxy| proxy.pending_count());
+    let route_pending = route_owner
+        .as_ref()
+        .map_or(0, route_open::RouteOpenSupervisor::len);
+    let manager_pending = connection_manager
+        .as_ref()
+        .map_or(0, ConnectionManager::pending_count);
+    let manager_waiters = connection_manager
+        .as_ref()
+        .map_or(0, ConnectionManager::total_waiter_count);
+    let manager_active = connection_manager
+        .as_ref()
+        .map_or(0, ConnectionManager::total_active_count);
+    if proxy_pending != 0
+        || route_pending != 0
+        || resolver_state.pending() != 0
+        || resolver_state.queued() != 0
+        || resolver_state.waiter_count() != 0
+        || manager_pending != 0
+        || manager_waiters != 0
+        || manager_active != 0
+        || !ingress_owners.is_empty()
+        || !route_resolve_wires.is_empty()
+        || !route_proxy_requests.is_empty()
+    {
+        return Err(io::Error::other("client shutdown left logical owners"));
+    }
+    for listener_id in listener_ids {
+        swarm.remove_listener(listener_id);
+    }
+    for peer in swarm.connected_peers().copied().collect::<Vec<_>>() {
+        let _ = swarm.disconnect_peer_id(peer);
+    }
+    let network_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while swarm.network_info().connection_counters().num_established() != 0 {
+        match tokio::time::timeout_at(network_deadline, swarm.next()).await {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                return Err(io::Error::other("client shutdown left network connections"));
+            }
+        }
+    }
     if product_ingress {
         emitter.emit(&LifecycleRecord::Resources {
-            connections: 0,
-            pending_opens: 0,
-            workers: 0,
-            tasks: 0,
+            connections: swarm.network_info().connection_counters().num_established() as usize,
+            pending_opens: proxy_pending.max(route_pending),
+            workers: proxy_tasks.len(),
+            tasks: ingress_tasks.len(),
         })?;
     }
     let mut terminal = TerminalResult::simple(&args.case_id, "stopped", "shutdown");
@@ -2973,5 +3121,38 @@ mod tests {
         assert!(route_proxy_rejection_needs_fresh_ticket(
             PublicErrorCode::RegistryStaleRevision
         ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_drops_and_joins_proxy_tasks() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct CountDrop(Arc<AtomicUsize>);
+        impl Drop for CountDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            let dropped = dropped.clone();
+            tasks.spawn(async move {
+                let _guard = CountDrop(dropped);
+                std::future::pending::<()>().await;
+            });
+        }
+        tokio::task::yield_now().await;
+
+        cancel_and_join_proxy_tasks(&shutdown, &mut tasks).await;
+
+        assert!(shutdown.is_cancelled());
+        assert!(tasks.is_empty());
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
     }
 }

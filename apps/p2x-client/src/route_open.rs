@@ -341,6 +341,10 @@ impl RouteOpenSupervisor {
             .collect()
     }
 
+    pub fn open_ids(&self) -> Vec<OpenId> {
+        self.opens.keys().copied().collect()
+    }
+
     pub fn path_attempt_id(&self, open_id: OpenId) -> Option<p2x_net::AttemptId> {
         self.opens
             .get(&open_id)

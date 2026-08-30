@@ -322,6 +322,14 @@ impl ConnectionManager {
             .map_or(0, |state| state.waiters.len())
     }
 
+    pub fn total_waiter_count(&self) -> usize {
+        self.peers.values().map(|state| state.waiters.len()).sum()
+    }
+
+    pub fn total_active_count(&self) -> usize {
+        self.peers.values().map(|state| state.active).sum()
+    }
+
     pub fn direct(&self, server: PeerId) -> Option<ConnectionId> {
         self.peers
             .get(&server)
