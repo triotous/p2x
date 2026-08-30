@@ -316,6 +316,35 @@ fn finish_proxy_worker(
     finish_proxy_worker_record(release, record, owner, swarm, emitter)
 }
 
+fn stale_proxy_candidate_decision(
+    workers: &ProxyWorkerTable,
+    worker_id: proxy_open::ProxyWorkerId,
+    request_id: Option<[u8; 16]>,
+) -> Option<proxy_open::ServerDecision> {
+    workers.get(worker_id).is_none().then(|| {
+        proxy_open::ServerDecision::Reject(p2x_protocol::ProxyOpenResponseV1::Rejected {
+            request_id,
+            error: p2x_protocol::PublicError::new(PublicErrorCode::PeerSetupTimeout, true),
+        })
+    })
+}
+
+fn promote_proxy_worker(
+    worker_id: proxy_open::ProxyWorkerId,
+    admission: stream_admission::AdmissionToken,
+    workers: &ProxyWorkerTable,
+    owner: &mut ServerProxyOwner,
+) -> Result<bool, &'static str> {
+    let Some(record) = workers.get(worker_id) else {
+        return Ok(false);
+    };
+    if record.admission != Some(admission) {
+        return Err("proxy worker promotion owner mismatch");
+    }
+    owner.promote(worker_id, admission)?;
+    Ok(true)
+}
+
 fn record_proxy_accepted(
     accepted: proxy_open::Accepted,
     workers: &mut ProxyWorkerTable,
@@ -869,13 +898,19 @@ async fn main() -> io::Result<()> {
                 }
             }
             Some(promotion) = proxy_promotion_rx.recv() => {
-                let acknowledged = proxy_worker_table
-                    .get(promotion.worker_id)
-                    .is_some_and(|record| record.admission == Some(promotion.admission))
-                    && proxy_owner.promote(promotion.worker_id, promotion.admission).is_ok();
+                let acknowledged = promote_proxy_worker(
+                    promotion.worker_id,
+                    promotion.admission,
+                    &proxy_worker_table,
+                    &mut proxy_owner,
+                )
+                .map_err(io::Error::other)?;
                 let _ = promotion.acknowledged.send(acknowledged);
                 if !acknowledged {
-                    return Err(io::Error::other("proxy stream promotion failed"));
+                    emitter.emit(&LifecycleRecord::OperationalError {
+                        code: "proxy.promotion_stale",
+                        message: "proxy worker completed before promotion dispatch",
+                    })?;
                 }
             }
             Some(accepted) = proxy_accept_rx.recv() => {
@@ -884,7 +919,13 @@ async fn main() -> io::Result<()> {
             Some(candidate) = proxy_rx.recv() => {
                 let peer_name = candidate.peer_id.to_string();
                 let request_id = candidate.open.as_ref().ok().map(|open| open.request_id);
-                let decision = {
+                let decision = if let Some(decision) = stale_proxy_candidate_decision(
+                    &proxy_worker_table,
+                    candidate.worker_id,
+                    request_id,
+                ) {
+                    decision
+                } else {
                     let now = unix_now();
                     let session = auth_state.current_session(now);
                     let context = session.as_ref().and_then(|session| {
@@ -1577,6 +1618,35 @@ mod tests {
             expected_service_set_hash: [5; 32],
             attempts: 0,
         }
+    }
+
+    #[test]
+    fn late_proxy_messages_do_not_recreate_completed_workers() {
+        let peer = libp2p::PeerId::random();
+        let connection = libp2p::swarm::ConnectionId::new_unchecked(1);
+        let mut workers = ProxyWorkerTable::default();
+        let worker_id = workers.insert(peer, connection, ProbePath::Direct);
+        assert!(stale_proxy_candidate_decision(&workers, worker_id, Some([1; 16])).is_none());
+        workers.remove(worker_id).unwrap();
+
+        assert!(matches!(
+            stale_proxy_candidate_decision(&workers, worker_id, Some([1; 16])),
+            Some(proxy_open::ServerDecision::Reject(
+                p2x_protocol::ProxyOpenResponseV1::Rejected { error, .. }
+            )) if error.code == PublicErrorCode::PeerSetupTimeout
+        ));
+        let tickets = ticket_admission::TicketAdmissionLedger::new(1, 0).unwrap();
+        let mut owner = ServerProxyOwner::new(tickets, None);
+        assert_eq!(
+            promote_proxy_worker(
+                worker_id,
+                stream_admission::AdmissionToken::new([2; 16]),
+                &workers,
+                &mut owner,
+            ),
+            Ok(false)
+        );
+        assert_eq!(owner.worker_count(), 0);
     }
 
     #[test]
