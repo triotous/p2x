@@ -18,6 +18,15 @@ class TunnelGateTests(unittest.TestCase):
         for marker in markers:
             self.assertEqual(live.private_markers_in(marker, markers), [marker])
 
+    def test_private_marker_evidence_requires_session_and_ticket(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "private-markers"
+            path.write_text("session:c2Vzc2lvbg\n")
+            with self.assertRaises(live.Failure):
+                live.read_test_private_markers(path)
+            path.write_text("session:c2Vzc2lvbg\nticket:dGlja2V0\n")
+            self.assertEqual(live.read_test_private_markers(path), ["c2Vzc2lvbg", "dGlja2V0"])
+
     def test_final_resources_require_every_zero_field(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "client.ndjson"

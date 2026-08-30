@@ -195,7 +195,8 @@ class Run:
         self.ticket_key = self.secret / "ticket.key"
         self.ticket_key.write_bytes(b"\x01" + secrets.token_bytes(32))
         self.ticket_key.chmod(0o600)
-        self.ticket_marker = base64.urlsafe_b64encode(self.ticket_key.read_bytes()).decode().rstrip("=")
+        self.ticket_key_marker = base64.urlsafe_b64encode(self.ticket_key.read_bytes()).decode().rstrip("=")
+        self.test_private_markers = self.secret / "private-markers"
         self.verification_keys = self.secret / "verification-keys.yaml"
         subprocess.run(
             [str(root / "target/debug/examples/ticket-verification"), str(self.ticket_key), str(self.verification_keys)],
@@ -390,8 +391,8 @@ limits:
     def start_exchange(self, name: str = "exchange") -> pathlib.Path:
         base = f"/ip4/127.0.0.1/tcp/{self.exchange_tcp}"
         advertised = base + f"/p2p/{self.exchange_peer}"
-        args = [str(self.root / "target/debug/p2x-exchange"), "--identity-file", str(self.secret / "exchange.key"), "--credential-file", str(self.credentials), "--ticket-key-file", str(self.ticket_key), "--tcp-listen", base, "--quic-listen", f"/ip4/127.0.0.1/udp/{self.exchange_quic}/quic-v1", "--advertise", advertised, "--case-id", self.case]
-        env = {}
+        args = [str(self.root / "target/debug/p2x-exchange"), "--identity-file", str(self.secret / "exchange.key"), "--credential-file", str(self.credentials), "--ticket-key-file", str(self.ticket_key), "--tcp-listen", base, "--quic-listen", f"/ip4/127.0.0.1/udp/{self.exchange_quic}/quic-v1", "--advertise", advertised, "--case-id", self.case, "--test-private-markers-file", str(self.test_private_markers)]
+        env = {"P2X_ENABLE_TEST_HOOKS": "1"}
         if self.case.split("/", 1)[0] in {"concurrent-streams", "resource-baseline"}:
             args += ["--resolve-limit-global", "256", "--resolve-limit-per-client", "128", "--resolve-limit-per-minute", "256"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
@@ -567,11 +568,28 @@ def private_markers_in(output: str, markers: list[str]) -> list[str]:
     return [marker for marker in markers if marker in output]
 
 
+def read_test_private_markers(path: pathlib.Path) -> list[str]:
+    by_kind: dict[str, list[str]] = {"session": [], "ticket": []}
+    if not path.exists():
+        raise Failure("exchange did not create the protected private-marker evidence")
+    for line in path.read_text(errors="strict").splitlines():
+        kind, separator, value = line.partition(":")
+        if not separator or kind not in by_kind or not value:
+            raise Failure("exchange wrote malformed private-marker evidence")
+        if value not in by_kind[kind]:
+            by_kind[kind].append(value)
+    missing = [kind for kind, values in by_kind.items() if not values]
+    if missing:
+        raise Failure(f"exchange did not expose run-random private markers for: {missing}")
+    return [value for values in by_kind.values() for value in values]
+
 def assert_privacy(run: Run, paths: list[pathlib.Path]) -> bool:
-    markers = [run.client_token, run.client2_token, run.server_token, *run.private, run.ticket_marker, run.payload_sentinel, f"127.0.0.1:{run.upstream_port}"]
+    markers = [run.client_token, run.client2_token, run.server_token, *run.private, run.ticket_key_marker, *read_test_private_markers(run.test_private_markers), run.payload_sentinel, f"127.0.0.1:{run.upstream_port}"]
     if private_markers_in("\n".join(markers), markers) != markers:
         raise Failure("privacy scanner did not detect every exact run marker in its canary")
-    output = "\n".join(path.read_text(errors="replace") for path in paths)
+    artifacts = set(paths)
+    artifacts.update(path for path in run.out.rglob("*") if path.is_file())
+    output = "\n".join(path.read_text(errors="replace") for path in artifacts)
     if leaked := private_markers_in(output, markers):
         raise Failure(f"privacy scan found exact run marker {leaked[0]}")
     return True

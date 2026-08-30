@@ -1,3 +1,4 @@
+use base64::Engine;
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use libp2p::{
@@ -23,8 +24,8 @@ use p2x_net::{
 use p2x_protocol::{AuthResponse, PublicError, PublicErrorCode};
 use std::{
     collections::HashSet,
-    io,
-    path::PathBuf,
+    io::{self, Write},
+    path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 fn validate_advertise(
@@ -75,6 +76,22 @@ fn chrono_like_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn append_test_private_marker(path: Option<&Path>, kind: &str, value: &[u8]) -> io::Result<()> {
+    let Some(path) = path else { return Ok(()) };
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    writeln!(
+        options.open(path)?,
+        "{kind}:{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value)
+    )
 }
 
 struct HeldResolveResponse {
@@ -140,6 +157,8 @@ struct Args {
     test_drop_first_resolve_response: bool,
     #[arg(long, hide = true)]
     test_hold_resolve_ms: Option<u64>,
+    #[arg(long, hide = true)]
+    test_private_markers_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -171,7 +190,8 @@ async fn main() -> io::Result<()> {
         || args.resolve_limit_per_minute.is_some()
         || args.resolve_limit_buckets.is_some()
         || args.test_drop_first_resolve_response
-        || args.test_hold_resolve_ms.is_some();
+        || args.test_hold_resolve_ms.is_some()
+        || args.test_private_markers_file.is_some();
     if test_hook_used && std::env::var("P2X_ENABLE_TEST_HOOKS").ok().as_deref() != Some("1") {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -401,8 +421,9 @@ async fn main() -> io::Result<()> {
                     }
                     let failed = matches!(&request, p2x_protocol::AuthRequest::Authenticate { .. });
                     let response = if let Some(provider) = provider.as_ref() { handle_request(provider, &mut sessions, &peer.to_string(), request, chrono_like_now(), Some(&relay_admission)) } else { AuthResponse::Rejected { request_id: wire_request_id, error: PublicError::new(PublicErrorCode::AuthSessionRequired, false) } };
-                    if let AuthResponse::Authenticated { .. } = response {
+                    if let AuthResponse::Authenticated { session_id, .. } = &response {
                         // Relay admission is installed transactionally by handle_request.
+                        append_test_private_marker(args.test_private_markers_file.as_deref(), "session", session_id)?;
                     }
                     let rejected = matches!(response, AuthResponse::Rejected { .. });
                     admission.mark_response(admission_request_id, rejected && failed);
@@ -441,7 +462,10 @@ async fn main() -> io::Result<()> {
                         }
                     };
                     let (resolved, request_id_hash, ticket_issued, code) = match &response {
-                        p2x_protocol::ResolveResponseV1::Resolved { request_id, .. } => {
+                        p2x_protocol::ResolveResponseV1::Resolved { request_id, ticket, .. } => {
+                            let (_, claims, _) = p2x_protocol::ticket::decode_envelope(ticket.as_bytes())
+                                .map_err(io::Error::other)?;
+                            append_test_private_marker(args.test_private_markers_file.as_deref(), "ticket", &claims.ticket_id())?;
                             (true, stable_hash(request_id), true, None)
                         }
                         p2x_protocol::ResolveResponseV1::Rejected { request_id, error } => (
@@ -813,4 +837,28 @@ async fn main() -> io::Result<()> {
         "shutdown",
     ))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protected_private_markers_are_exact_and_append_only() {
+        let path = std::env::temp_dir().join(format!(
+            "p2x-exchange-private-markers-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        append_test_private_marker(Some(&path), "session", &[1; 16]).unwrap();
+        append_test_private_marker(Some(&path), "ticket", &[2; 16]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "session:AQEBAQEBAQEBAQEBAQEBAQ\nticket:AgICAgICAgICAgICAgICAg\n"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 }
