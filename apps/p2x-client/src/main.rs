@@ -3088,7 +3088,7 @@ async fn main() -> io::Result<()> {
         let _ = swarm.disconnect_peer_id(peer);
     }
     let network_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while swarm.network_info().connection_counters().num_established() != 0 {
+    while swarm.network_info().connection_counters().num_connections() != 0 {
         match tokio::time::timeout_at(network_deadline, swarm.next()).await {
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => {
@@ -3098,7 +3098,7 @@ async fn main() -> io::Result<()> {
     }
     if product_ingress {
         emitter.emit(&LifecycleRecord::Resources {
-            connections: swarm.network_info().connection_counters().num_established() as usize,
+            connections: swarm.network_info().connection_counters().num_connections() as usize,
             pending_opens: proxy_pending.max(route_pending),
             workers: proxy_tasks.len(),
             tasks: ingress_tasks.len(),
