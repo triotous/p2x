@@ -102,8 +102,13 @@ impl IngressOwnerBook {
         self.proxy_tasks.remove(&open_id)
     }
 
-    pub fn remove_proxy_task_id(&mut self, task_id: tokio::task::Id) {
-        self.proxy_tasks.retain(|_, task| task.id() != task_id);
+    pub fn take_proxy_task_id(&mut self, task_id: tokio::task::Id) -> Option<OpenId> {
+        let open_id = self
+            .proxy_tasks
+            .iter()
+            .find_map(|(open_id, task)| (task.id() == task_id).then_some(*open_id))?;
+        self.proxy_tasks.remove(&open_id);
+        Some(open_id)
     }
 
     pub fn take_setup(&mut self, ingress_id: IngressId) -> Option<IngressSetupOwner> {
@@ -200,6 +205,11 @@ impl IngressOwnerBook {
 
     pub fn active_len(&self) -> usize {
         self.active.len()
+    }
+
+    #[cfg(test)]
+    pub fn proxy_task_len(&self) -> usize {
+        self.proxy_tasks.len()
     }
 
     #[allow(dead_code)]

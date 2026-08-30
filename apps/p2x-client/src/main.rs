@@ -690,14 +690,22 @@ fn dispatch_route_dial<E>(
     dial(address).map_err(|_| PublicErrorCode::PeerConnectionFailed)
 }
 
-async fn cancel_proxy_task(tasks: &mut tokio::task::JoinSet<()>, task: tokio::task::AbortHandle) {
-    task.abort();
-    while let Some(result) = tasks.join_next_with_id().await {
-        match result {
-            Ok((id, ())) if id == task.id() => break,
-            Err(error) if error.id() == task.id() => break,
-            _ => {}
-        }
+fn classify_proxy_task_completion(
+    owners: &mut IngressOwnerBook,
+    result: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
+) -> io::Result<Option<route_open::OpenId>> {
+    let task_id = result
+        .as_ref()
+        .map(|(id, ())| *id)
+        .unwrap_or_else(|error| error.id());
+    let open_id = owners.take_proxy_task_id(task_id);
+    match result {
+        Ok(_) => Ok(None),
+        Err(_) if open_id.is_some() => Ok(open_id),
+        Err(error) if error.is_cancelled() => Ok(None),
+        Err(error) => Err(io::Error::other(format!(
+            "unowned proxy setup task failed: {error}"
+        ))),
     }
 }
 
@@ -1391,7 +1399,7 @@ async fn main() -> io::Result<()> {
                             .unwrap_or_default();
                         if let Some(open_id) = ingress_owners.setup_open_id(id) {
                             if let Some(task) = ingress_owners.take_proxy_task(open_id) {
-                                cancel_proxy_task(&mut proxy_tasks, task).await;
+                                task.abort();
                             }
                             route_resolve_wires.retain(|_, (candidate, _, _)| *candidate != open_id);
                             route_proxy_requests.retain(|_, candidate| *candidate != open_id);
@@ -1477,10 +1485,42 @@ async fn main() -> io::Result<()> {
                 }
             }
             Some(result) = proxy_tasks.join_next_with_id(), if !proxy_tasks.is_empty() => {
-                let task_id = result.as_ref().map(|(id, ())| *id).unwrap_or_else(|error| error.id());
-                ingress_owners.remove_proxy_task_id(task_id);
-                if let Err(error) = result {
-                    return Err(io::Error::other(format!("proxy setup task failed: {error}")));
+                if let Some(open_id) = classify_proxy_task_completion(&mut ingress_owners, result)? {
+                    let owner = route_owner
+                        .as_mut()
+                        .ok_or_else(|| io::Error::other("proxy task route owner missing"))?;
+                    let action = owner
+                        .complete(open_id, Err(PublicErrorCode::PeerConnectionFailed))
+                        .ok_or_else(|| io::Error::other("proxy task route owner missing"))?;
+                    let completed_actions = drive_route_actions(
+                        &mut swarm,
+                        owner,
+                        expected_exchange,
+                        &emitter,
+                        &connections,
+                        &mut route_resolve_wires,
+                        &mut route_proxy_requests,
+                        &mut route_wire_sequence,
+                        vec![action],
+                    )?;
+                    if complete_route_actions(
+                        product_ingress,
+                        completed_actions,
+                        &mut resolver_state,
+                        &mut route_resolve_wires,
+                        &mut route_proxy_requests,
+                        &mut ingress_owners,
+                        owner,
+                        expected_exchange,
+                        &connections,
+                        &mut route_wire_sequence,
+                        &mut connection_manager,
+                        &mut swarm,
+                        &emitter,
+                        &args.case_id,
+                    ).await? {
+                        return Ok(());
+                    }
                 }
             }
             Some(worker) = worker_rx.recv() => {
@@ -3185,6 +3225,89 @@ mod tests {
         tasks.spawn(async {});
 
         assert!(tasks.join_next().await.unwrap().is_ok());
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn proxy_task_panic_is_attributed_without_losing_unrelated_completion() {
+        let mut owners = IngressOwnerBook::default();
+        let mut tasks = tokio::task::JoinSet::new();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        for (ingress_id, open_id) in [(1, 11), (2, 12)] {
+            let (command, _) = tokio::sync::mpsc::channel(1);
+            owners
+                .insert_setup(ingress_owner::IngressSetupOwner {
+                    ingress_id: ingress::IngressId(ingress_id),
+                    route_id: "orders".into(),
+                    accepted_at: std::time::Instant::now(),
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    command,
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                    open_id: None,
+                })
+                .unwrap();
+            owners
+                .attach_open(ingress::IngressId(ingress_id), route_open::OpenId(open_id))
+                .unwrap();
+        }
+        let completed = tasks.spawn(async {});
+        owners
+            .set_proxy_task(route_open::OpenId(11), completed)
+            .unwrap();
+        let panicked = tasks.spawn(async move {
+            let _ = wait.await;
+            panic!("proxy setup panic");
+        });
+        owners
+            .set_proxy_task(route_open::OpenId(12), panicked)
+            .unwrap();
+
+        let first = tasks.join_next_with_id().await.unwrap();
+        assert_eq!(
+            classify_proxy_task_completion(&mut owners, first).unwrap(),
+            None
+        );
+        assert_eq!(owners.proxy_task_len(), 1);
+        release.send(()).unwrap();
+        let second = tasks.join_next_with_id().await.unwrap();
+        assert_eq!(
+            classify_proxy_task_completion(&mut owners, second).unwrap(),
+            Some(route_open::OpenId(12))
+        );
+        assert_eq!(owners.proxy_task_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_proxy_task_cancellation_is_not_a_daemon_failure() {
+        let mut owners = IngressOwnerBook::default();
+        let (command, _) = tokio::sync::mpsc::channel(1);
+        owners
+            .insert_setup(ingress_owner::IngressSetupOwner {
+                ingress_id: ingress::IngressId(1),
+                route_id: "orders".into(),
+                accepted_at: std::time::Instant::now(),
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                command,
+                cancel: tokio_util::sync::CancellationToken::new(),
+                open_id: None,
+            })
+            .unwrap();
+        owners
+            .attach_open(ingress::IngressId(1), route_open::OpenId(11))
+            .unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        let task = tasks.spawn(std::future::pending::<()>());
+        owners.set_proxy_task(route_open::OpenId(11), task).unwrap();
+        owners
+            .take_proxy_task(route_open::OpenId(11))
+            .unwrap()
+            .abort();
+
+        let result = tasks.join_next_with_id().await.unwrap();
+        assert_eq!(
+            classify_proxy_task_completion(&mut owners, result).unwrap(),
+            None
+        );
         assert!(tasks.is_empty());
     }
 
