@@ -552,10 +552,18 @@ fn drive_route_actions(
                     );
                 match request {
                     Ok(request_id) => {
-                        if !owner.proxy_queued(open_id, request_id.0, connection) {
-                            return Err(io::Error::other("route owner rejected proxy dispatch"));
-                        }
+                        let queued = owner
+                            .proxy_queued(
+                                open_id,
+                                request_id.0,
+                                connection,
+                                std::time::Instant::now(),
+                            )
+                            .ok_or_else(|| {
+                                io::Error::other("route owner rejected proxy dispatch")
+                            })?;
                         proxy_requests.insert(request_id, open_id);
+                        actions.extend(queued);
                         emitter.emit(&LifecycleRecord::PathSelected {
                             request_id: request_id.0,
                             connection_id_hash: stable_hash(connection),
@@ -590,8 +598,18 @@ fn drive_route_actions(
                 open_id,
                 server,
                 request_id,
+                proxy_request_id,
                 result,
-            } => completed.push((open_id, server, request_id, result)),
+            } => {
+                if let Some(request_id) = proxy_request_id {
+                    let request_id = ProxyRequestId(request_id);
+                    proxy_requests.remove(&request_id);
+                    if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
+                        proxy.cancel(request_id);
+                    }
+                }
+                completed.push((open_id, server, request_id, result));
+            }
             route_open::RouteAction::StartHandshakeWorker { .. } => {
                 return Err(io::Error::other(
                     "handshake worker action must be dispatched from an opened stream",
