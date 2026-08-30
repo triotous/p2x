@@ -1462,6 +1462,11 @@ async fn main() -> io::Result<()> {
                     }
                 }
             }
+            Some(result) = proxy_tasks.join_next(), if !proxy_tasks.is_empty() => {
+                if let Err(error) = result {
+                    return Err(io::Error::other(format!("proxy setup task failed: {error}")));
+                }
+            }
             Some(worker) = worker_rx.recv() => {
                 let peer = worker.peer_id.to_string();
                 match worker.result {
@@ -3153,6 +3158,15 @@ mod tests {
             dispatch_route_dial(vec![0xff], |_| Ok::<_, ()>(())),
             Err(PublicErrorCode::PeerConnectionFailed)
         );
+    }
+
+    #[tokio::test]
+    async fn completed_proxy_tasks_are_joined() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async {});
+
+        assert!(tasks.join_next().await.unwrap().is_ok());
+        assert!(tasks.is_empty());
     }
 
     #[tokio::test]
