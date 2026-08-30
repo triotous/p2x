@@ -308,13 +308,51 @@ fn finish_proxy_worker(
     workers: &mut ProxyWorkerTable,
     owner: &mut ServerProxyOwner,
     swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
-    connection_paths: &HashMap<libp2p::swarm::ConnectionId, ProbePath>,
     emitter: &Emitter,
 ) -> io::Result<()> {
     let record = workers
         .remove(release.worker_id)
         .ok_or_else(|| io::Error::other("proxy worker completion missing owner"))?;
-    finish_proxy_worker_record(release, record, owner, swarm, connection_paths, emitter)
+    finish_proxy_worker_record(release, record, owner, swarm, emitter)
+}
+
+fn record_proxy_accepted(
+    accepted: proxy_open::Accepted,
+    workers: &mut ProxyWorkerTable,
+    emitter: &Emitter,
+) -> io::Result<()> {
+    if workers.get(accepted.worker_id).is_none() {
+        return Err(io::Error::other("accepted proxy worker owner missing"));
+    }
+    workers
+        .mark_accepted(
+            accepted.worker_id,
+            accepted.setup_duration,
+            accepted.request_id_hash,
+            accepted.stream_id_hash,
+        )
+        .map_err(io::Error::other)?;
+    let peer = accepted.peer_id.to_string();
+    emitter.emit(&LifecycleRecord::TunnelAccepted {
+        component_side: p2x_net::lifecycle::ComponentSide::Server,
+        peer_id: &peer,
+        connection_id_hash: stable_hash(accepted.connection_id),
+        request_id_hash: accepted.request_id_hash,
+        stream_id_hash: accepted.stream_id_hash,
+        selected_path: Some(accepted.selected_path),
+        setup_duration_ms: accepted.setup_duration.as_millis(),
+    })
+}
+
+fn drain_proxy_accepts(
+    accepts: &mut mpsc::Receiver<proxy_open::Accepted>,
+    workers: &mut ProxyWorkerTable,
+    emitter: &Emitter,
+) -> io::Result<()> {
+    while let Ok(accepted) = accepts.try_recv() {
+        record_proxy_accepted(accepted, workers, emitter)?;
+    }
+    Ok(())
 }
 
 fn release_from_worker_record(
@@ -339,12 +377,47 @@ fn release_from_worker_record(
     }
 }
 
+async fn abort_and_join_proxy_workers(
+    proxy_workers: &mut JoinSet<proxy_open::Release>,
+    proxy_worker_tasks: &mut HashMap<tokio::task::Id, proxy_open::ProxyWorkerId>,
+    proxy_worker_table: &mut ProxyWorkerTable,
+    proxy_owner: &mut ServerProxyOwner,
+    swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
+    proxy_accept_rx: &mut mpsc::Receiver<proxy_open::Accepted>,
+    emitter: &Emitter,
+) -> io::Result<()> {
+    proxy_workers.abort_all();
+    drain_proxy_accepts(proxy_accept_rx, proxy_worker_table, emitter)?;
+    while let Some(result) = proxy_workers.join_next_with_id().await {
+        drain_proxy_accepts(proxy_accept_rx, proxy_worker_table, emitter)?;
+        match result {
+            Ok((task_id, release)) => {
+                proxy_worker_tasks.remove(&task_id);
+                finish_proxy_worker(release, proxy_worker_table, proxy_owner, swarm, emitter)?;
+            }
+            Err(error) => {
+                let task_id = error.id();
+                let worker_id = proxy_worker_tasks
+                    .remove(&task_id)
+                    .ok_or_else(|| io::Error::other("aborted proxy worker owner missing"))?;
+                let record = proxy_worker_table
+                    .remove(worker_id)
+                    .ok_or_else(|| io::Error::other("aborted proxy worker record missing"))?;
+                let release =
+                    release_from_worker_record(worker_id, record, PublicErrorCode::PeerDraining);
+                finish_proxy_worker_record(release, record, proxy_owner, swarm, emitter)?;
+            }
+        }
+    }
+    drain_proxy_accepts(proxy_accept_rx, proxy_worker_table, emitter)?;
+    Ok(())
+}
+
 fn finish_proxy_worker_record(
     release: proxy_open::Release,
     record: p2x_server::proxy_owner::WorkerRecord,
     owner: &mut ServerProxyOwner,
     swarm: &mut libp2p::Swarm<p2x_net::builder::PeerBehaviour>,
-    connection_paths: &HashMap<libp2p::swarm::ConnectionId, ProbePath>,
     emitter: &Emitter,
 ) -> io::Result<()> {
     if let Some(proxy) = swarm.behaviour_mut().proxy_stream.as_mut() {
@@ -426,7 +499,6 @@ fn finish_proxy_worker_record(
             code: Some(code.as_str()),
         })?;
     }
-    let _ = connection_paths;
     Ok(())
 }
 
@@ -773,10 +845,11 @@ async fn main() -> io::Result<()> {
                 }
             }
             Some(result) = proxy_workers.join_next_with_id() => {
+                drain_proxy_accepts(&mut proxy_accept_rx, &mut proxy_worker_table, &emitter)?;
                 match result {
                     Ok((task_id, release)) => {
                         proxy_worker_tasks.remove(&task_id);
-                        finish_proxy_worker(release, &mut proxy_worker_table, &mut proxy_owner, &mut swarm, &connection_paths, &emitter)?;
+                        finish_proxy_worker(release, &mut proxy_worker_table, &mut proxy_owner, &mut swarm, &emitter)?;
                     }
                     Err(error) => {
                         let task_id = error.id();
@@ -791,7 +864,7 @@ async fn main() -> io::Result<()> {
                             record,
                             PublicErrorCode::PeerConnectionFailed,
                         );
-                        finish_proxy_worker_record(release, record, &mut proxy_owner, &mut swarm, &connection_paths, &emitter)?;
+                        finish_proxy_worker_record(release, record, &mut proxy_owner, &mut swarm, &emitter)?;
                     }
                 }
             }
@@ -806,27 +879,7 @@ async fn main() -> io::Result<()> {
                 }
             }
             Some(accepted) = proxy_accept_rx.recv() => {
-                if proxy_worker_table.get(accepted.worker_id).is_none() {
-                    continue;
-                }
-                proxy_worker_table
-                    .mark_accepted(
-                        accepted.worker_id,
-                        accepted.setup_duration,
-                        accepted.request_id_hash,
-                        accepted.stream_id_hash,
-                    )
-                    .map_err(io::Error::other)?;
-                let peer = accepted.peer_id.to_string();
-                emitter.emit(&LifecycleRecord::TunnelAccepted {
-                    component_side: p2x_net::lifecycle::ComponentSide::Server,
-                    peer_id: &peer,
-                    connection_id_hash: stable_hash(accepted.connection_id),
-                    request_id_hash: accepted.request_id_hash,
-                    stream_id_hash: accepted.stream_id_hash,
-                    selected_path: Some(accepted.selected_path),
-                    setup_duration_ms: accepted.setup_duration.as_millis(),
-                })?;
+                record_proxy_accepted(accepted, &mut proxy_worker_table, &emitter)?;
             }
             Some(candidate) = proxy_rx.recv() => {
                 let peer_name = candidate.peer_id.to_string();
@@ -1343,7 +1396,10 @@ async fn main() -> io::Result<()> {
         proxy.set_draining(true);
     }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while (worker_admission.admitted() > 0 || !proxy_worker_table.is_empty())
+    while (worker_admission.admitted() > 0
+        || !proxy_worker_table.is_empty()
+        || !proxy_worker_tasks.is_empty()
+        || !proxy_workers.is_empty())
         && tokio::time::Instant::now() < deadline
     {
         tokio::select! {
@@ -1375,33 +1431,14 @@ async fn main() -> io::Result<()> {
                 ));
             }
             Some(accepted) = proxy_accept_rx.recv() => {
-                if proxy_worker_table.get(accepted.worker_id).is_none() {
-                    continue;
-                }
-                proxy_worker_table
-                    .mark_accepted(
-                        accepted.worker_id,
-                        accepted.setup_duration,
-                        accepted.request_id_hash,
-                        accepted.stream_id_hash,
-                    )
-                    .map_err(io::Error::other)?;
-                let peer = accepted.peer_id.to_string();
-                emitter.emit(&LifecycleRecord::TunnelAccepted {
-                    component_side: p2x_net::lifecycle::ComponentSide::Server,
-                    peer_id: &peer,
-                    connection_id_hash: stable_hash(accepted.connection_id),
-                    request_id_hash: accepted.request_id_hash,
-                    stream_id_hash: accepted.stream_id_hash,
-                    selected_path: Some(accepted.selected_path),
-                    setup_duration_ms: accepted.setup_duration.as_millis(),
-                })?;
+                record_proxy_accepted(accepted, &mut proxy_worker_table, &emitter)?;
             }
             Some(result) = proxy_workers.join_next_with_id() => {
+                drain_proxy_accepts(&mut proxy_accept_rx, &mut proxy_worker_table, &emitter)?;
                 match result {
                     Ok((task_id, release)) => {
                         proxy_worker_tasks.remove(&task_id);
-                        finish_proxy_worker(release, &mut proxy_worker_table, &mut proxy_owner, &mut swarm, &connection_paths, &emitter)?;
+                        finish_proxy_worker(release, &mut proxy_worker_table, &mut proxy_owner, &mut swarm, &emitter)?;
                     }
                     Err(error) => {
                         let task_id = error.id();
@@ -1412,7 +1449,7 @@ async fn main() -> io::Result<()> {
                             .remove(worker_id)
                             .ok_or_else(|| io::Error::other("shutdown proxy worker record missing"))?;
                         let release = release_from_worker_record(worker_id, record, PublicErrorCode::PeerDraining);
-                        finish_proxy_worker_record(release, record, &mut proxy_owner, &mut swarm, &connection_paths, &emitter)?;
+                        finish_proxy_worker_record(release, record, &mut proxy_owner, &mut swarm, &emitter)?
                     }
                 }
             }
@@ -1421,6 +1458,16 @@ async fn main() -> io::Result<()> {
             }
         }
     }
+    abort_and_join_proxy_workers(
+        &mut proxy_workers,
+        &mut proxy_worker_tasks,
+        &mut proxy_worker_table,
+        &mut proxy_owner,
+        &mut swarm,
+        &mut proxy_accept_rx,
+        &emitter,
+    )
+    .await?;
     if !config.is_connectivity_lab() {
         let _ = availability.begin_shutdown();
         let snapshot = availability.readiness(unix_now());
@@ -1483,46 +1530,6 @@ async fn main() -> io::Result<()> {
     availability.stopped();
     proxy_owner.clear_tickets();
     connection_paths.clear();
-    if !proxy_worker_table.is_empty() {
-        proxy_workers.abort_all();
-        while let Some(result) = proxy_workers.join_next_with_id().await {
-            match result {
-                Ok((task_id, release)) => {
-                    proxy_worker_tasks.remove(&task_id);
-                    finish_proxy_worker(
-                        release,
-                        &mut proxy_worker_table,
-                        &mut proxy_owner,
-                        &mut swarm,
-                        &connection_paths,
-                        &emitter,
-                    )?;
-                }
-                Err(error) => {
-                    let task_id = error.id();
-                    let worker_id = proxy_worker_tasks
-                        .remove(&task_id)
-                        .ok_or_else(|| io::Error::other("aborted proxy worker owner missing"))?;
-                    let record = proxy_worker_table
-                        .remove(worker_id)
-                        .ok_or_else(|| io::Error::other("aborted proxy worker record missing"))?;
-                    let release = release_from_worker_record(
-                        worker_id,
-                        record,
-                        PublicErrorCode::PeerDraining,
-                    );
-                    finish_proxy_worker_record(
-                        release,
-                        record,
-                        &mut proxy_owner,
-                        &mut swarm,
-                        &connection_paths,
-                        &emitter,
-                    )?;
-                }
-            }
-        }
-    }
     if !proxy_worker_table.is_empty() || !proxy_worker_tasks.is_empty() {
         return Err(io::Error::other(
             "proxy worker table leaked during shutdown",
