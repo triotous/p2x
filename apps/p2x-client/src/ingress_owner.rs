@@ -39,6 +39,7 @@ pub struct IngressOwnerBook {
     setup: HashMap<IngressId, IngressSetupOwner>,
     active: HashMap<IngressId, ActiveTunnelOwner>,
     by_open: HashMap<OpenId, IngressId>,
+    proxy_tasks: HashMap<OpenId, tokio::task::AbortHandle>,
     high_water: usize,
 }
 
@@ -85,10 +86,31 @@ impl IngressOwnerBook {
             .map(|owner| owner.cancel.clone())
     }
 
+    pub fn set_proxy_task(
+        &mut self,
+        open_id: OpenId,
+        task: tokio::task::AbortHandle,
+    ) -> Result<(), &'static str> {
+        if !self.by_open.contains_key(&open_id) || self.proxy_tasks.contains_key(&open_id) {
+            return Err("ingress proxy task owner missing");
+        }
+        self.proxy_tasks.insert(open_id, task);
+        Ok(())
+    }
+
+    pub fn take_proxy_task(&mut self, open_id: OpenId) -> Option<tokio::task::AbortHandle> {
+        self.proxy_tasks.remove(&open_id)
+    }
+
+    pub fn remove_proxy_task_id(&mut self, task_id: tokio::task::Id) {
+        self.proxy_tasks.retain(|_, task| task.id() != task_id);
+    }
+
     pub fn take_setup(&mut self, ingress_id: IngressId) -> Option<IngressSetupOwner> {
         let owner = self.setup.remove(&ingress_id)?;
         if let Some(open_id) = owner.open_id {
             self.by_open.remove(&open_id);
+            self.proxy_tasks.remove(&open_id);
         }
         Some(owner)
     }
@@ -231,6 +253,18 @@ mod tests {
         assert!(book.take_active(IngressId(1)).is_some());
         assert!(book.take_active(IngressId(1)).is_none());
         assert!(book.is_empty());
+    }
+
+    #[tokio::test]
+    async fn proxy_task_owner_is_released_with_setup() {
+        let mut book = IngressOwnerBook::default();
+        book.insert_setup(setup(1)).unwrap();
+        book.attach_open(IngressId(1), OpenId(9)).unwrap();
+        book.set_proxy_task(OpenId(9), tokio::spawn(async {}).abort_handle())
+            .unwrap();
+
+        assert!(book.take_setup_for_open(OpenId(9)).is_some());
+        assert!(book.take_proxy_task(OpenId(9)).is_none());
     }
 
     #[test]

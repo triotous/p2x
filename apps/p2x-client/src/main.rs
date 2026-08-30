@@ -690,6 +690,17 @@ fn dispatch_route_dial<E>(
     dial(address).map_err(|_| PublicErrorCode::PeerConnectionFailed)
 }
 
+async fn cancel_proxy_task(tasks: &mut tokio::task::JoinSet<()>, task: tokio::task::AbortHandle) {
+    task.abort();
+    while let Some(result) = tasks.join_next_with_id().await {
+        match result {
+            Ok((id, ())) if id == task.id() => break,
+            Err(error) if error.id() == task.id() => break,
+            _ => {}
+        }
+    }
+}
+
 async fn cancel_and_join_proxy_tasks(
     shutdown: &tokio_util::sync::CancellationToken,
     tasks: &mut tokio::task::JoinSet<()>,
@@ -1379,6 +1390,9 @@ async fn main() -> io::Result<()> {
                             .map(|owner| owner.route_id.clone())
                             .unwrap_or_default();
                         if let Some(open_id) = ingress_owners.setup_open_id(id) {
+                            if let Some(task) = ingress_owners.take_proxy_task(open_id) {
+                                cancel_proxy_task(&mut proxy_tasks, task).await;
+                            }
                             route_resolve_wires.retain(|_, (candidate, _, _)| *candidate != open_id);
                             route_proxy_requests.retain(|_, candidate| *candidate != open_id);
                             if let Some(route_owner) = route_owner.as_mut() {
@@ -1462,7 +1476,9 @@ async fn main() -> io::Result<()> {
                     }
                 }
             }
-            Some(result) = proxy_tasks.join_next(), if !proxy_tasks.is_empty() => {
+            Some(result) = proxy_tasks.join_next_with_id(), if !proxy_tasks.is_empty() => {
+                let task_id = result.as_ref().map(|(id, ())| *id).unwrap_or_else(|error| error.id());
+                ingress_owners.remove_proxy_task_id(task_id);
                 if let Err(error) = result {
                     return Err(io::Error::other(format!("proxy setup task failed: {error}")));
                 }
@@ -2500,7 +2516,7 @@ async fn main() -> io::Result<()> {
                         } else {
                             shutdown.child_token()
                         };
-                        proxy_tasks.spawn(async move {
+                        let proxy_task = proxy_tasks.spawn(async move {
                             let result = tokio::select! {
                                 _ = cancel.cancelled() => return,
                                 result = async {
@@ -2511,6 +2527,9 @@ async fn main() -> io::Result<()> {
                             };
                             let _ = tx.send(ProxyResult { open_id: Some(open_id), request_id: open.request_id, result }).await;
                         });
+                        ingress_owners
+                            .set_proxy_task(open_id, proxy_task)
+                            .map_err(io::Error::other)?;
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Proxy(ProxyOutput::OutboundFailed { request_id, peer_id: _, connection_id: _, code: _ })) if route_proxy_requests.contains_key(&request_id) => {
                         let open_id = route_proxy_requests.remove(&request_id).expect("checked route proxy request exists");
