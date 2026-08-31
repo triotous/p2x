@@ -96,6 +96,43 @@ class TunnelGateTests(unittest.TestCase):
                 [{"event": "proxy_authorization", "authorized": False, "code": "limit.proxy_streams"}],
             )
 
+    def test_stream_limit_rejections_are_exact_logical_requests(self) -> None:
+        accepted = [
+            {"event": "tunnel_accepted", "peer_id": "client-a"},
+            {"event": "tunnel_accepted", "peer_id": "client-b"},
+        ]
+        rejected = {
+            "event": "proxy_authorization",
+            "peer_id": "client-a",
+            "request_id_hash": 7,
+            "authorized": False,
+            "code": "limit.proxy_streams",
+        }
+        self.assertEqual(
+            live.assert_named_contract("stream-limits/server-client", [], accepted + [rejected, rejected]),
+            "stream_limit_boundary",
+        )
+        with self.assertRaises(live.Failure):
+            live.assert_named_contract(
+                "stream-limits/server-client",
+                [],
+                accepted + [rejected, {**rejected, "request_id_hash": 8}],
+            )
+
+    def test_server_dial_requires_held_and_final_zero_dial_count(self) -> None:
+        rows = [
+            {"event": "resources", "tasks": 1},
+            {"event": "tunnel_accepted"},
+            {"event": "proxy_authorization", "peer_id": "client", "request_id_hash": 7, "authorized": False, "code": "limit.proxy_streams"},
+            {"event": "resources", "tasks": 0},
+        ]
+        self.assertEqual(
+            live.assert_named_contract("stream-limits/server-dial", [], rows),
+            "stream_limit_boundary",
+        )
+        with self.assertRaises(live.Failure):
+            live.assert_named_contract("stream-limits/server-dial", [], rows[:-1])
+
     def test_setup_shutdown_requires_production_boundary_before_accepted(self) -> None:
         client_rows = [{"event": "route_owner_high_water", "opens": 1}, {"event": "terminal", "code": "shutdown"}]
         server_rows = [{"event": "test_fault_applied", "fault": "hold_server_verification"}]

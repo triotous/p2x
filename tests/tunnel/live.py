@@ -277,8 +277,9 @@ credentials:
         max_upstream_dials = 1 if self.case in {"stream-limits/server-dial", "stream-limits"} else 2 if self.case in {"stream-limits/client-server", "stream-limits/server-client", "stream-limits/server-global", "stream-limits/server-service"} else 128 if concurrent else 64
         concurrency_limit = 1 if self.case in {"stream-limits", "stream-limits/server-service"} else 2 if self.case in {"stream-limits/client-server", "stream-limits/server-client", "stream-limits/server-global", "stream-limits/server-dial"} else 128 if concurrent else 64
         if self.case == "stream-limits/server-global":
-            max_workers = max_upstream_dials = concurrency_limit = 2
+            max_workers = 2
             max_workers_per_client = 128
+            max_upstream_dials = concurrency_limit = 4
         if self.case == "stream-limits/client-ingress":
             max_workers = max_workers_per_client = max_upstream_dials = concurrency_limit = 2
         if self.case == "stream-limits/client-server":
@@ -670,34 +671,36 @@ def assert_named_contract(requested_case: str, client_rows: list[dict], server_r
         return "per_ingress_failure_recovery"
     if requested_case.startswith("stream-limits/"):
         client_rejections = [row for row in client_rows if row.get("event") == "ingress_rejected"]
-        server_rejections = [row for row in server_rows if row.get("event") == "proxy_authorization" and not row.get("authorized")]
+        server_accepted = [row for row in server_rows if row.get("event") == "tunnel_accepted"]
+        server_rejections = {
+            (row.get("peer_id"), row.get("request_id_hash"), row.get("code"))
+            for row in server_rows
+            if row.get("event") == "proxy_authorization" and not row.get("authorized")
+        }
         if requested_case == "stream-limits/client-ingress":
-            if not any(row.get("code") == "limit.proxy_streams" for row in client_rejections):
-                raise Failure("client-ingress did not reject N+1 at the local ingress")
-            if len([row for row in server_rows if row.get("event") == "tunnel_accepted"]) != 2:
-                raise Failure("client-ingress did not reuse released capacity")
+            resolved = [row for row in client_rows if row.get("event") == "resolution_outcome" and row.get("resolved")]
+            if len(client_rejections) != 1 or client_rejections[0].get("code") != "limit.proxy_streams" or len(resolved) != 2 or len(server_accepted) != 2 or server_rejections:
+                raise Failure("client-ingress did not reject N+1 before route work and reuse exact local capacity")
         elif requested_case == "stream-limits/client-server":
-            if not any(row.get("code") in {"limit.proxy_streams", "limit.peer_connections"} for row in client_rejections):
-                raise Failure("client-server did not reject N+1 at the client")
-            if server_rejections:
-                raise Failure("client-server sent its local-only overflow to the server")
+            if len(client_rejections) != 1 or client_rejections[0].get("code") != "limit.peer_connections" or len(server_accepted) != 2 or server_rejections:
+                raise Failure("client-server did not enforce exact local per-server N/N+1 and reuse")
         elif requested_case == "stream-limits/server-global":
-            if not any(row.get("code") == "limit.proxy_streams" for row in server_rejections):
-                raise Failure("server-global did not reject N+1 globally")
+            if len(server_rejections) != 1 or next(iter(server_rejections))[1:] != (0, "limit.proxy_streams") or len(server_accepted) != 3:
+                raise Failure("server-global did not enforce exact pre-request global N/N+1 and reuse")
         elif requested_case == "stream-limits/server-client":
-            if len([row for row in server_rows if row.get("event") == "tunnel_accepted"]) != 2:
-                raise Failure("server-client did not admit the second authenticated client")
+            accepted_peers = {row.get("peer_id") for row in server_accepted}
+            rejected_peers = {peer for peer, _, code in server_rejections if code == "limit.proxy_streams"}
+            if len(server_rejections) != 1 or len(server_accepted) != 2 or len(accepted_peers) != 2 or not rejected_peers < accepted_peers:
+                raise Failure("server-client did not isolate one client's N+1 from another client")
         elif requested_case == "stream-limits/server-service":
-            if not any(row.get("code") == "limit.proxy_streams" for row in server_rejections):
-                raise Failure("server-service did not reject N+1 at service capacity")
+            if len(server_rejections) != 1 or next(iter(server_rejections))[1] in {None, 0} or next(iter(server_rejections))[2] != "limit.proxy_streams" or len(server_accepted) != 2:
+                raise Failure("server-service did not enforce exact correlated service N/N+1 and reuse")
         elif requested_case == "stream-limits/server-dial":
-            if not any(row.get("code") == "limit.proxy_streams" for row in server_rejections):
-                raise Failure("server-dial did not reject N+1 before ticket consume")
-            if not any(row.get("event") == "resources" and row.get("tasks") == 0 for row in server_rows):
-                raise Failure("server-dial did not return dialing entries to zero")
-        else:
-            if not any(row.get("code") == "limit.proxy_streams" for row in server_rejections):
-                raise Failure(f"{requested_case} did not observe server N+1 rejection")
+            if len(server_rejections) != 1 or next(iter(server_rejections))[1] in {None, 0} or next(iter(server_rejections))[2] != "limit.proxy_streams" or len(server_accepted) != 1:
+                raise Failure("server-dial did not enforce exact correlated held-dial N/N+1")
+            dialing = [row.get("tasks") for row in server_rows if row.get("event") == "resources"]
+            if 1 not in dialing or not dialing or dialing[-1] != 0:
+                raise Failure("server-dial did not hold exactly one dial and drain it to zero")
         return "stream_limit_boundary"
     if requested_case.startswith("shutdown/"):
         if not any(row.get("event") == "terminal" and row.get("code") == "shutdown" for row in client_rows + server_rows):
@@ -1063,6 +1066,8 @@ def run_case(root: pathlib.Path, case: str) -> dict:
             if recv_exact(reusable, len(b"server-limit-reused")) != b"server-limit-reused":
                 raise Failure(f"{requested_case} did not reuse released service capacity")
             reusable.close()
+            if run.upstream is None or run.upstream.accepted_connections != 2:
+                raise Failure("server-service overflow created an extra upstream connection")
         elif requested_case == "stream-limits/server-dial":
             assert client is not None
             client.sendall(b"held-server-dial")
@@ -1077,11 +1082,18 @@ def run_case(root: pathlib.Path, case: str) -> dict:
             wait_for(client_log, lambda row: row.get("event") == "tunnel_accepted", 10)
             client.close()
             client = None
-            wait_for(server_log, lambda row: row.get("event") == "resources" and row.get("tasks") == 0, 30)
+            terminal = wait_for(server_log, lambda row: row.get("event") == "tunnel_terminal" and row.get("accepted") is True, 30)
+            wait_for(server_log, lambda row: row.get("event") == "resources" and row.get("tasks") == 0 and row.get("offset_ms", 0) > terminal.get("offset_ms", 0), 30)
         elif requested_case == "stream-limits/server-client":
             assert client is not None and client2_log is not None
             client.sendall(b"server-client-held")
-            wait_for_count(server_log, lambda row: row.get("event") == "tunnel_accepted", 1, 60)
+            first_accepted = wait_for(server_log, lambda row: row.get("event") == "tunnel_accepted", 60)
+            overflow = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            overflow.settimeout(20)
+            overflow.sendall(b"server-client-overflow")
+            wait_for(server_log, lambda row: row.get("event") == "proxy_authorization" and row.get("peer_id") == first_accepted.get("peer_id") and row.get("authorized") is False and row.get("code") == "limit.proxy_streams", 30)
+            wait_for_eof(overflow)
+            overflow.close()
             client2 = socket.create_connection(("127.0.0.1", run.local_port2), timeout=20)
             client2.settimeout(30)
             client2.sendall(b"server-client-second")

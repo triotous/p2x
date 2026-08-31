@@ -222,7 +222,6 @@ impl ServiceConfig {
             || proxy.max_workers_per_client > 256
             || proxy.max_upstream_dials == 0
             || proxy.max_upstream_dials > 512
-            || proxy.max_upstream_dials > proxy.max_workers
             || !(p2x_proxy::MIN_COPY_BUFFER..=p2x_proxy::MAX_COPY_BUFFER)
                 .contains(&proxy.copy_buffer_bytes)
             || proxy
@@ -230,9 +229,6 @@ impl ServiceConfig {
                 .checked_mul(proxy.max_workers)
                 .and_then(|value| value.checked_mul(2))
                 .is_none()
-            || upstreams
-                .values()
-                .any(|upstream| upstream.concurrency_limit > proxy.max_workers)
             || proxy.max_replay_entries == 0
             || proxy.max_replay_entries > 65_536
             || proxy.ticket_clock_skew > 30
@@ -291,6 +287,23 @@ mod tests {
         assert_eq!(config.service_set_hash, config.services.hash());
         let _ = std::fs::remove_file(path);
     }
+    #[test]
+    fn independent_limits_may_exceed_global_workers() {
+        let path = std::env::temp_dir().join(format!(
+            "p2x-services-independent-limits-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, "schema_version: 1\nregistration: {}\nservices:\n- upstream_id: orders\n  selector:\n    protocol: tcp\n    metadata: {service: orders}\n  enabled: true\n  connect: 127.0.0.1:5432\n  concurrency_limit: 4\nproxy:\n  max_workers: 2\n  max_workers_per_client: 32\n  max_upstream_dials: 4\n").unwrap();
+        let config = ServiceConfig::load(&path).unwrap();
+        assert_eq!(config.proxy.max_workers, 2);
+        assert_eq!(config.proxy.max_upstream_dials, 4);
+        assert_eq!(
+            config.upstreams.values().next().unwrap().concurrency_limit,
+            4
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn strict_service_config_requires_enabled_service() {
         let path = std::env::temp_dir().join(format!("p2x-services-{}", std::process::id()));
