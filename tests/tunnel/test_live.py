@@ -57,6 +57,25 @@ class TunnelGateTests(unittest.TestCase):
                 [],
             )
 
+    def test_resolve_recovery_requires_a_real_rejected_response(self) -> None:
+        client_rows = [
+            {"event": "started"},
+            {"event": "ingress_accepted", "ingress_id": 1},
+            {"event": "ingress_accepted", "ingress_id": 2},
+            {"event": "resolution_outcome", "code": "registry.offline"},
+            {"event": "ingress_rejected", "ingress_id": 1, "code": "registry.offline"},
+        ]
+        self.assertEqual(
+            live.assert_named_contract("per-ingress-failure-recovery/resolve", client_rows, []),
+            "per_ingress_failure_recovery",
+        )
+        with self.assertRaises(live.Failure):
+            live.assert_named_contract(
+                "per-ingress-failure-recovery/resolve",
+                [row for row in client_rows if row.get("event") != "resolution_outcome"],
+                [],
+            )
+
     def test_setup_shutdown_requires_production_boundary_before_accepted(self) -> None:
         client_rows = [{"event": "route_owner_high_water", "opens": 1}, {"event": "terminal", "code": "shutdown"}]
         server_rows = [{"event": "test_fault_applied", "fault": "hold_server_verification"}]

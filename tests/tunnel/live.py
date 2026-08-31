@@ -409,6 +409,9 @@ limits:
         elif self.deadline_stage == "resolve":
             args += ["--test-hold-resolve-ms", "1500"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
+        elif self.case == "per-ingress-failure-recovery/resolve":
+            args += ["--test-reject-first-resolve"]
+            env["P2X_ENABLE_TEST_HOOKS"] = "1"
         return self.start(name, args, env)
 
     def start_server(self, exchange: str, name: str = "server") -> pathlib.Path:
@@ -438,9 +441,6 @@ limits:
         args = [str(self.root / "target/debug/p2x-client"), "--identity-file", str(identity), "--exchange", exchange, "--exchange-peer-id", self.exchange_peer, "--credential-env", "P2X_TOKEN", "--routes-file", str(routes), "--case-id", self.case]
         env = {"P2X_TOKEN": token_value}
         profile = self.case.split("/", 1)[0]
-        if self.case == "per-ingress-failure-recovery/resolve":
-            args += ["--test-fail-first-resolve"]
-            env["P2X_ENABLE_TEST_HOOKS"] = "1"
         if profile == "path-loss-recovery":
             args += ["--test-close-proxy-after-accept-ms", "100"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
@@ -628,8 +628,8 @@ def assert_named_contract(requested_case: str, client_rows: list[dict], server_r
         if sum(row.get("event") == "ingress_accepted" for row in client_rows) < 2:
             raise Failure(f"{requested_case} did not accept a later ingress")
         if requested_case == "per-ingress-failure-recovery/resolve":
-            if not any(row.get("event") == "test_fault_applied" and row.get("fault") == "fail_first_resolve" for row in client_rows):
-                raise Failure("resolve recovery did not apply the resolve fault")
+            if not any(row.get("event") == "resolution_outcome" and row.get("code") == "registry.offline" for row in client_rows):
+                raise Failure("resolve recovery did not consume the rejected resolve response")
         elif requested_case == "per-ingress-failure-recovery/path-capacity":
             if not any(row.get("event") == "ingress_rejected" and row.get("code") == "limit.proxy_streams" for row in client_rows):
                 raise Failure("path-capacity did not reject only the overflow ingress")
@@ -851,16 +851,19 @@ def run_case(root: pathlib.Path, case: str) -> dict:
                 wait_for(client_log, lambda row: row.get("event") == "tunnel_accepted", 45)
         if requested_case == "per-ingress-failure-recovery/resolve":
             assert client is not None
+            queued = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            queued.settimeout(30)
+            wait_for_count(client_log, lambda row: row.get("event") == "ingress_accepted", 2, 10)
+            wait_for(exchange_log, lambda row: row.get("event") == "test_fault_applied" and row.get("fault") == "reject_first_resolve", 30)
+            wait_for(client_log, lambda row: row.get("event") == "ingress_rejected" and row.get("code") == "registry.offline", 45)
+            wait_for_eof(client)
             client.close()
             client = None
-            wait_for(client_log, lambda row: row.get("event") == "ingress_rejected", 45)
-            later = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
-            later.settimeout(30)
             payload = b"resolve-recovery"
-            later.sendall(payload)
-            if recv_exact(later, len(payload)) != payload:
-                raise Failure("resolve recovery did not carry a later ingress")
-            later.close()
+            queued.sendall(payload)
+            if recv_exact(queued, len(payload)) != payload:
+                raise Failure("resolve rejection did not promote the queued ingress")
+            queued.close()
         elif requested_case == "per-ingress-failure-recovery/path-capacity":
             assert client is not None
             client.sendall(b"held-capacity")

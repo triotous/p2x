@@ -156,6 +156,8 @@ struct Args {
     #[arg(long, hide = true)]
     test_drop_first_resolve_response: bool,
     #[arg(long, hide = true)]
+    test_reject_first_resolve: bool,
+    #[arg(long, hide = true)]
     test_hold_resolve_ms: Option<u64>,
     #[arg(long, hide = true)]
     test_private_markers_file: Option<PathBuf>,
@@ -190,6 +192,7 @@ async fn main() -> io::Result<()> {
         || args.resolve_limit_per_minute.is_some()
         || args.resolve_limit_buckets.is_some()
         || args.test_drop_first_resolve_response
+        || args.test_reject_first_resolve
         || args.test_hold_resolve_ms.is_some()
         || args.test_private_markers_file.is_some();
     if test_hook_used && std::env::var("P2X_ENABLE_TEST_HOOKS").ok().as_deref() != Some("1") {
@@ -319,6 +322,7 @@ async fn main() -> io::Result<()> {
     let mut reserved_servers = HashSet::new();
     let mut active_circuits = 0usize;
     let mut dropped_first_resolve_response = false;
+    let mut rejected_first_resolve = false;
     let mut held_first_resolve_response = false;
     let mut held_resolve_responses: Vec<HeldResolveResponse> = Vec::new();
     registry.set_advertise_addresses(args.advertise.iter().map(ToString::to_string).collect());
@@ -443,7 +447,16 @@ async fn main() -> io::Result<()> {
                     if let Some(resolver) = resolver.as_mut() { resolver.admission.release_request(peer, connection_id, request_id); }
                 }
                 SwarmEvent::Behaviour(p2x_net::builder::ExchangeEvent::Resolve(RequestResponseEvent::Message { peer, message: RequestResponseMessage::Request { request, channel, request_id }, connection_id, .. })) => {
-                    let response = if let Some(resolver) = resolver.as_mut() {
+                    let response = if args.test_reject_first_resolve && !rejected_first_resolve {
+                        rejected_first_resolve = true;
+                        emitter.emit(&LifecycleRecord::TestFaultApplied {
+                            fault: "reject_first_resolve",
+                        })?;
+                        p2x_protocol::ResolveResponseV1::Rejected {
+                            request_id: Some(match request { p2x_protocol::ResolveRequestV1::Resolve { request_id, .. } => request_id }),
+                            error: PublicError::new(PublicErrorCode::RegistryOffline, true),
+                        }
+                    } else if let Some(resolver) = resolver.as_mut() {
                         let client_session = sessions.current(&peer.to_string(), chrono_like_now());
                         resolver.resolve_and_authorize(
                             peer,
