@@ -133,6 +133,27 @@ class TunnelGateTests(unittest.TestCase):
         with self.assertRaises(live.Failure):
             live.assert_named_contract("stream-limits/server-dial", [], rows[:-1])
 
+    def test_pre_accept_eof_cannot_reach_route_work(self) -> None:
+        client = [
+            {"event": "started"},
+            {"event": "ingress_accepted", "ingress_id": 1},
+            {"event": "ingress_rejected", "ingress_id": 1, "code": "peer.connection_failed", "offset_ms": 1},
+            {"event": "ingress_accepted", "ingress_id": 2},
+            {"event": "resolution_outcome", "resolved": True, "request_id_hash": 7, "offset_ms": 2},
+            {"event": "tunnel_accepted", "request_id_hash": 7},
+        ]
+        server = [{"event": "tunnel_accepted", "request_id_hash": 7}]
+        self.assertEqual(
+            live.assert_named_contract("per-ingress-failure-recovery/pre-accept-eof", client, server),
+            "per_ingress_failure_recovery",
+        )
+        with self.assertRaises(live.Failure):
+            live.assert_named_contract(
+                "per-ingress-failure-recovery/pre-accept-eof",
+                client[:3] + [{"event": "resolution_outcome", "resolved": True, "request_id_hash": 6}] + client[3:],
+                server,
+            )
+
     def test_active_shutdown_requires_exact_accepted_terminals(self) -> None:
         accepted = [{"event": "tunnel_accepted"}]
         terminal = [{"event": "tunnel_terminal", "accepted": True}]

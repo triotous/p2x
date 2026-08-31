@@ -663,11 +663,32 @@ def assert_named_contract(requested_case: str, client_rows: list[dict], server_r
             if not any(row.get("event") == "tunnel_accepted" and row.get("offset_ms", 0) > rejections[0].get("offset_ms", 0) for row in client_rows):
                 raise Failure("path-capacity did not reuse released client capacity")
         elif requested_case == "per-ingress-failure-recovery/upstream":
-            if not any(row.get("event") == "proxy_authorization" and row.get("code") == "upstream.connect_failed" and not row.get("authorized") for row in server_rows):
-                raise Failure("upstream recovery did not classify the failed ingress")
+            ingresses = [row for row in client_rows if row.get("event") == "ingress_accepted"]
+            rejections = [row for row in client_rows if row.get("event") == "ingress_rejected"]
+            resolutions = [row for row in client_rows if row.get("event") == "resolution_outcome" and row.get("resolved")]
+            client_accepted = [row for row in client_rows if row.get("event") == "tunnel_accepted"]
+            server_accepted = [row for row in server_rows if row.get("event") == "tunnel_accepted"]
+            failures = {
+                (row.get("request_id_hash"), row.get("code"))
+                for row in server_rows
+                if row.get("event") == "proxy_authorization" and not row.get("authorized")
+            }
+            if len(ingresses) != 2 or len(rejections) != 1 or rejections[0].get("ingress_id") != ingresses[0].get("ingress_id") or rejections[0].get("code") != "upstream.connect_failed":
+                raise Failure("upstream recovery did not reject exact first ingress")
+            if len(resolutions) != 2 or failures != {(resolutions[0].get("request_id_hash"), "upstream.connect_failed")}:
+                raise Failure("upstream recovery did not correlate exact failed upstream request")
+            if len(client_accepted) != 1 or len(server_accepted) != 1 or client_accepted[0].get("request_id_hash") != resolutions[1].get("request_id_hash") or server_accepted[0].get("request_id_hash") != resolutions[1].get("request_id_hash") or client_accepted[0].get("offset_ms", 0) <= rejections[0].get("offset_ms", 0):
+                raise Failure("upstream recovery did not accept only the later ingress after release")
         elif requested_case == "per-ingress-failure-recovery/pre-accept-eof":
-            if not any(row.get("event") == "ingress_rejected" and row.get("code") == "peer.connection_failed" for row in client_rows):
-                raise Failure("pre-accept EOF did not reject the exact ingress")
+            ingresses = [row for row in client_rows if row.get("event") == "ingress_accepted"]
+            rejections = [row for row in client_rows if row.get("event") == "ingress_rejected"]
+            resolutions = [row for row in client_rows if row.get("event") == "resolution_outcome" and row.get("resolved")]
+            client_accepted = [row for row in client_rows if row.get("event") == "tunnel_accepted"]
+            server_accepted = [row for row in server_rows if row.get("event") == "tunnel_accepted"]
+            if len(ingresses) != 2 or len(rejections) != 1 or rejections[0].get("ingress_id") != ingresses[0].get("ingress_id") or rejections[0].get("code") != "peer.connection_failed":
+                raise Failure("pre-accept EOF did not reject exact first ingress")
+            if len(resolutions) != 1 or len(client_accepted) != 1 or len(server_accepted) != 1 or client_accepted[0].get("request_id_hash") != resolutions[0].get("request_id_hash") or server_accepted[0].get("request_id_hash") != resolutions[0].get("request_id_hash") or resolutions[0].get("offset_ms", 0) <= rejections[0].get("offset_ms", 0):
+                raise Failure("pre-accept EOF reached route work or blocked exact later recovery")
         return "per_ingress_failure_recovery"
     if requested_case.startswith("stream-limits/"):
         client_rejections = [row for row in client_rows if row.get("event") == "ingress_rejected"]
