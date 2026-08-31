@@ -9,6 +9,42 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use crate::proxy_owner::ProxyWorkerId;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TestDeadlineStage {
+    Verification,
+    OwnerDecision,
+    Promotion,
+    UpstreamDial,
+    AcceptedWrite,
+}
+
+impl std::str::FromStr for TestDeadlineStage {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "verification" => Ok(Self::Verification),
+            "owner-decision" => Ok(Self::OwnerDecision),
+            "promotion" => Ok(Self::Promotion),
+            "upstream-dial" => Ok(Self::UpstreamDial),
+            "accepted-write" => Ok(Self::AcceptedWrite),
+            _ => Err("invalid server deadline test stage"),
+        }
+    }
+}
+
+impl TestDeadlineStage {
+    pub const fn fault(self) -> &'static str {
+        match self {
+            Self::Verification => "hold_server_verification",
+            Self::OwnerDecision => "hold_server_owner_decision",
+            Self::Promotion => "hold_server_promotion",
+            Self::UpstreamDial => "hold_server_upstream_dial",
+            Self::AcceptedWrite => "hold_server_accepted_write",
+        }
+    }
+}
+
 pub struct Promotion {
     pub worker_id: ProxyWorkerId,
     pub admission: AdmissionToken,
@@ -52,6 +88,7 @@ pub enum ServerDecision {
 
 pub struct Candidate {
     pub worker_id: ProxyWorkerId,
+    pub test_deadline_stage: Option<TestDeadlineStage>,
     pub peer_id: PeerId,
     pub connection_id: ConnectionId,
     pub selected_path: ProbePath,
@@ -112,6 +149,18 @@ async fn reserve_accepted(
     }
 }
 
+pub async fn hold_test_deadline_stage(
+    delay: Duration,
+    deadline: std::time::Instant,
+    cancel: tokio_util::sync::CancellationToken,
+) -> bool {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        _ = tokio::time::sleep(delay.min(remaining)) => delay <= remaining,
+    }
+}
+
 async fn write_response_bounded<T: AsyncWrite + Unpin>(
     stream: &mut T,
     response: &ProxyOpenResponseV1,
@@ -146,6 +195,10 @@ pub async fn run_worker(
     now: i64,
     clock_skew: i64,
     hold_handshake_ms: Option<u64>,
+    test_deadline_stage: Option<TestDeadlineStage>,
+    test_deadline_hold_ms: Option<u64>,
+    test_deadline_claimed: Arc<std::sync::atomic::AtomicBool>,
+    test_faults: mpsc::Sender<TestDeadlineStage>,
     hold_dial_ms: Option<u64>,
     candidates: mpsc::Sender<Candidate>,
     accepts: mpsc::Sender<Accepted>,
@@ -157,6 +210,16 @@ pub async fn run_worker(
     let worker_deadline = started + Duration::from_secs(5);
     let started_unix = now;
     let cancel = shutdown.child_token();
+    let test_deadline_stage = test_deadline_stage.filter(|_| {
+        test_deadline_claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    });
     let open = tokio::select! {
         _ = cancel.cancelled() => Err(PublicErrorCode::ExchangeDraining),
         result = tokio::time::timeout(
@@ -168,37 +231,45 @@ pub async fn run_worker(
             .ok_or(PublicErrorCode::ProtocolMalformed),
     };
     let request_id = open.as_ref().ok().map(|open| open.request_id);
-    if let Some(delay) = hold_handshake_ms {
-        let remaining = worker_deadline.saturating_duration_since(std::time::Instant::now());
-        if super::upstream::hold(Duration::from_millis(delay), remaining, cancel.clone())
-            .await
-            .is_err()
-        {
-            let code = transition_failure_code(&shutdown);
-            if let Ok(open) = open.as_ref() {
-                let response = ProxyOpenResponseV1::Rejected {
-                    request_id: Some(open.request_id),
-                    error: PublicError::new(code, true),
-                };
-                let _ =
-                    write_response_bounded(&mut stream, &response, worker_deadline, &cancel).await;
-            }
-            return release(
-                worker_id,
-                peer_id,
-                connection_id,
-                selected_path,
-                started.elapsed(),
-                AdmissionToken::empty(),
-                request_id
-                    .map(p2x_net::lifecycle::stable_hash)
-                    .unwrap_or_default(),
-                None,
-                false,
-                Some(code),
-                None,
-            );
+    let verification_hold = if test_deadline_stage == Some(TestDeadlineStage::Verification) {
+        if let Some(stage) = test_deadline_stage {
+            let _ = test_faults.try_send(stage);
         }
+        test_deadline_hold_ms
+    } else {
+        hold_handshake_ms
+    };
+    if let Some(delay) = verification_hold
+        && !hold_test_deadline_stage(
+            Duration::from_millis(delay),
+            worker_deadline,
+            cancel.clone(),
+        )
+        .await
+    {
+        let code = transition_failure_code(&shutdown);
+        if let Ok(open) = open.as_ref() {
+            let response = ProxyOpenResponseV1::Rejected {
+                request_id: Some(open.request_id),
+                error: PublicError::new(code, true),
+            };
+            let _ = write_response_bounded(&mut stream, &response, worker_deadline, &cancel).await;
+        }
+        return release(
+            worker_id,
+            peer_id,
+            connection_id,
+            selected_path,
+            started.elapsed(),
+            AdmissionToken::empty(),
+            request_id
+                .map(p2x_net::lifecycle::stable_hash)
+                .unwrap_or_default(),
+            None,
+            false,
+            Some(code),
+            None,
+        );
     }
     let validation = match (&verification_ring, open.as_ref()) {
         (Some(ring), Ok(open)) => super::ticket_admission::TicketAdmissionLedger::new(
@@ -220,6 +291,7 @@ pub async fn run_worker(
     };
     let candidate = Candidate {
         worker_id,
+        test_deadline_stage,
         peer_id,
         connection_id,
         selected_path,
@@ -306,31 +378,82 @@ pub async fn run_worker(
                 );
             };
             let remaining = worker_deadline.saturating_duration_since(std::time::Instant::now());
-            let dial = match hold_dial_ms {
-                Some(delay) => match super::upstream::hold(
+            let stage_dial_hold = (test_deadline_stage == Some(TestDeadlineStage::UpstreamDial))
+                .then_some(test_deadline_hold_ms)
+                .flatten();
+            let dial = if let Some(delay) = stage_dial_hold {
+                let _ = test_faults.try_send(TestDeadlineStage::UpstreamDial);
+                if hold_test_deadline_stage(
                     Duration::from_millis(delay),
-                    remaining,
+                    worker_deadline,
                     cancel.clone(),
                 )
                 .await
                 {
-                    Ok(()) if Duration::from_millis(delay) >= upstream.connect_timeout => {
-                        Err(super::upstream::ConnectError::Timeout)
-                    }
-                    Ok(()) => {
-                        super::upstream::connect(
-                            &upstream,
-                            worker_deadline.saturating_duration_since(std::time::Instant::now()),
-                            cancel.clone(),
-                        )
-                        .await
-                    }
-                    Err(error) => Err(error),
-                },
-                None => super::upstream::connect(&upstream, remaining, cancel.clone()).await,
+                    super::upstream::connect(
+                        &upstream,
+                        worker_deadline.saturating_duration_since(std::time::Instant::now()),
+                        cancel.clone(),
+                    )
+                    .await
+                } else {
+                    Err(super::upstream::ConnectError::Timeout)
+                }
+            } else {
+                match hold_dial_ms {
+                    Some(delay) => match super::upstream::hold(
+                        Duration::from_millis(delay),
+                        remaining,
+                        cancel.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) if Duration::from_millis(delay) >= upstream.connect_timeout => {
+                            Err(super::upstream::ConnectError::Timeout)
+                        }
+                        Ok(()) => {
+                            super::upstream::connect(
+                                &upstream,
+                                worker_deadline
+                                    .saturating_duration_since(std::time::Instant::now()),
+                                cancel.clone(),
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    },
+                    None => super::upstream::connect(&upstream, remaining, cancel.clone()).await,
+                }
             };
             match dial {
                 Ok(socket) => {
+                    if test_deadline_stage == Some(TestDeadlineStage::Promotion)
+                        && let Some(delay) = test_deadline_hold_ms
+                    {
+                        let _ = test_faults.try_send(TestDeadlineStage::Promotion);
+                        if !hold_test_deadline_stage(
+                            Duration::from_millis(delay),
+                            worker_deadline,
+                            cancel.clone(),
+                        )
+                        .await
+                        {
+                            drop(socket);
+                            return release(
+                                worker_id,
+                                peer_id,
+                                connection_id,
+                                selected_path,
+                                started.elapsed(),
+                                admission,
+                                request_id_hash,
+                                stream_id_hash,
+                                false,
+                                Some(transition_failure_code(&shutdown)),
+                                None,
+                            );
+                        }
+                    }
                     let (acknowledged, ack) = oneshot::channel();
                     if !bounded_promotion(
                         &promotions,
@@ -395,8 +518,23 @@ pub async fn run_worker(
                         stream_id,
                         selected_upstream_mode: p2x_protocol::UpstreamMode::Tcp,
                     };
-                    if write_response_bounded(&mut stream, &response, worker_deadline, &cancel)
+                    let accepted_write_ready = if test_deadline_stage
+                        == Some(TestDeadlineStage::AcceptedWrite)
+                        && let Some(delay) = test_deadline_hold_ms
+                    {
+                        let _ = test_faults.try_send(TestDeadlineStage::AcceptedWrite);
+                        hold_test_deadline_stage(
+                            Duration::from_millis(delay),
+                            worker_deadline,
+                            cancel.clone(),
+                        )
                         .await
+                    } else {
+                        true
+                    };
+                    if accepted_write_ready
+                        && write_response_bounded(&mut stream, &response, worker_deadline, &cancel)
+                            .await
                     {
                         accepted = true;
                         let setup_duration = started.elapsed();
@@ -425,7 +563,11 @@ pub async fn run_worker(
                             code = Some(PublicErrorCode::UpstreamIdleTimeout);
                         }
                     } else {
-                        code = Some(PublicErrorCode::ProtocolMalformed);
+                        code = Some(if accepted_write_ready {
+                            PublicErrorCode::ProtocolMalformed
+                        } else {
+                            transition_failure_code(&shutdown)
+                        });
                         drop(socket);
                     }
                 }
@@ -534,6 +676,41 @@ mod tests {
         frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
         frame.extend_from_slice(&body);
         frame
+    }
+
+    #[test]
+    fn deadline_stage_names_are_closed_and_stable() {
+        for (name, stage, fault) in [
+            (
+                "verification",
+                TestDeadlineStage::Verification,
+                "hold_server_verification",
+            ),
+            (
+                "owner-decision",
+                TestDeadlineStage::OwnerDecision,
+                "hold_server_owner_decision",
+            ),
+            (
+                "promotion",
+                TestDeadlineStage::Promotion,
+                "hold_server_promotion",
+            ),
+            (
+                "upstream-dial",
+                TestDeadlineStage::UpstreamDial,
+                "hold_server_upstream_dial",
+            ),
+            (
+                "accepted-write",
+                TestDeadlineStage::AcceptedWrite,
+                "hold_server_accepted_write",
+            ),
+        ] {
+            assert_eq!(name.parse::<TestDeadlineStage>(), Ok(stage));
+            assert_eq!(stage.fault(), fault);
+        }
+        assert!("synthetic".parse::<TestDeadlineStage>().is_err());
     }
 
     #[tokio::test]

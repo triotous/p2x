@@ -194,6 +194,15 @@ impl IngressOwnerBook {
         self.setup.keys().copied()
     }
 
+    pub fn expired_setups(&self, now: Instant) -> Vec<(IngressId, Option<OpenId>)> {
+        self.setup
+            .values()
+            .filter_map(|owner| {
+                (now >= owner.deadline).then_some((owner.ingress_id, owner.open_id))
+            })
+            .collect()
+    }
+
     pub fn active_ids(&self) -> impl Iterator<Item = IngressId> + '_ {
         self.active.keys().copied()
     }
@@ -275,6 +284,23 @@ mod tests {
 
         assert!(book.take_setup_for_open(OpenId(9)).is_some());
         assert!(book.take_proxy_task(OpenId(9)).is_none());
+    }
+
+    #[test]
+    fn expired_setups_preserve_exact_open_ownership() {
+        let expired = setup(1);
+        let now = expired.accepted_at + Duration::from_millis(1500);
+        let mut book = IngressOwnerBook::default();
+        book.insert_setup(expired).unwrap();
+        book.attach_open(IngressId(1), OpenId(9)).unwrap();
+        let mut live = setup(2);
+        live.deadline = now + Duration::from_secs(1);
+        book.insert_setup(live).unwrap();
+
+        assert_eq!(
+            book.expired_setups(now),
+            vec![(IngressId(1), Some(OpenId(9)))]
+        );
     }
 
     #[test]

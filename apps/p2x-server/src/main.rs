@@ -36,7 +36,7 @@ use p2x_server::{
     proxy_owner::{ProxyDecisionContext, ProxyWorkerTable, ServerProxyOwner},
     stream_admission, ticket_admission,
 };
-use std::{collections::HashMap, io, path::PathBuf};
+use std::{collections::HashMap, io, path::PathBuf, sync::Arc};
 use tokio::{sync::mpsc, task::JoinSet};
 
 #[derive(Parser, Debug)]
@@ -88,8 +88,37 @@ struct Args {
     test_concurrent_registry_requests: bool,
     #[arg(long, hide = true, value_parser = clap::value_parser!(u64).range(0..=10_000))]
     test_hold_proxy_handshake_ms: Option<u64>,
+    #[arg(long, hide = true)]
+    test_deadline_stage: Option<proxy_open::TestDeadlineStage>,
+    #[arg(long, hide = true, value_parser = clap::value_parser!(u64).range(0..=10_000))]
+    test_deadline_hold_ms: Option<u64>,
     #[arg(long, hide = true, value_parser = clap::value_parser!(u64).range(0..=30_000))]
     test_hold_upstream_dial_ms: Option<u64>,
+}
+
+fn validate_test_hooks(args: &Args, enabled: bool) -> io::Result<()> {
+    let used = args.test_register_without_reservation
+        || args.test_suppress_registry_refresh
+        || args.test_replay_register_response
+        || args.test_drop_reservation_after_register
+        || args.test_concurrent_registry_requests
+        || args.test_hold_proxy_handshake_ms.is_some()
+        || args.test_deadline_stage.is_some()
+        || args.test_deadline_hold_ms.is_some()
+        || args.test_hold_upstream_dial_ms.is_some();
+    if used && !enabled {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "server test hooks require P2X_ENABLE_TEST_HOOKS=1",
+        ));
+    }
+    if args.test_deadline_stage.is_some() != args.test_deadline_hold_ms.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "server deadline test stage and hold must be used together",
+        ));
+    }
+    Ok(())
 }
 
 fn probe_mut(
@@ -534,20 +563,10 @@ fn finish_proxy_worker_record(
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args = Args::parse();
-    if (args.test_register_without_reservation
-        || args.test_suppress_registry_refresh
-        || args.test_replay_register_response
-        || args.test_drop_reservation_after_register
-        || args.test_concurrent_registry_requests
-        || args.test_hold_proxy_handshake_ms.is_some()
-        || args.test_hold_upstream_dial_ms.is_some())
-        && std::env::var("P2X_ENABLE_TEST_HOOKS").ok().as_deref() != Some("1")
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "registry test hooks require P2X_ENABLE_TEST_HOOKS=1",
-        ));
-    }
+    validate_test_hooks(
+        &args,
+        std::env::var("P2X_ENABLE_TEST_HOOKS").ok().as_deref() == Some("1"),
+    )?;
     let run_id = std::env::var("P2X_RUN_ID").unwrap_or_else(|_| "manual".into());
     let emitter = match &args.artifact {
         Some(path) => Emitter::with_artifact("server", &run_id, path)?,
@@ -690,6 +709,9 @@ async fn main() -> io::Result<()> {
     let (proxy_promotion_tx, mut proxy_promotion_rx) =
         mpsc::channel::<proxy_open::Promotion>(proxy_limit);
     let (proxy_accept_tx, mut proxy_accept_rx) = mpsc::channel::<proxy_open::Accepted>(proxy_limit);
+    let (proxy_test_fault_tx, mut proxy_test_fault_rx) =
+        mpsc::channel::<proxy_open::TestDeadlineStage>(1);
+    let proxy_test_deadline_claimed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut proxy_workers = JoinSet::new();
     let mut proxy_worker_tasks = HashMap::<tokio::task::Id, proxy_open::ProxyWorkerId>::new();
     let mut proxy_worker_table = ProxyWorkerTable::default();
@@ -897,6 +919,9 @@ async fn main() -> io::Result<()> {
                     }
                 }
             }
+            Some(stage) = proxy_test_fault_rx.recv() => {
+                emitter.emit(&LifecycleRecord::TestFaultApplied { fault: stage.fault() })?;
+            }
             Some(promotion) = proxy_promotion_rx.recv() => {
                 let acknowledged = promote_proxy_worker(
                     promotion.worker_id,
@@ -919,6 +944,17 @@ async fn main() -> io::Result<()> {
             Some(candidate) = proxy_rx.recv() => {
                 let peer_name = candidate.peer_id.to_string();
                 let request_id = candidate.open.as_ref().ok().map(|open| open.request_id);
+                if candidate.test_deadline_stage == Some(proxy_open::TestDeadlineStage::OwnerDecision)
+                    && let Some(delay) = args.test_deadline_hold_ms
+                {
+                    let _ = proxy_test_fault_tx.try_send(proxy_open::TestDeadlineStage::OwnerDecision);
+                    let _ = proxy_open::hold_test_deadline_stage(
+                        std::time::Duration::from_millis(delay),
+                        candidate.deadline,
+                        shutdown.child_token(),
+                    )
+                    .await;
+                }
                 let decision = if let Some(decision) = stale_proxy_candidate_decision(
                     &proxy_worker_table,
                     candidate.worker_id,
@@ -1164,6 +1200,10 @@ async fn main() -> io::Result<()> {
                             unix_now(),
                             args.ticket_clock_skew as i64,
                             args.test_hold_proxy_handshake_ms,
+                            args.test_deadline_stage,
+                            args.test_deadline_hold_ms,
+                            proxy_test_deadline_claimed.clone(),
+                            proxy_test_fault_tx.clone(),
                             args.test_hold_upstream_dial_ms,
                             tx,
                             proxy_accept_tx.clone(),
@@ -1690,6 +1730,32 @@ mod tests {
             expected_service_set_hash: [5; 32],
             attempts: 0,
         }
+    }
+
+    fn test_args(extra: &[&str]) -> Args {
+        let mut args = vec!["p2x-server"];
+        args.extend_from_slice(extra);
+        Args::try_parse_from(args).unwrap()
+    }
+
+    #[test]
+    fn deadline_stage_hooks_are_guarded_and_paired() {
+        let args = test_args(&[
+            "--test-deadline-stage",
+            "owner-decision",
+            "--test-deadline-hold-ms",
+            "1000",
+        ]);
+        assert_eq!(
+            validate_test_hooks(&args, false).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        validate_test_hooks(&args, true).unwrap();
+        let args = test_args(&["--test-deadline-stage", "promotion"]);
+        assert_eq!(
+            validate_test_hooks(&args, true).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]

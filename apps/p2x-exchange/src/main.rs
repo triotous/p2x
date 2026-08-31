@@ -319,6 +319,7 @@ async fn main() -> io::Result<()> {
     let mut reserved_servers = HashSet::new();
     let mut active_circuits = 0usize;
     let mut dropped_first_resolve_response = false;
+    let mut held_first_resolve_response = false;
     let mut held_resolve_responses: Vec<HeldResolveResponse> = Vec::new();
     registry.set_advertise_addresses(args.advertise.iter().map(ToString::to_string).collect());
     let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -508,7 +509,9 @@ async fn main() -> io::Result<()> {
                     }
                     if let Some(delay) = args.test_hold_resolve_ms
                         && resolved
+                        && !held_first_resolve_response
                     {
+                        held_first_resolve_response = true;
                         emitter.emit(&LifecycleRecord::TestFaultApplied {
                             fault: "hold_resolve_response",
                         })?;

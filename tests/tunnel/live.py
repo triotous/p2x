@@ -20,6 +20,15 @@ from contextlib import closing
 class Failure(RuntimeError):
     pass
 
+DEADLINE_STAGES = (
+    ("resolve", "hold_resolve_response"),
+    ("verification", "hold_server_verification"),
+    ("owner-decision", "hold_server_owner_decision"),
+    ("promotion", "hold_server_promotion"),
+    ("upstream-dial", "hold_server_upstream_dial"),
+    ("accepted-write", "hold_server_accepted_write"),
+)
+
 
 def free_port(kind: int) -> int:
     with closing(socket.socket(socket.AF_INET, kind)) as sock:
@@ -160,6 +169,7 @@ class Run:
         run_id = os.environ.get("P2X_RUN_ID", time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
         self.root = root
         self.case = case
+        self.deadline_stage = case.removeprefix("deadline-stages/") if case.startswith("deadline-stages/") else None
         self.out = root / "target" / "p2x-tunnel" / run_id / case
         self.out.mkdir(parents=True, exist_ok=True)
         self.secret = pathlib.Path(__import__("tempfile").mkdtemp(prefix="p2x-tunnel-"))
@@ -298,9 +308,9 @@ proxy:
 """
         )
         direct = 0 if base_case.endswith("-relay") else 5000 if base_case == "control-loss-direct" else 1500
-        if self.case == "deadline-stages":
+        if base_case == "deadline-stages":
             direct = 0
-        setup_timeout = 1_000 if self.case == "deadline-stages" else 20_000
+        setup_timeout = 1_000 if self.deadline_stage == "resolve" else 7_000 if base_case == "deadline-stages" else 20_000
         self.routes = self.secret / "routes.yaml"
         self.routes.write_text(
             f"""schema_version: 1
@@ -396,7 +406,7 @@ limits:
         if self.case.split("/", 1)[0] in {"concurrent-streams", "resource-baseline"}:
             args += ["--resolve-limit-global", "256", "--resolve-limit-per-client", "128", "--resolve-limit-per-minute", "256"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
-        elif self.case == "deadline-stages":
+        elif self.deadline_stage == "resolve":
             args += ["--test-hold-resolve-ms", "1500"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
         return self.start(name, args, env)
@@ -404,7 +414,10 @@ limits:
     def start_server(self, exchange: str, name: str = "server") -> pathlib.Path:
         args = [str(self.root / "target/debug/p2x-server"), "--identity-file", str(self.secret / "server.key"), "--exchange", exchange, "--exchange-peer-id", self.exchange_peer, "--credential-env", "P2X_TOKEN", "--ticket-verification-keys-file", str(self.verification_keys), "--services-file", str(self.services), "--case-id", self.case]
         env = {"P2X_TOKEN": self.server_token}
-        if self.case.split("/", 1)[0] == "upstream-timeout":
+        if self.deadline_stage not in {None, "resolve"}:
+            args += ["--test-deadline-stage", self.deadline_stage, "--test-deadline-hold-ms", "10000"]
+            env["P2X_ENABLE_TEST_HOOKS"] = "1"
+        elif self.case.split("/", 1)[0] == "upstream-timeout":
             args += ["--test-hold-upstream-dial-ms", "4000"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
         elif self.case.split("/", 1)[0] == "stream-limits" or self.case == "per-ingress-failure-recovery/path-capacity":
@@ -682,11 +695,13 @@ def assert_named_contract(requested_case: str, client_rows: list[dict], server_r
         if len(client_terminals) != 2 or len(server_terminals) != 2:
             raise Failure("idle-timeout did not terminate both isolated and active streams")
         return "idle_isolation"
-    if requested_case == "deadline-stages":
-        if not any(row.get("event") == "ingress_rejected" and row.get("code") == "peer.setup_timeout" for row in client_rows):
-            raise Failure("deadline-stages did not reject at the original accept deadline")
-        if not any(row.get("event") == "resources" and row.get("pending_opens") == 0 and row.get("workers") == 0 for row in client_rows):
-            raise Failure("deadline-stages did not drain client setup owners")
+    if requested_case.startswith("deadline-stages/"):
+        rejection = next((row for row in client_rows if row.get("event") == "ingress_rejected" and row.get("code") == "peer.setup_timeout"), None)
+        if rejection is None:
+            raise Failure(f"{requested_case} did not reject at the original accept deadline")
+        first_ingress = next((row for row in client_rows if row.get("event") == "ingress_accepted"), None)
+        if first_ingress is None or rejection.get("ingress_id") != first_ingress.get("ingress_id"):
+            raise Failure(f"{requested_case} did not reject the held ingress")
         return "deadline_stage_timeout"
     if requested_case == "concurrent-streams/64-sustained":
         if len(client_terminals) != 64 or len(server_terminals) != 64:
@@ -764,7 +779,36 @@ def assert_tunnel_lifecycle(case: str, client_rows: list[dict], server_rows: lis
         expected["upstream_failure_or_idle"] = True
     return expected
 
-def run_case(root: pathlib.Path, case: str) -> None:
+def run_deadline_stages(root: pathlib.Path) -> None:
+    requested_case = "deadline-stages"
+    stage_summaries = []
+    for stage, fault in DEADLINE_STAGES:
+        summary = run_case(root, f"deadline-stages/{stage}")
+        observed = summary["observed_assertions"]
+        required = (
+            "deadline_fault_applied",
+            "deadline_timeout_observed",
+            "held_ingress_released",
+            "later_ingress_recovered",
+            "resources_drained",
+            "run_stopped",
+        )
+        if not all(observed.get(assertion) for assertion in required):
+            raise Failure(f"deadline-stages/{stage} did not prove its isolated stage contract")
+        stage_summaries.append({"stage": stage, "fault": fault, "passed": True})
+    out = root / "target" / "p2x-tunnel" / os.environ.get("P2X_RUN_ID", "manual") / requested_case
+    out.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "case": requested_case,
+        "passed": True,
+        "stages": stage_summaries,
+        "observed_assertions": {"named_contract": "deadline_stage_timeout"},
+    }
+    (out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
+    print(json.dumps(summary, sort_keys=True), flush=True)
+
+
+def run_case(root: pathlib.Path, case: str) -> dict:
     requested_case = case
     profile = case.split("/", 1)[0]
     run = Run(root, case)
@@ -800,10 +844,9 @@ def run_case(root: pathlib.Path, case: str) -> None:
                 "per-ingress-failure-recovery/resolve",
                 "per-ingress-failure-recovery/upstream",
                 "per-ingress-failure-recovery/pre-accept-eof",
-                "deadline-stages",
                 "shutdown/client-setup",
                 "shutdown/server-setup",
-            }:
+            } and not requested_case.startswith("deadline-stages/"):
                 wait_for(client_log, lambda row: row.get("event") == "tunnel_accepted", 45)
         if requested_case == "per-ingress-failure-recovery/resolve":
             assert client is not None
@@ -880,16 +923,30 @@ def run_case(root: pathlib.Path, case: str) -> None:
             wait_for_eof(client, 5)
             client.close()
             client = None
-        elif requested_case == "deadline-stages":
+        elif requested_case.startswith("deadline-stages/"):
             assert client is not None
+            stage = requested_case.split("/", 1)[1]
+            expected_fault = dict(DEADLINE_STAGES)[stage]
             started = time.monotonic()
-            client.sendall(b"deadline-stage")
+            client.sendall(f"deadline-{stage}".encode())
+            fault_log = exchange_log if stage == "resolve" else server_log
+            wait_for(fault_log, lambda row: row.get("event") == "test_fault_applied" and row.get("fault") == expected_fault, 30)
             wait_for(client_log, lambda row: row.get("event") == "ingress_rejected" and row.get("code") == "peer.setup_timeout", 10)
             wait_for_eof(client, 10)
-            if time.monotonic() - started >= 5:
-                raise Failure("deadline-stages exceeded the five-second setup bound")
+            if time.monotonic() - started >= 7:
+                raise Failure(f"deadline-stages/{stage} exceeded the original setup deadline")
             client.close()
             client = None
+            wait_for(client_log, lambda row: row.get("event") == "resources" and row.get("pending_opens") == 0 and row.get("workers") == 0 and row.get("tasks") == 0, 10)
+            later = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            later.settimeout(30)
+            payload = f"deadline-recovery-{stage}".encode()
+            later.sendall(payload)
+            if recv_exact(later, len(payload)) != payload:
+                raise Failure(f"deadline-stages/{stage} did not carry a later ingress")
+            later.close()
+            wait_for(client_log, lambda row: row.get("event") == "tunnel_accepted", 45)
+            wait_for(client_log, lambda row: row.get("event") == "tunnel_terminal" and row.get("accepted") is True, 30)
         elif requested_case == "stream-limits/client-ingress":
             assert client is not None
             client.sendall(b"held-client-ingress")
@@ -1256,7 +1313,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
         if client2_log is not None:
             client_rows.extend(read_rows(client2_log))
         server_rows = read_rows(server_log)
-        if requested_case in {"shutdown/client-setup", "shutdown/server-setup", "deadline-stages"}:
+        if requested_case in {"shutdown/client-setup", "shutdown/server-setup"}:
             lifecycle_assertions = {
                 "accepted": False,
                 "terminal_correlation": False,
@@ -1267,6 +1324,23 @@ def run_case(root: pathlib.Path, case: str) -> None:
         else:
             lifecycle_assertions = assert_tunnel_lifecycle(profile, client_rows, server_rows)
         named_contract = assert_named_contract(requested_case, client_rows, server_rows)
+        deadline_fault_applied = False
+        deadline_timeout_observed = False
+        held_ingress_released = False
+        later_ingress_recovered = False
+        if requested_case.startswith("deadline-stages/"):
+            stage = requested_case.split("/", 1)[1]
+            expected_fault = dict(DEADLINE_STAGES)[stage]
+            fault_rows = read_rows(exchange_log if stage == "resolve" else server_log)
+            deadline_fault_applied = any(row.get("event") == "test_fault_applied" and row.get("fault") == expected_fault for row in fault_rows)
+            ingress_ids = [row.get("ingress_id") for row in client_rows if row.get("event") == "ingress_accepted"]
+            rejection = next((row for row in client_rows if row.get("event") == "ingress_rejected" and row.get("code") == "peer.setup_timeout"), None)
+            deadline_timeout_observed = rejection is not None
+            held_ingress_released = bool(ingress_ids and rejection and rejection.get("ingress_id") == ingress_ids[0])
+            accepted_after_rejection = any(row.get("event") == "tunnel_accepted" and row.get("offset_ms", 0) > (rejection or {}).get("offset_ms", 0) for row in client_rows)
+            later_ingress_recovered = len(ingress_ids) >= 2 and held_ingress_released and accepted_after_rejection
+            if not all((deadline_fault_applied, deadline_timeout_observed, held_ingress_released, later_ingress_recovered)):
+                raise Failure(f"{requested_case} did not apply its fault, release the held ingress, and recover a later ingress")
         resource_profile = False
         if profile in {"concurrent-streams", "resource-baseline"}:
             target = 64 if requested_case == "concurrent-streams/64-sustained" else 128
@@ -1360,6 +1434,10 @@ def run_case(root: pathlib.Path, case: str) -> None:
             "run_stopped": run_stopped,
             "resource_profile": resource_profile if profile in {"concurrent-streams", "resource-baseline"} else False,
             "named_contract": named_contract,
+            "deadline_fault_applied": deadline_fault_applied,
+            "deadline_timeout_observed": deadline_timeout_observed,
+            "held_ingress_released": held_ingress_released,
+            "later_ingress_recovered": later_ingress_recovered,
         }
         if not required_assertions.issubset(observed_assertions) or not all(observed_assertions[key] for key in required_assertions):
             raise Failure(f"{requested_case} missing or failed required assertions: {required_assertions} / {observed_assertions}")
@@ -1370,6 +1448,7 @@ def run_case(root: pathlib.Path, case: str) -> None:
         }
         (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
         print(json.dumps(summary, sort_keys=True), flush=True)
+        return summary
     finally:
         run.cleanup()
 
@@ -1379,7 +1458,11 @@ if __name__ == "__main__":
         print("usage: live.py ROOT CASE", file=sys.stderr)
         raise SystemExit(2)
     try:
-        run_case(pathlib.Path(sys.argv[1]), sys.argv[2])
+        root = pathlib.Path(sys.argv[1])
+        if sys.argv[2] == "deadline-stages":
+            run_deadline_stages(root)
+        else:
+            run_case(root, sys.argv[2])
     except (Failure, subprocess.CalledProcessError) as error:
         print(f"tunnel case failed: {error}", file=sys.stderr)
         raise SystemExit(1)

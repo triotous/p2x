@@ -1057,6 +1057,57 @@ async fn main() -> io::Result<()> {
                         close_proxy_due = Some((connection, due));
                     }
                 }
+                if product_ingress {
+                    let expired = ingress_owners.expired_setups(now);
+                    for (ingress_id, open_id) in expired {
+                        if let Some(open_id) = open_id {
+                            let (completed, promoted) = route_owner
+                                .as_mut()
+                                .expect("multi-open owner exists")
+                                .cancel_with_promotion(&mut resolver_state, open_id);
+                            let completed_actions = drive_route_actions(
+                                &mut swarm,
+                                route_owner.as_mut().expect("multi-open owner exists"),
+                                expected_exchange,
+                                &emitter,
+                                &connections,
+                                &mut route_resolve_wires,
+                                &mut route_proxy_requests,
+                                &mut route_wire_sequence,
+                                completed.into_iter().chain(promoted).collect(),
+                            )?;
+                            if let Some(task) = ingress_owners.take_proxy_task(open_id) {
+                                task.abort();
+                            }
+                            if complete_route_actions(
+                                product_ingress,
+                                completed_actions,
+                                &mut resolver_state,
+                                &mut route_resolve_wires,
+                                &mut route_proxy_requests,
+                                &mut ingress_owners,
+                                route_owner.as_mut().expect("multi-open owner exists"),
+                                expected_exchange,
+                                &connections,
+                                &mut route_wire_sequence,
+                                &mut connection_manager,
+                                &mut swarm,
+                                &emitter,
+                                &args.case_id,
+                            ).await? {
+                                return Ok(());
+                            }
+                        } else {
+                            reject_ingress(
+                                &mut ingress_owners,
+                                ingress_id,
+                                PublicErrorCode::PeerSetupTimeout,
+                                &emitter,
+                            )
+                            .await?;
+                        }
+                    }
+                }
                 if supervised_proxy_mode || product_ingress {
                     let timed_out = route_resolve_wires
                         .iter()

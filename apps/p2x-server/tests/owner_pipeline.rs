@@ -193,6 +193,7 @@ async fn actual_resolution_ticket_flows_through_server_owner_once() {
     let (decision_tx, _decision_rx) = tokio::sync::oneshot::channel();
     let candidate_for_owner = Candidate {
         worker_id: ProxyWorkerId(1),
+        test_deadline_stage: None,
         peer_id: client,
         connection_id: ConnectionId::new_unchecked(1),
         selected_path: p2x_net::probe::ProbePath::Direct,
@@ -288,6 +289,7 @@ async fn actual_resolution_ticket_flows_through_server_owner_once() {
     let (replay_tx, _replay_rx) = tokio::sync::oneshot::channel();
     let replay = Candidate {
         worker_id: ProxyWorkerId(2),
+        test_deadline_stage: None,
         peer_id: client,
         connection_id: ConnectionId::new_unchecked(1),
         selected_path: p2x_net::probe::ProbePath::Direct,

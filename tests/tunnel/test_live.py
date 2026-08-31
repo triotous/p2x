@@ -27,6 +27,36 @@ class TunnelGateTests(unittest.TestCase):
             path.write_text("session:c2Vzc2lvbg\nticket:dGlja2V0\n")
             self.assertEqual(live.read_test_private_markers(path), ["c2Vzc2lvbg", "dGlja2V0"])
 
+    def test_deadline_stage_matrix_is_closed_and_stage_specific(self) -> None:
+        self.assertEqual(
+            live.DEADLINE_STAGES,
+            (
+                ("resolve", "hold_resolve_response"),
+                ("verification", "hold_server_verification"),
+                ("owner-decision", "hold_server_owner_decision"),
+                ("promotion", "hold_server_promotion"),
+                ("upstream-dial", "hold_server_upstream_dial"),
+                ("accepted-write", "hold_server_accepted_write"),
+            ),
+        )
+        client_rows = [
+            {"event": "ingress_accepted", "ingress_id": 1},
+            {"event": "ingress_rejected", "ingress_id": 1, "code": "peer.setup_timeout"},
+        ]
+        self.assertEqual(
+            live.assert_named_contract("deadline-stages/promotion", client_rows, []),
+            "deadline_stage_timeout",
+        )
+        with self.assertRaises(live.Failure):
+            live.assert_named_contract(
+                "deadline-stages/accepted-write",
+                [
+                    {"event": "ingress_accepted", "ingress_id": 1},
+                    {"event": "ingress_rejected", "ingress_id": 2, "code": "peer.setup_timeout"},
+                ],
+                [],
+            )
+
     def test_final_resources_require_every_zero_field(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "client.ndjson"
