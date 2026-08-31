@@ -133,6 +133,25 @@ class TunnelGateTests(unittest.TestCase):
         with self.assertRaises(live.Failure):
             live.assert_named_contract("stream-limits/server-dial", [], rows[:-1])
 
+    def test_active_shutdown_requires_exact_accepted_terminals(self) -> None:
+        accepted = [{"event": "tunnel_accepted"}]
+        terminal = [{"event": "tunnel_terminal", "accepted": True}]
+        process_terminal = [{"event": "terminal", "code": "shutdown"}]
+        self.assertEqual(
+            live.assert_named_contract(
+                "shutdown/server-active",
+                accepted + terminal,
+                accepted + terminal + process_terminal,
+            ),
+            "shutdown_active_drain",
+        )
+        with self.assertRaises(live.Failure):
+            live.assert_named_contract(
+                "shutdown/server-active",
+                accepted + terminal,
+                terminal + process_terminal,
+            )
+
     def test_setup_shutdown_requires_production_boundary_before_accepted(self) -> None:
         client_rows = [{"event": "route_owner_high_water", "opens": 1}, {"event": "terminal", "code": "shutdown"}]
         server_rows = [{"event": "test_fault_applied", "fault": "hold_server_verification"}]

@@ -711,8 +711,12 @@ def assert_named_contract(requested_case: str, client_rows: list[dict], server_r
             if not any(row.get("event") == "test_fault_applied" and row.get("fault") == "hold_server_verification" for row in server_rows):
                 raise Failure(f"{requested_case} did not stop at the production setup boundary")
             return "shutdown_setup_drain"
-        if not client_terminals and not server_terminals:
-            raise Failure(f"{requested_case} did not observe shutdown tunnel terminal evidence")
+        client_accepted = [row for row in client_rows if row.get("event") == "tunnel_accepted"]
+        server_accepted = [row for row in server_rows if row.get("event") == "tunnel_accepted"]
+        if len(client_accepted) != 1 or len(server_accepted) != 1 or len(client_terminals) != 1 or len(server_terminals) != 1:
+            raise Failure(f"{requested_case} did not drain exactly one Accepted tunnel per side")
+        if not client_terminals[0].get("accepted") or not server_terminals[0].get("accepted"):
+            raise Failure(f"{requested_case} emitted a pre-Accept terminal for an active tunnel")
         return "shutdown_active_drain"
     if requested_case == "terminal-correlation":
         if len(client_terminals) != 1 or len(server_terminals) != 1:
@@ -1179,10 +1183,16 @@ def run_case(root: pathlib.Path, case: str) -> dict:
                 wait_for_terminal(second)
             else:
                 client.sendall(b"shutdown-cancellation")
-                time.sleep(0.2)
+                wait_for_count(client_log, lambda row: row.get("event") == "tunnel_accepted", 1, 30)
+                wait_for_count(server_log, lambda row: row.get("event") == "tunnel_accepted", 1, 30)
+                wait_for(client_log, lambda row: row.get("event") == "resources" and row.get("workers") == 1 and row.get("tasks") == 1, 30)
+                wait_for(server_log, lambda row: row.get("event") == "resources" and row.get("workers") == 1 and row.get("tasks") == 1, 30)
                 run.mark_resources("active_before_shutdown")
-                run.stop(client_log)
-                run.stop(server_log)
+                target_log, peer_log = (client_log, server_log) if requested_case != "shutdown/server-active" else (server_log, client_log)
+                run.stop(target_log)
+                wait_for_terminal(target_log)
+                wait_for(peer_log, lambda row: row.get("event") == "tunnel_terminal" and row.get("accepted") is True, 30)
+                run.stop(peer_log)
             client.close()
             client = None
         elif profile.startswith("half-close"):
