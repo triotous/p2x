@@ -76,6 +76,26 @@ class TunnelGateTests(unittest.TestCase):
                 [],
             )
 
+    def test_path_capacity_requires_client_pending_limit(self) -> None:
+        client_rows = [{"event": "started"}] + [
+            {"event": "ingress_accepted", "ingress_id": ingress_id}
+            for ingress_id in (1, 2, 3)
+        ]
+        client_rows.extend([
+            {"event": "ingress_rejected", "ingress_id": 2, "code": "limit.peer_connections", "offset_ms": 2},
+            {"event": "tunnel_accepted", "offset_ms": 3},
+        ])
+        self.assertEqual(
+            live.assert_named_contract("per-ingress-failure-recovery/path-capacity", client_rows, []),
+            "per_ingress_failure_recovery",
+        )
+        with self.assertRaises(live.Failure):
+            live.assert_named_contract(
+                "per-ingress-failure-recovery/path-capacity",
+                client_rows,
+                [{"event": "proxy_authorization", "authorized": False, "code": "limit.proxy_streams"}],
+            )
+
     def test_setup_shutdown_requires_production_boundary_before_accepted(self) -> None:
         client_rows = [{"event": "route_owner_high_water", "opens": 1}, {"event": "terminal", "code": "shutdown"}]
         server_rows = [{"event": "test_fault_applied", "fault": "hold_server_verification"}]

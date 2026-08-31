@@ -187,12 +187,15 @@ class Run:
         self.upstream_connections = 0
         self.selector_key = "k_" + secrets.token_hex(8)
         self.selector_value = "v_" + secrets.token_hex(8)
+        self.selector_value2 = "v_" + secrets.token_hex(8)
         self.route_id = "r_" + secrets.token_hex(8)
+        self.route_id2 = "r_" + secrets.token_hex(8)
         self.upstream_id = "u_" + secrets.token_hex(8)
+        self.upstream_id2 = "u_" + secrets.token_hex(8)
         self.client_credential_id = "client_" + secrets.token_hex(4)
         self.client2_credential_id = "client_" + secrets.token_hex(4)
         self.server_credential_id = "server_" + secrets.token_hex(4)
-        self.private = [self.selector_key, self.selector_value, self.route_id, self.upstream_id, self.client_credential_id, self.client2_credential_id, self.server_credential_id]
+        self.private = [self.selector_key, self.selector_value, self.selector_value2, self.route_id, self.route_id2, self.upstream_id, self.upstream_id2, self.client_credential_id, self.client2_credential_id, self.server_credential_id]
         self.client_token, client_digest = token(self.client_credential_id)
         self.client2_token, client2_digest = token(self.client2_credential_id)
         self.server_token, server_digest = token(self.server_credential_id)
@@ -269,20 +272,27 @@ credentials:
         self.services = self.secret / "services.yaml"
         base_case = self.case.split("/", 1)[0]
         concurrent = base_case == "concurrent-streams" or base_case == "resource-baseline"
-        limited = base_case == "stream-limits" or self.case == "per-ingress-failure-recovery/path-capacity"
-        max_workers = 1 if self.case in {"per-ingress-failure-recovery/path-capacity", "stream-limits/server-global"} else 2 if base_case == "stream-limits" else 256
+        max_workers = 1 if self.case == "stream-limits/server-global" else 2 if base_case == "stream-limits" else 256
         max_workers_per_client = 1 if self.case in {"stream-limits", "stream-limits/server-client"} else 2 if self.case in {"stream-limits/client-server", "stream-limits/server-global", "stream-limits/server-service", "stream-limits/server-dial"} else 128 if concurrent else 32
-        max_upstream_dials = 1 if self.case in {"per-ingress-failure-recovery/path-capacity", "stream-limits/server-dial", "stream-limits"} else 2 if self.case in {"stream-limits/client-server", "stream-limits/server-client", "stream-limits/server-global", "stream-limits/server-service"} else 128 if concurrent else 64
+        max_upstream_dials = 1 if self.case in {"stream-limits/server-dial", "stream-limits"} else 2 if self.case in {"stream-limits/client-server", "stream-limits/server-client", "stream-limits/server-global", "stream-limits/server-service"} else 128 if concurrent else 64
         concurrency_limit = 1 if self.case in {"stream-limits", "stream-limits/server-service"} else 2 if self.case in {"stream-limits/client-server", "stream-limits/server-client", "stream-limits/server-global", "stream-limits/server-dial"} else 128 if concurrent else 64
         if self.case == "stream-limits/server-global":
             max_workers = max_upstream_dials = concurrency_limit = 2
             max_workers_per_client = 128
-        if self.case == "per-ingress-failure-recovery/path-capacity":
-            max_workers = max_workers_per_client = max_upstream_dials = concurrency_limit = 1
         if self.case == "stream-limits/client-ingress":
             max_workers = max_workers_per_client = max_upstream_dials = concurrency_limit = 2
         if self.case == "stream-limits/client-server":
             max_workers = max_workers_per_client = max_upstream_dials = concurrency_limit = 2
+        second_service = f"""  - upstream_id: {self.upstream_id2}
+    selector:
+      protocol: tcp
+      metadata: {{{self.selector_key}: {self.selector_value2}}}
+    enabled: true
+    connect: 127.0.0.1:{connect}
+    connect_timeout_ms: 3000
+    idle_timeout_ms: {idle}
+    concurrency_limit: {concurrency_limit}
+""" if self.case == "per-ingress-failure-recovery/path-capacity" else ""
         self.services.write_text(
             f"""schema_version: 1
 registration:
@@ -298,7 +308,7 @@ services:
     connect_timeout_ms: 3000
     idle_timeout_ms: {idle}
     concurrency_limit: {concurrency_limit}
-proxy:
+{second_service}proxy:
   max_workers: {max_workers}
   max_workers_per_client: {max_workers_per_client}
   max_upstream_dials: {max_upstream_dials}
@@ -311,6 +321,15 @@ proxy:
         if base_case == "deadline-stages":
             direct = 0
         setup_timeout = 1_000 if self.deadline_stage == "resolve" else 7_000 if base_case == "deadline-stages" else 20_000
+        second_route = f"""  - route_id: {self.route_id2}
+    selector:
+      protocol: tcp
+      metadata: {{{self.selector_key}: {self.selector_value2}}}
+""" if self.case == "per-ingress-failure-recovery/path-capacity" else ""
+        second_listener = f"""  - name: {self.route_id2}-local
+    bind: 127.0.0.1:{self.local_port2}
+    route_id: {self.route_id2}
+""" if self.case == "per-ingress-failure-recovery/path-capacity" else ""
         self.routes = self.secret / "routes.yaml"
         self.routes.write_text(
             f"""schema_version: 1
@@ -322,14 +341,14 @@ targets:
     selector:
       protocol: tcp
       metadata: {{{self.selector_key}: {self.selector_value}}}
-raw_tcp:
+{second_route}raw_tcp:
   - name: {self.route_id}-local
     bind: 127.0.0.1:{self.local_port}
     route_id: {self.route_id}
-limits:
+{second_listener}limits:
   max_peer_states: 64
-  max_pending_setups: 256
-  max_pending_per_server: 128
+  max_pending_setups: {1 if self.case == "per-ingress-failure-recovery/path-capacity" else 256}
+  max_pending_per_server: {1 if self.case == "per-ingress-failure-recovery/path-capacity" else 128}
   max_ingress_connections: {1 if self.case == "stream-limits/client-ingress" else 512}
   max_streams_per_server: {1 if self.case == "stream-limits/client-server" else 128}
   copy_buffer_bytes: 32768
@@ -423,7 +442,10 @@ limits:
         elif self.case.split("/", 1)[0] == "upstream-timeout":
             args += ["--test-hold-upstream-dial-ms", "4000"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
-        elif self.case.split("/", 1)[0] == "stream-limits" or self.case == "per-ingress-failure-recovery/path-capacity":
+        elif self.case == "per-ingress-failure-recovery/path-capacity":
+            args += ["--test-deadline-stage", "verification", "--test-deadline-hold-ms", "1000"]
+            env["P2X_ENABLE_TEST_HOOKS"] = "1"
+        elif self.case.split("/", 1)[0] == "stream-limits":
             if self.case == "stream-limits/server-dial":
                 args += ["--test-hold-upstream-dial-ms", "1000"]
             else:
@@ -631,8 +653,14 @@ def assert_named_contract(requested_case: str, client_rows: list[dict], server_r
             if not any(row.get("event") == "resolution_outcome" and row.get("code") == "registry.offline" for row in client_rows):
                 raise Failure("resolve recovery did not consume the rejected resolve response")
         elif requested_case == "per-ingress-failure-recovery/path-capacity":
-            if not any(row.get("event") == "ingress_rejected" and row.get("code") == "limit.proxy_streams" for row in client_rows):
-                raise Failure("path-capacity did not reject only the overflow ingress")
+            ingresses = [row for row in client_rows if row.get("event") == "ingress_accepted"]
+            rejections = [row for row in client_rows if row.get("event") == "ingress_rejected"]
+            if len(ingresses) != 3 or len(rejections) != 1 or rejections[0].get("ingress_id") != ingresses[1].get("ingress_id") or rejections[0].get("code") != "limit.peer_connections":
+                raise Failure("path-capacity did not reject exact N+1 at the client pending-path limit")
+            if any(row.get("event") == "proxy_authorization" and not row.get("authorized") for row in server_rows):
+                raise Failure("path-capacity overflow reached server admission")
+            if not any(row.get("event") == "tunnel_accepted" and row.get("offset_ms", 0) > rejections[0].get("offset_ms", 0) for row in client_rows):
+                raise Failure("path-capacity did not reuse released client capacity")
         elif requested_case == "per-ingress-failure-recovery/upstream":
             if not any(row.get("event") == "proxy_authorization" and row.get("code") == "upstream.connect_failed" and not row.get("authorized") for row in server_rows):
                 raise Failure("upstream recovery did not classify the failed ingress")
@@ -843,6 +871,7 @@ def run_case(root: pathlib.Path, case: str) -> dict:
                 "stream-limits/client-server",
                 "stream-limits/server-dial",
                 "per-ingress-failure-recovery/resolve",
+                "per-ingress-failure-recovery/path-capacity",
                 "per-ingress-failure-recovery/upstream",
                 "per-ingress-failure-recovery/pre-accept-eof",
                 "shutdown/client-setup",
@@ -867,16 +896,19 @@ def run_case(root: pathlib.Path, case: str) -> dict:
         elif requested_case == "per-ingress-failure-recovery/path-capacity":
             assert client is not None
             client.sendall(b"held-capacity")
-            wait_for(client_log, lambda row: row.get("event") == "tunnel_accepted", 45)
-            second = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            wait_for(server_log, lambda row: row.get("event") == "test_fault_applied" and row.get("fault") == "hold_server_verification", 30)
+            wait_for(client_log, lambda row: row.get("event") == "resources" and row.get("pending_opens", 0) == 1, 10)
+            second = socket.create_connection(("127.0.0.1", run.local_port2), timeout=20)
             second.settimeout(30)
             second.sendall(b"capacity-overflow")
-            if second.recv(1) != b"":
-                raise Failure("path-capacity forwarded N+1 ingress")
+            wait_for(client_log, lambda row: row.get("event") == "ingress_rejected" and row.get("code") == "limit.peer_connections", 20)
+            wait_for_eof(second)
             second.close()
+            wait_for(client_log, lambda row: row.get("event") == "tunnel_accepted", 45)
             client.close()
             client = None
-            later = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
+            wait_for(client_log, lambda row: row.get("event") == "tunnel_terminal" and row.get("accepted") is True, 20)
+            later = socket.create_connection(("127.0.0.1", run.local_port2), timeout=20)
             later.settimeout(20)
             later.sendall(b"capacity-reused")
             if recv_exact(later, len(b"capacity-reused")) != b"capacity-reused":
