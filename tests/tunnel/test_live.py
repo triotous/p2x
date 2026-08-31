@@ -57,6 +57,22 @@ class TunnelGateTests(unittest.TestCase):
                 [],
             )
 
+    def test_setup_shutdown_requires_production_boundary_before_accepted(self) -> None:
+        client_rows = [{"event": "route_owner_high_water", "opens": 1}, {"event": "terminal", "code": "shutdown"}]
+        server_rows = [{"event": "test_fault_applied", "fault": "hold_server_verification"}]
+        self.assertEqual(
+            live.assert_named_contract("shutdown/client-setup", client_rows, server_rows),
+            "shutdown_setup_drain",
+        )
+        with self.assertRaises(live.Failure):
+            live.assert_named_contract(
+                "shutdown/client-setup",
+                client_rows + [{"event": "tunnel_accepted"}],
+                server_rows,
+            )
+        with self.assertRaises(live.Failure):
+            live.assert_named_contract("shutdown/server-setup", client_rows, [])
+
     def test_final_resources_require_every_zero_field(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "client.ndjson"

@@ -426,8 +426,8 @@ limits:
             else:
                 args += ["--test-hold-proxy-handshake-ms", "1000"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
-        elif self.case == "shutdown/server-setup":
-            args += ["--test-hold-proxy-handshake-ms", "10000"]
+        elif self.case in {"shutdown/client-setup", "shutdown/server-setup"}:
+            args += ["--test-deadline-stage", "verification", "--test-deadline-hold-ms", "10000"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
         return self.start(name, args, env)
 
@@ -440,9 +440,6 @@ limits:
         profile = self.case.split("/", 1)[0]
         if self.case == "per-ingress-failure-recovery/resolve":
             args += ["--test-fail-first-resolve"]
-            env["P2X_ENABLE_TEST_HOOKS"] = "1"
-        elif self.case == "shutdown/client-setup":
-            args += ["--test-delay-after-resolve-ms", "10000"]
             env["P2X_ENABLE_TEST_HOOKS"] = "1"
         if profile == "path-loss-recovery":
             args += ["--test-close-proxy-after-accept-ms", "100"]
@@ -678,6 +675,10 @@ def assert_named_contract(requested_case: str, client_rows: list[dict], server_r
         if not any(row.get("event") == "terminal" and row.get("code") == "shutdown" for row in client_rows + server_rows):
             raise Failure(f"{requested_case} did not observe shutdown terminal")
         if requested_case in {"shutdown/client-setup", "shutdown/server-setup"}:
+            if any(row.get("event") == "tunnel_accepted" for row in client_rows + server_rows):
+                raise Failure(f"{requested_case} crossed Accepted before setup shutdown")
+            if not any(row.get("event") == "test_fault_applied" and row.get("fault") == "hold_server_verification" for row in server_rows):
+                raise Failure(f"{requested_case} did not stop at the production setup boundary")
             return "shutdown_setup_drain"
         if not client_terminals and not server_terminals:
             raise Failure(f"{requested_case} did not observe shutdown tunnel terminal evidence")
@@ -1118,6 +1119,10 @@ def run_case(root: pathlib.Path, case: str) -> dict:
         elif profile == "shutdown-cancellation" or requested_case.startswith("shutdown/"):
             assert client is not None
             if requested_case in {"shutdown/client-setup", "shutdown/server-setup"}:
+                wait_for(server_log, lambda row: row.get("event") == "test_fault_applied" and row.get("fault") == "hold_server_verification", 30)
+                wait_for(client_log, lambda row: row.get("event") == "route_owner_high_water" and row.get("opens", 0) >= 1, 10)
+                if any(row.get("event") == "tunnel_accepted" for row in read_rows(client_log) + read_rows(server_log)):
+                    raise Failure(f"{requested_case} crossed Accepted before setup shutdown")
                 run.mark_resources("setup_before_shutdown")
                 first = client_log if requested_case == "shutdown/client-setup" else server_log
                 second = server_log if requested_case == "shutdown/client-setup" else client_log

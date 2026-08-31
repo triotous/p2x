@@ -41,4 +41,9 @@
 [result] Focused Rust/Python tests, formatting, Clippy, syntax, and diff checks passed.
 [action] Ran P2X_RUN_ID=audit-deadline-final ./tests/tunnel/local.sh --case deadline-stages and inspected target/p2x-tunnel/audit-deadline-final/deadline-stages/{resolve,verification,owner-decision,promotion,upstream-dial,accepted-write}/summary.json.
 [result] All six isolated real-process stages passed exact fault application, original ingress setup timeout, held-ingress release, later-ingress recovery, resource drain, and process-stop assertions. Aggregate deadline-stages passed.
-[commit] pending isolated deadline-stage evidence commit.
+[commit] 060c843 Prove each tunnel setup deadline stage.
+[audit] Raw shutdown/client-setup evidence from target/p2x-tunnel/audit-all showed TunnelAccepted before shutdown; the legacy client delay hook did not apply to the product ingress route-owner pipeline, so the green summary did not prove setup-stage cancellation.
+[action] Changed both setup-shutdown cases to pause the production server verification transition with the existing run-gated, one-shot deadline hook; the runner now waits for the exact fault and client route owner, rejects any pre-shutdown TunnelAccepted, and the named contract requires the production boundary evidence.
+[action] Ran python3 -m unittest tests/tunnel/test_live.py; python3 -m py_compile tests/tunnel/live.py tests/tunnel/test_live.py; P2X_RUN_ID=audit-shutdown-boundary-client ./tests/tunnel/local.sh --case shutdown/client-setup; P2X_RUN_ID=audit-shutdown-boundary-server ./tests/tunnel/local.sh --case shutdown/server-setup; and git diff --check.
+[result] Six Python tests passed. Both isolated real-process setup cases applied hold_server_verification before Accepted, held an exact client route owner, shut down the selected side, emitted no TunnelAccepted, drained all final resource fields to zero, emitted one process terminal each, passed privacy scanning, and stopped every process/fixture.
+[commit] pending isolated setup-shutdown evidence commit.
