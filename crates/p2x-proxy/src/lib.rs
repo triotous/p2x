@@ -362,6 +362,7 @@ mod tests {
     struct ScriptedState {
         input: Vec<u8>,
         read_at: usize,
+        repeat_read: bool,
         output: Vec<u8>,
         fail_read: bool,
         fail_write_after: Option<usize>,
@@ -381,6 +382,7 @@ mod tests {
             let state = Arc::new(std::sync::Mutex::new(ScriptedState {
                 input: input.to_vec(),
                 read_at: 0,
+                repeat_read: false,
                 output: Vec::new(),
                 fail_read: false,
                 fail_write_after: None,
@@ -424,7 +426,11 @@ mod tests {
                 return Poll::Ready(Err(io::Error::other("scripted read")));
             }
             if state.read_at == state.input.len() {
-                return Poll::Ready(Ok(0));
+                if state.repeat_read {
+                    state.read_at = 0;
+                } else {
+                    return Poll::Ready(Ok(0));
+                }
             }
             let count = (state.input.len() - state.read_at).min(buf.len());
             buf[..count].copy_from_slice(&state.input[state.read_at..state.read_at + count]);
@@ -547,42 +553,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_budget_allows_a_heartbeat_during_hot_copy() {
-        let (mut local_peer, local) = tokio::io::duplex(64 * 1024);
-        let (remote, mut remote_peer) = tokio::io::duplex(64 * 1024);
+    async fn scheduler_budget_runs_a_heartbeat_during_hot_copy() {
+        let (local, local_state) = ScriptedIo::new(&[0x41; MIN_COPY_BUFFER]);
+        local_state.lock().unwrap().repeat_read = true;
+        let (remote, remote_state) = ScriptedIo::new(b"");
+        remote_state.lock().unwrap().pending_read = true;
         let heartbeat = Arc::new(AtomicBool::new(false));
         let heartbeat_seen = heartbeat.clone();
+        let copied = remote_state.clone();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let heartbeat_task = tokio::spawn(async move {
-            for _ in 0..32 {
-                heartbeat_seen.store(true, Ordering::Relaxed);
+            while copied.lock().unwrap().output.is_empty() {
                 tokio::task::yield_now().await;
             }
+            heartbeat_seen.store(true, Ordering::Relaxed);
+            cancel_tx.send(()).unwrap();
         });
-        let pump = tokio::spawn(pump_no_idle(
-            local.compat(),
-            remote.compat(),
-            MIN_COPY_BUFFER,
-            async {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            },
-        ));
-        let writer = tokio::spawn(async move {
-            let block = vec![0x41; MIN_COPY_BUFFER];
-            for _ in 0..64 {
-                if local_peer.write_all(&block).await.is_err() {
-                    break;
-                }
-            }
-        });
-        let reader = tokio::spawn(async move {
-            let mut block = vec![0; MIN_COPY_BUFFER];
-            while remote_peer.read_exact(&mut block).await.is_ok() {}
-        });
+        let result = pump_no_idle(local, remote, MIN_COPY_BUFFER, async {
+            let _ = cancel_rx.await;
+        })
+        .await
+        .unwrap();
         heartbeat_task.await.unwrap();
+        assert_eq!(result.terminal, Terminal::Cancelled);
         assert!(heartbeat.load(Ordering::Relaxed));
-        let _ = pump.await;
-        writer.abort();
-        reader.abort();
+        assert!(!remote_state.lock().unwrap().output.is_empty());
     }
 
     #[tokio::test]
@@ -614,6 +609,32 @@ mod tests {
         assert_eq!(result.terminal, Terminal::LocalIo);
         assert_eq!(result.local_to_remote_bytes, 2);
         assert_eq!(remote_state.lock().unwrap().output, b"lo");
+    }
+
+    #[tokio::test]
+    async fn scripted_remote_read_failure_is_remote_io() {
+        let (local, _local_state) = ScriptedIo::new(b"");
+        let (remote, remote_state) = ScriptedIo::new(b"remote");
+        remote_state.lock().unwrap().fail_read = true;
+        let result = pump_no_idle(local, remote, MIN_COPY_BUFFER, futures::future::pending())
+            .await
+            .unwrap();
+        assert_eq!(result.terminal, Terminal::RemoteIo);
+        assert_eq!(result.local_to_remote_bytes, 0);
+        assert_eq!(result.remote_to_local_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn scripted_remote_to_local_write_failure_preserves_committed_prefix() {
+        let (local, local_state) = ScriptedIo::new(b"");
+        local_state.lock().unwrap().fail_write_after = Some(2);
+        let (remote, _remote_state) = ScriptedIo::new(b"remote");
+        let result = pump_no_idle(local, remote, MIN_COPY_BUFFER, futures::future::pending())
+            .await
+            .unwrap();
+        assert_eq!(result.terminal, Terminal::RemoteIo);
+        assert_eq!(result.remote_to_local_bytes, 2);
+        assert_eq!(local_state.lock().unwrap().output, b"re");
     }
 
     #[tokio::test]
@@ -649,6 +670,77 @@ mod tests {
             remote_state.lock().unwrap().drops.load(Ordering::Relaxed),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_blocked_write() {
+        let (local, local_state) = ScriptedIo::new(b"payload");
+        let (remote, remote_state) = ScriptedIo::new(b"");
+        remote_state.lock().unwrap().block_write = true;
+        let result = pump_no_idle(local, remote, MIN_COPY_BUFFER, async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.terminal, Terminal::Cancelled);
+        assert_eq!(local_state.lock().unwrap().drops.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            remote_state.lock().unwrap().drops.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn either_direction_resets_the_shared_idle_deadline() {
+        let (mut local_peer, local) = tokio::io::duplex(16);
+        let (remote, mut remote_peer) = tokio::io::duplex(16);
+        let task = tokio::spawn(pump(
+            local.compat(),
+            remote.compat(),
+            MIN_COPY_BUFFER,
+            Duration::from_millis(100),
+            futures::future::pending(),
+        ));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        local_peer.write_all(b"left").await.unwrap();
+        let mut left = [0; 4];
+        remote_peer.read_exact(&mut left).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        remote_peer.write_all(b"right").await.unwrap();
+        let mut right = [0; 5];
+        local_peer.read_exact(&mut right).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        local_peer.shutdown().await.unwrap();
+        remote_peer.shutdown().await.unwrap();
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.terminal, Terminal::Complete);
+        assert_eq!(result.local_to_remote_bytes, 4);
+        assert_eq!(result.remote_to_local_bytes, 5);
+    }
+
+    #[tokio::test]
+    async fn remote_half_close_keeps_local_to_remote_open() {
+        let (mut local_peer, local) = tokio::io::duplex(16);
+        let (remote, mut remote_peer) = tokio::io::duplex(16);
+        let task = tokio::spawn(pump_no_idle(
+            local.compat(),
+            remote.compat(),
+            MIN_COPY_BUFFER,
+            futures::future::pending(),
+        ));
+        remote_peer.write_all(b"request").await.unwrap();
+        remote_peer.shutdown().await.unwrap();
+        let mut request = [0; 7];
+        local_peer.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"request");
+        local_peer.write_all(b"response").await.unwrap();
+        local_peer.shutdown().await.unwrap();
+        let mut response = [0; 8];
+        remote_peer.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"response");
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.terminal, Terminal::Complete);
+        assert!(result.local_eof && result.remote_eof);
     }
 
     #[test]
