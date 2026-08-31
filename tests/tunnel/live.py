@@ -593,8 +593,28 @@ def assert_resource_profile(run: Run, client_rows: list[dict], server_rows: list
         raise Failure("client logical worker peak did not reach the target")
     if max((row.get("workers", 0) for row in server_rows if row.get("event") == "resources"), default=0) < target:
         raise Failure("server logical worker peak did not reach the target")
-    if run.upstream is None or run.upstream.accepted_connections < target:
-        raise Failure(f"upstream did not expose {target} independent sockets: {run.upstream and run.upstream.accepted_connections}")
+    if run.upstream is None or run.upstream.accepted_connections != target:
+        raise Failure(f"upstream did not expose exactly {target} independent sockets: {run.upstream and run.upstream.accepted_connections}")
+    client_detail = [row for row in client_rows if row.get("event") == "client_tunnel_resources"]
+    server_detail = [row for row in server_rows if row.get("event") == "server_tunnel_resources"]
+    client_peaks = {
+        field: max((row.get(field, 0) for row in client_detail), default=0)
+        for field in ("active_owners", "manager_active")
+    }
+    server_peaks = {
+        field: max((row.get(field, 0) for row in server_detail), default=0)
+        for field in ("owner_workers", "behavior_admissions", "worker_tasks", "active_streams", "service_streams", "replay_entries")
+    }
+    if client_peaks != {"active_owners": target, "manager_active": target}:
+        raise Failure(f"client resource owners did not reach exact target: {client_peaks}")
+    if any(server_peaks[field] != target for field in ("owner_workers", "behavior_admissions", "worker_tasks", "active_streams", "service_streams")) or server_peaks["replay_entries"] < target:
+        raise Failure(f"server resource owners did not reach target: {server_peaks}")
+    client_final_fields = ("setup_owners", "active_owners", "route_opens", "resolver_pending", "resolver_queued", "resolver_waiters", "manager_pending", "manager_waiters", "manager_active", "proxy_tasks")
+    server_final_fields = ("owner_workers", "behavior_admissions", "worker_tasks", "dialing", "active_streams", "service_streams")
+    if not client_detail or any(client_detail[-1].get(field) != 0 for field in client_final_fields):
+        raise Failure(f"client detailed resources did not drain: {client_detail[-1] if client_detail else None}")
+    if not server_detail or any(server_detail[-1].get(field) != 0 for field in server_final_fields):
+        raise Failure(f"server detailed resources did not drain: {server_detail[-1] if server_detail else None}")
     return True
 
 def private_markers_in(output: str, markers: list[str]) -> list[str]:
@@ -1270,8 +1290,12 @@ def run_case(root: pathlib.Path, case: str) -> dict:
                     for peer in peers:
                         peer.close()
                     peers.clear()
-                    wait_for_count(client_log, lambda row: row.get("event") == "tunnel_terminal", target, 120)
-                    wait_for_count(server_log, lambda row: row.get("event") == "tunnel_terminal", target, 120)
+                    client_terminals = wait_for_count(client_log, lambda row: row.get("event") == "tunnel_terminal", target, 120)
+                    server_terminals = wait_for_count(server_log, lambda row: row.get("event") == "tunnel_terminal", target, 120)
+                    client_terminal_offset = max(row.get("offset_ms", 0) for row in client_terminals)
+                    server_terminal_offset = max(row.get("offset_ms", 0) for row in server_terminals)
+                    wait_for(client_log, lambda row: row.get("event") == "client_tunnel_resources" and row.get("offset_ms", 0) > client_terminal_offset and all(row.get(field) == 0 for field in ("setup_owners", "active_owners", "route_opens", "resolver_pending", "resolver_queued", "resolver_waiters", "manager_pending", "manager_waiters", "manager_active", "proxy_tasks")), 30)
+                    wait_for(server_log, lambda row: row.get("event") == "server_tunnel_resources" and row.get("offset_ms", 0) > server_terminal_offset and all(row.get(field) == 0 for field in ("owner_workers", "behavior_admissions", "worker_tasks", "dialing", "active_streams", "service_streams")), 30)
                     run.mark_resources("after_release")
                 finally:
                     for peer in peers:
@@ -1359,9 +1383,10 @@ def run_case(root: pathlib.Path, case: str) -> dict:
                     if bytes(data) != payload:
                         raise Failure("echo payload mismatch")
             selected = [row.get("selected_path") for row in read_rows(client_log) if row.get("event") == "path_selected"]
-            expected_path = "relay" if profile.endswith("-relay") else "direct"
-            if expected_path not in selected:
-                raise Failure(f"expected {expected_path} selected path, saw {selected}")
+            if profile not in {"concurrent-streams", "resource-baseline"}:
+                expected_path = "relay" if profile.endswith("-relay") else "direct"
+                if expected_path not in selected:
+                    raise Failure(f"expected {expected_path} selected path, saw {selected}")
             if profile in {"concurrent-streams", "resource-baseline"}:
                 target = 64 if requested_case == "concurrent-streams/64-sustained" else 128
                 accepted_rows = [row for row in read_rows(client_log) if row.get("event") == "tunnel_accepted"]

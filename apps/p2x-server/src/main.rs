@@ -886,12 +886,16 @@ async fn main() -> io::Result<()> {
                     + swarm.behaviour().proxy_stream.as_ref().map_or(0, |proxy| proxy.pending_count());
                 let configured_proxy_workers = proxy_worker_table.len();
                 emitter.emit(&LifecycleRecord::Resources { connections, pending_opens, workers: worker_admission.admitted() + configured_proxy_workers, tasks: worker_admission.admitted() + configured_proxy_workers })?;
-                if !proxy_owner.stream_admission().is_empty() {
-                    emitter.emit(&LifecycleRecord::Resources {
-                        connections,
-                        pending_opens,
-                        workers: proxy_worker_table.len(),
-                        tasks: proxy_owner.stream_admission().dialing(),
+                if !args.unsafe_connectivity_lab {
+                    let (owner_workers, dialing, active_streams, _, service_counts, replay_entries) = proxy_owner.snapshot();
+                    emitter.emit(&LifecycleRecord::ServerTunnelResources {
+                        owner_workers,
+                        behavior_admissions: swarm.behaviour().proxy_stream.as_ref().map_or(0, |proxy| proxy.inbound_count()),
+                        worker_tasks: proxy_workers.len(),
+                        dialing,
+                        active_streams,
+                        service_streams: service_counts.values().sum(),
+                        replay_entries,
                     })?;
                 }
             }
@@ -1704,6 +1708,17 @@ async fn main() -> io::Result<()> {
         pending_opens,
         workers,
         tasks,
+    })?;
+    let (owner_workers, dialing, active_streams, _, service_counts, replay_entries) =
+        proxy_owner.snapshot();
+    emitter.emit(&LifecycleRecord::ServerTunnelResources {
+        owner_workers,
+        behavior_admissions: inbound_proxy_workers,
+        worker_tasks: proxy_workers.len(),
+        dialing,
+        active_streams,
+        service_streams: service_counts.values().sum(),
+        replay_entries,
     })?;
     emitter.terminal(&TerminalResult::simple(
         &args.case_id,

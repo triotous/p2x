@@ -207,7 +207,6 @@ impl IngressOwnerBook {
         self.active.keys().copied()
     }
 
-    #[allow(dead_code)]
     pub fn setup_len(&self) -> usize {
         self.setup.len()
     }
@@ -216,7 +215,6 @@ impl IngressOwnerBook {
         self.active.len()
     }
 
-    #[cfg(test)]
     pub fn proxy_task_len(&self) -> usize {
         self.proxy_tasks.len()
     }

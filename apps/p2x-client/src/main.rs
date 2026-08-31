@@ -1349,6 +1349,20 @@ async fn main() -> io::Result<()> {
                     })?;
                 }
                 emitter.emit(&LifecycleRecord::Resources { connections: connections.len(), pending_opens: proxy_pending.max(route_pending), workers: route_owner.as_ref().map_or(0, route_open::RouteOpenSupervisor::handshake_count).saturating_add(active_streams), tasks: active_streams })?;
+                if product_ingress {
+                    emitter.emit(&LifecycleRecord::ClientTunnelResources {
+                        setup_owners: ingress_owners.setup_len(),
+                        active_owners: active_streams,
+                        route_opens: route_pending,
+                        resolver_pending: resolver_state.pending(),
+                        resolver_queued: resolver_state.queued(),
+                        resolver_waiters: resolver_state.waiter_count(),
+                        manager_pending: connection_manager.as_ref().map_or(0, ConnectionManager::pending_count),
+                        manager_waiters: connection_manager.as_ref().map_or(0, ConnectionManager::total_waiter_count),
+                        manager_active: connection_manager.as_ref().map_or(0, ConnectionManager::total_active_count),
+                        proxy_tasks: ingress_owners.proxy_task_len(),
+                    })?;
+                }
             }
             Some(event) = ingress_rx.recv(), if product_ingress => {
                 match event {
@@ -3212,6 +3226,18 @@ async fn main() -> io::Result<()> {
             pending_opens: proxy_pending.max(route_pending),
             workers: proxy_tasks.len(),
             tasks: ingress_tasks.len(),
+        })?;
+        emitter.emit(&LifecycleRecord::ClientTunnelResources {
+            setup_owners: ingress_owners.setup_len(),
+            active_owners: ingress_owners.active_len(),
+            route_opens: route_pending,
+            resolver_pending: resolver_state.pending(),
+            resolver_queued: resolver_state.queued(),
+            resolver_waiters: resolver_state.waiter_count(),
+            manager_pending,
+            manager_waiters,
+            manager_active,
+            proxy_tasks: ingress_owners.proxy_task_len(),
         })?;
     }
     let mut terminal = TerminalResult::simple(&args.case_id, "stopped", "shutdown");
