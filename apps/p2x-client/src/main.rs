@@ -2632,9 +2632,11 @@ async fn main() -> io::Result<()> {
                             };
                             let _ = tx.send(ProxyResult { open_id: Some(open_id), request_id: open.request_id, result }).await;
                         });
-                        ingress_owners
-                            .set_proxy_task(open_id, proxy_task)
-                            .map_err(io::Error::other)?;
+                        if product_ingress {
+                            ingress_owners
+                                .set_proxy_task(open_id, proxy_task)
+                                .map_err(io::Error::other)?;
+                        }
                     }
                     SwarmEvent::Behaviour(p2x_net::builder::PeerEvent::Proxy(ProxyOutput::OutboundFailed { request_id, peer_id: _, connection_id: _, code: _ })) if route_proxy_requests.contains_key(&request_id) => {
                         let open_id = route_proxy_requests.remove(&request_id).expect("checked route proxy request exists");
