@@ -3208,6 +3208,9 @@ async fn main() -> io::Result<()> {
     for listener_id in listener_ids {
         swarm.remove_listener(listener_id);
     }
+    // DCUtR retries failed direct dials; disable it before disconnecting so shutdown
+    // cannot create a new dial after the connected-peer snapshot.
+    swarm.behaviour_mut().dcutr = libp2p::swarm::behaviour::toggle::Toggle::from(None);
     for peer in swarm.connected_peers().copied().collect::<Vec<_>>() {
         let _ = swarm.disconnect_peer_id(peer);
     }
