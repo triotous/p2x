@@ -167,12 +167,16 @@ async fn write_response_bounded<T: AsyncWrite + Unpin>(
     deadline: std::time::Instant,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> bool {
+    let write = tokio::time::timeout(
+        deadline.saturating_duration_since(std::time::Instant::now()),
+        proxy_codec::write_response(stream, response),
+    );
+    if cancel.is_cancelled() {
+        return write.await.is_ok_and(|result| result.is_ok());
+    }
     tokio::select! {
         _ = cancel.cancelled() => false,
-        result = tokio::time::timeout(
-            deadline.saturating_duration_since(std::time::Instant::now()),
-            proxy_codec::write_response(stream, response),
-        ) => result.is_ok_and(|result| result.is_ok()),
+        result = write => result.is_ok_and(|result| result.is_ok()),
     }
 }
 
@@ -711,6 +715,28 @@ mod tests {
             assert_eq!(stage.fault(), fault);
         }
         assert!("synthetic".parse::<TestDeadlineStage>().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_worker_can_write_its_bounded_rejection() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let response = ProxyOpenResponseV1::Rejected {
+            request_id: Some([1; 16]),
+            error: PublicError::new(PublicErrorCode::PeerDraining, true),
+        };
+        let mut output = Cursor::new(Vec::new());
+
+        assert!(
+            write_response_bounded(
+                &mut output,
+                &response,
+                std::time::Instant::now() + Duration::from_secs(1),
+                &cancel,
+            )
+            .await
+        );
+        assert!(!output.into_inner().is_empty());
     }
 
     #[tokio::test]

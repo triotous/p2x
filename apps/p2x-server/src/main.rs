@@ -1481,6 +1481,7 @@ async fn main() -> io::Result<()> {
     {
         proxy.set_draining(true);
     }
+    swarm.behaviour_mut().dcutr = libp2p::swarm::behaviour::toggle::Toggle::from(None);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while (worker_admission.admitted() > 0
         || !proxy_worker_table.is_empty()
@@ -1583,26 +1584,40 @@ async fn main() -> io::Result<()> {
         let outbound = send_registry(&mut swarm, peer_id, &operation);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if let SwarmEvent::Behaviour(PeerEvent::Registry(RequestResponseEvent::Message {
-                    message:
-                        RequestResponseMessage::Response {
-                            request_id: response_id,
-                            response:
-                                RegistryResponseV1::Withdrawn {
-                                    request_id: wire_id,
-                                    instance_id: response_instance,
-                                    ..
-                                },
-                        },
-                    ..
-                })) = swarm.select_next_some().await
-                    && response_id == outbound
-                    && wire_id == request_id
-                    && response_instance == instance_id
-                {
-                    break;
+                match swarm.select_next_some().await {
+                    SwarmEvent::Behaviour(PeerEvent::Registry(RequestResponseEvent::Message {
+                        message:
+                            RequestResponseMessage::Response {
+                                request_id: response_id,
+                                response:
+                                    RegistryResponseV1::Withdrawn {
+                                        request_id: wire_id,
+                                        instance_id: response_instance,
+                                        ..
+                                    },
+                            },
+                        ..
+                    })) if response_id == outbound
+                        && wire_id == request_id
+                        && response_instance == instance_id =>
+                    {
+                        break;
+                    }
+                    SwarmEvent::ConnectionClosed {
+                        peer_id,
+                        connection_id,
+                        ..
+                    } => {
+                        if let Some(book) = connection_book.as_mut() {
+                            book.on_connection_closed(peer_id, connection_id)
+                                .map_err(io::Error::other)?;
+                        }
+                        connection_paths.remove(&connection_id);
+                    }
+                    _ => {}
                 }
             }
+            Ok::<(), io::Error>(())
         })
         .await;
         availability.withdrawn();
