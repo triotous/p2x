@@ -47,3 +47,21 @@
 [action] Ran python3 -m unittest tests/tunnel/test_live.py; python3 -m py_compile tests/tunnel/live.py tests/tunnel/test_live.py; P2X_RUN_ID=audit-shutdown-boundary-client ./tests/tunnel/local.sh --case shutdown/client-setup; P2X_RUN_ID=audit-shutdown-boundary-server ./tests/tunnel/local.sh --case shutdown/server-setup; and git diff --check.
 [result] Six Python tests passed. Both isolated real-process setup cases applied hold_server_verification before Accepted, held an exact client route owner, shut down the selected side, emitted no TunnelAccepted, drained all final resource fields to zero, emitted one process terminal each, passed privacy scanning, and stopped every process/fixture.
 [commit] pending isolated setup-shutdown evidence commit.
+[commit] 60ddf64 Prove tunnel setup shutdown boundaries.
+[commit] 8a016f3 Close tunnel pump behavior matrix.
+[commit] c9caa2b Prove queued ingress resolve recovery.
+[commit] 883e8d5 Prove client path capacity recovery.
+[commit] e0188c7 Prove exact tunnel stream limits.
+[commit] b42a19b Prove active tunnel shutdown ownership.
+[commit] e0de3ef Prove exact ingress failure recovery.
+[commit] e54ee57 Record exact tunnel resource ownership.
+[audit] The first final-HEAD all-case run exposed two deadline-runner races: recovery matched a pre-ingress zero-resource sample, and accepted-write could observe stream EOF at the same absolute deadline and classify it as protocol.malformed.
+[action] Required deadline recovery to observe a production resource-zero sample strictly after the original ingress rejection; added a negative control proving an initial zero sample cannot satisfy the gate.
+[action] Made the client proxy handshake enforce its absolute deadline after either select branch completes, while retaining protocol.malformed for malformed responses completed before the deadline; added focused tests for simultaneous ready EOF/deadline and pre-deadline malformed EOF.
+[action] Ran cargo fmt --all; cargo test -p p2x-client proxy_open::tests -- --nocapture; cargo clippy -p p2x-client --all-targets -- -D warnings; python3 -m unittest tests/tunnel/test_live.py; python3 -m py_compile tests/tunnel/live.py tests/tunnel/test_live.py; and git diff --check.
+[result] Two focused Rust tests, 13 Python tests, formatting, focused Clippy, Python syntax, and diff checks passed.
+[action] Ran P2X_RUN_ID=20260829T-deadline-race-fixed ./tests/tunnel/local.sh --case deadline-stages.
+[result] All six isolated real-process stages passed exact fault, original peer.setup_timeout, post-rejection resource drain, later-ingress recovery, lifecycle correlation, privacy, and process-stop assertions; aggregate deadline-stages passed.
+[commit] pending deterministic deadline race commit.
+[action] Re-ran the aggregate after the final minimal timeout_at implementation: P2X_RUN_ID=20260829T-deadline-race-final ./tests/tunnel/local.sh --case deadline-stages.
+[result] All six stages and the aggregate passed again on the exact candidate diff.

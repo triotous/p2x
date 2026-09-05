@@ -27,6 +27,16 @@ class TunnelGateTests(unittest.TestCase):
             path.write_text("session:c2Vzc2lvbg\nticket:dGlja2V0\n")
             self.assertEqual(live.read_test_private_markers(path), ["c2Vzc2lvbg", "dGlja2V0"])
 
+    def test_deadline_recovery_drain_must_follow_rejection(self) -> None:
+        self.assertFalse(live.resources_drained_after(
+            {"event": "resources", "offset_ms": 1, "pending_opens": 0, "workers": 0, "tasks": 0},
+            2,
+        ))
+        self.assertTrue(live.resources_drained_after(
+            {"event": "resources", "offset_ms": 3, "pending_opens": 0, "workers": 0, "tasks": 0},
+            2,
+        ))
+
     def test_deadline_stage_matrix_is_closed_and_stage_specific(self) -> None:
         self.assertEqual(
             live.DEADLINE_STAGES,

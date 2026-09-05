@@ -70,6 +70,9 @@ def wait_for(path: pathlib.Path, predicate, timeout: float = 30.0) -> dict:
     tail = "\n".join(path.read_text(errors="replace").splitlines()[-20:]) if path.exists() else "<missing>"
     raise Failure(f"timed out waiting for {path.name}\n{tail}")
 
+def resources_drained_after(row: dict, offset_ms: int) -> bool:
+    return row.get("event") == "resources" and row.get("offset_ms", 0) > offset_ms and all(row.get(field) == 0 for field in ("pending_opens", "workers", "tasks"))
+
 
 class Upstream:
     def __init__(self, port: int, mode: str):
@@ -1015,13 +1018,13 @@ def run_case(root: pathlib.Path, case: str) -> dict:
             client.sendall(f"deadline-{stage}".encode())
             fault_log = exchange_log if stage == "resolve" else server_log
             wait_for(fault_log, lambda row: row.get("event") == "test_fault_applied" and row.get("fault") == expected_fault, 30)
-            wait_for(client_log, lambda row: row.get("event") == "ingress_rejected" and row.get("code") == "peer.setup_timeout", 10)
+            rejection = wait_for(client_log, lambda row: row.get("event") == "ingress_rejected" and row.get("code") == "peer.setup_timeout", 10)
             wait_for_eof(client, 10)
             if time.monotonic() - started >= 7:
                 raise Failure(f"deadline-stages/{stage} exceeded the original setup deadline")
             client.close()
             client = None
-            wait_for(client_log, lambda row: row.get("event") == "resources" and row.get("pending_opens") == 0 and row.get("workers") == 0 and row.get("tasks") == 0, 10)
+            wait_for(client_log, lambda row: resources_drained_after(row, rejection.get("offset_ms", 0)), 10)
             later = socket.create_connection(("127.0.0.1", run.local_port), timeout=20)
             later.settimeout(30)
             payload = f"deadline-recovery-{stage}".encode()
