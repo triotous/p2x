@@ -398,6 +398,30 @@ def assert_one_terminal(log: pathlib.Path) -> dict:
     return terminal[0]
 
 
+def observed(condition: bool, message: str) -> bool:
+    if not condition:
+        raise CaseFailure(message)
+    return condition
+
+def resources_drained(*logs: pathlib.Path) -> bool:
+    return observed(
+        all(
+            terminal.get(key) == 0
+            for log in logs
+            for terminal in [assert_one_terminal(log)]
+            for key in ("final_connections", "final_pending_opens", "final_workers", "final_tasks")
+        ),
+        "final resources did not drain",
+    )
+
+def privacy_scan_clean(run: Run) -> bool:
+    forbidden = [run.client_token, run.client2_token, run.server_token, "token_secret", "raw_ticket", "session_id"] + run.private
+    output = "\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
+    return observed(
+        not any(marker and marker in output for marker in forbidden),
+        "privacy scan found credentials, session data, ticket data, or selector values",
+    )
+
 def finish_limits(run: Run, primary_log: pathlib.Path, secondary_log: pathlib.Path, server_log: pathlib.Path, exchange_log: pathlib.Path) -> None:
     primary_terminal = assert_one_terminal(primary_log)
     secondary_terminal = assert_one_terminal(secondary_log)
@@ -416,38 +440,49 @@ def finish_limits(run: Run, primary_log: pathlib.Path, secondary_log: pathlib.Pa
     server_rows = rows(server_log)
     if case == "resolve-limit":
         outcomes = [row for row in exchange_rows if row.get("event") == "resolution_outcome"]
-        if not any(row.get("resolved") and row.get("ticket_issued") for row in outcomes):
-            raise CaseFailure("resolve-limit did not admit the boundary request")
-        if not any(
-            row.get("code") == "limit.resolve_requests"
-            and not row.get("resolved")
-            and not row.get("ticket_issued")
-            for row in outcomes
-        ):
-            raise CaseFailure("resolve-limit did not reject N+1 without ticket state")
-        if not any(row.get("event") == "test_fault_applied" and row.get("fault") == "hold_resolve_response" for row in exchange_rows):
-            raise CaseFailure("resolve-limit hold fault was not observed")
+        boundary_admitted = observed(
+            any(row.get("resolved") and row.get("ticket_issued") for row in outcomes),
+            "resolve-limit did not admit the boundary request",
+        )
+        n_plus_one_rejected = observed(
+            any(
+                row.get("code") == "limit.resolve_requests"
+                and not row.get("resolved")
+                and not row.get("ticket_issued")
+                for row in outcomes
+            ),
+            "resolve-limit did not reject N+1 without ticket state",
+        )
+        observed(
+            any(row.get("event") == "test_fault_applied" and row.get("fault") == "hold_resolve_response" for row in exchange_rows),
+            "resolve-limit hold fault was not observed",
+        )
     else:
-        if not any(row.get("event") == "proxy_authorization" and row.get("code") == "limit.proxy_streams" for row in server_rows):
-            raise CaseFailure("proxy-limit did not produce server admission rejection evidence")
-        if not any(row.get("event") == "resources" and row.get("workers", 0) >= 1 for row in server_rows):
-            raise CaseFailure("proxy-limit did not expose a live held worker")
-    forbidden = [run.client_token, run.client2_token, run.server_token, "token_secret", "raw_ticket", "session_id"] + run.private
-    output = "\\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
-    if any(marker and marker in output for marker in forbidden):
-        raise CaseFailure("privacy scan found credentials, session data, ticket data, or selector values")
+        authorizations = [row for row in server_rows if row.get("event") == "proxy_authorization"]
+        boundary_admitted = observed(
+            any(row.get("authorized") for row in authorizations),
+            "proxy-limit did not admit the boundary request",
+        )
+        n_plus_one_rejected = observed(
+            any(row.get("code") == "limit.proxy_streams" for row in authorizations),
+            "proxy-limit did not produce server admission rejection evidence",
+        )
+        observed(
+            any(row.get("event") == "resources" and row.get("workers", 0) >= 1 for row in server_rows),
+            "proxy-limit did not expose a live held worker",
+        )
     summary = {
         "case": case,
         "passed": True,
         "observed_assertions": {
-            "boundary_admitted": True,
-            "n_plus_one_rejected": True,
-            "primary_authorized": True,
-            "resources_drained": True,
-            "privacy_scan_clean": True,
+            "boundary_admitted": boundary_admitted,
+            "n_plus_one_rejected": n_plus_one_rejected,
+            "primary_authorized": observed("proxy.authorized" in terminal_codes, "limit boundary was not authorized"),
+            "resources_drained": resources_drained(primary_log, secondary_log, server_log, exchange_log),
+            "privacy_scan_clean": privacy_scan_clean(run),
         },
     }
-    (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\\n")
+    (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
     print(json.dumps(summary, sort_keys=True), flush=True)
 
 def finish_restart(run: Run, client_log: pathlib.Path, server_logs: list[pathlib.Path], exchange_logs: list[pathlib.Path]) -> None:
@@ -471,12 +506,22 @@ def finish_restart(run: Run, client_log: pathlib.Path, server_logs: list[pathlib
     revisions = [row.get("revision") for row in exchange_rows if row.get("event") == "registry_transition" and row.get("code") == "registry.registered" and row.get("revision") is not None]
     if len(set(revisions)) < 2:
         raise CaseFailure(f"{case} did not observe replacement registration revision")
-    forbidden = [run.client_token, run.client2_token, run.server_token, "token_secret", "raw_ticket", "session_id"] + run.private
-    output = "\\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
-    if any(marker and marker in output for marker in forbidden):
-        raise CaseFailure("privacy scan found credentials, session data, ticket data, or selector values")
-    summary = {"case": case, "passed": True, "observed_assertions": {"fresh_resolve_authorized": True, "replacement_registration_observed": True, "privacy_scan_clean": True}}
-    (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\\n")
+    summary = {
+        "case": case,
+        "passed": True,
+        "observed_assertions": {
+            "fresh_resolve_authorized": observed(
+                terminal.get("code") == "proxy.authorized" and len(outcomes) >= 2,
+                f"{case} did not authorize fresh resolution",
+            ),
+            "replacement_registration_observed": observed(
+                len(set(revisions)) >= 2,
+                f"{case} did not observe replacement registration revision",
+            ),
+            "privacy_scan_clean": privacy_scan_clean(run),
+        },
+    }
+    (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
     print(json.dumps(summary, sort_keys=True), flush=True)
 
 def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathlib.Path, exchange_log: pathlib.Path) -> None:
@@ -509,13 +554,23 @@ def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathli
             raise CaseFailure(f"concurrent-opens expected 128 headroom resolutions, got {len(resolution_client)}")
     elif len(resolution_client) != 1 or len(resolution_exchange) != 1:
         raise CaseFailure(f"resolution outcome cardinality: client={len(resolution_client)} exchange={len(resolution_exchange)}")
-    if case not in ("connection-reuse", "concurrent-opens") and resolution_client[0].get("request_id_hash") != resolution_exchange[0].get("request_id_hash"):
-        raise CaseFailure("client/exchange resolution correlation mismatch")
+    if case in ("connection-reuse", "concurrent-opens"):
+        resolution_correlated = observed(
+            sorted(row.get("request_id_hash") for row in resolution_client)
+            == sorted(row.get("request_id_hash") for row in resolution_exchange),
+            "client/exchange resolution correlation mismatch",
+        )
+    else:
+        resolution_correlated = observed(
+            bool(resolution_client)
+            and all(row.get("request_id_hash") == resolution_client[0].get("request_id_hash") for row in resolution_exchange),
+            "client/exchange resolution correlation mismatch",
+        )
+    client_auth = [row for row in client_rows if row.get("event") == "proxy_authorization" and row.get("authorized")]
+    server_auth = [row for row in server_rows if row.get("event") == "proxy_authorization" and row.get("authorized")]
     if expected == "proxy.authorized":
         if not resolution_client[0].get("resolved") or not resolution_client[0].get("ticket_issued"):
             raise CaseFailure("successful resolution did not report a ticketed grant")
-        client_auth = [row for row in client_rows if row.get("event") == "proxy_authorization" and row.get("authorized")]
-        server_auth = [row for row in server_rows if row.get("event") == "proxy_authorization" and row.get("authorized")]
         if not client_auth or not server_auth:
             raise CaseFailure(f"proxy authorization missing: client={len(client_auth)} server={len(server_auth)}")
         if case in ("connection-reuse", "concurrent-opens"):
@@ -563,23 +618,22 @@ def finish(run: Run, expected: str, client_log: pathlib.Path, server_log: pathli
     if case == "ticket-bindings":
         if not run.binding_unit_passed:
             raise CaseFailure("ticket-bindings unit matrix did not pass")
-    forbidden = [run.client_token, run.server_token, "token_secret", "raw_ticket", "session_id"] + run.private
-    output = "\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
-    if any(marker and marker in output for marker in forbidden):
-        raise CaseFailure("privacy scan found credentials, session data, ticket data, or selector values")
     summary = {
         "case": case,
         "passed": True,
         "observed_assertions": {
             "client_terminal": expected,
-            "client_exchange_resolution_correlated": True,
-            "server_authorization_correlated": expected == "proxy.authorized",
-            "exact_selected_connection": expected == "proxy.authorized",
-            "privacy_scan_clean": True,
+            "client_exchange_resolution_correlated": resolution_correlated,
+            "server_authorization_correlated": expected == "proxy.authorized" and bool(server_auth),
+            "exact_selected_connection": expected == "proxy.authorized" and bool(client_auth),
+            "privacy_scan_clean": privacy_scan_clean(run),
         },
     }
     if case == "ticket-bindings":
-        summary["subcases"] = {name: True for name in BINDING_SUBCASES}
+        summary["subcases"] = {
+            name: observed(run.binding_unit_passed, f"ticket binding subcase {name} did not pass")
+            for name in BINDING_SUBCASES
+        }
     (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
     print(json.dumps(summary, sort_keys=True), flush=True)
 
@@ -744,16 +798,25 @@ try:
         if any(row.get("event") == "proxy_authorization" for row in rows(cancel_client)):
             raise CaseFailure("client cancel unexpectedly opened a proxy")
 
-        for path in (server_log, client_log, exchange_log, exchange_drain, exchange_client, server_drain, cancel_client, server_cancel, exchange_cancel):
-            terminal = assert_one_terminal(path)
-            if any(terminal.get(key) != 0 for key in ("final_connections", "final_pending_opens", "final_workers", "final_tasks")):
-                raise CaseFailure(f"{path.name}: final resources did not drain")
-        forbidden = [run.client_token, run.client2_token, run.server_token, "token_secret", "raw_ticket", "session_id"] + run.private
-        output = "\\n".join(path.read_text(errors="replace") for _, path, _ in run.processes)
-        if any(marker and marker in output for marker in forbidden):
-            raise CaseFailure("privacy scan found credentials, session data, ticket data, or selector values")
-        summary = {"case": case, "passed": True, "subcases": {"server_drain": True, "exchange_drain": True, "client_cancel": True}, "observed_assertions": {"resources_drained": True, "readiness_loss": True, "privacy_scan_clean": True}}
-        (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\\n")
+        lifecycle_logs = (server_log, client_log, exchange_log, exchange_drain, exchange_client, server_drain, cancel_client, server_cancel, exchange_cancel)
+        summary = {
+            "case": case,
+            "passed": True,
+            "subcases": {
+                "server_drain": observed(server_client_terminal.get("code") == "peer.draining", "server drain was not observed"),
+                "exchange_drain": observed(exchange_terminal.get("code") == "exchange.draining", "exchange drain was not observed"),
+                "client_cancel": observed(cancel_terminal.get("code") == "shutdown", "client cancellation was not observed"),
+            },
+            "observed_assertions": {
+                "resources_drained": resources_drained(*lifecycle_logs),
+                "readiness_loss": observed(
+                    server_client_terminal.get("code") == "peer.draining" and exchange_terminal.get("code") == "exchange.draining",
+                    "drain readiness loss was not observed",
+                ),
+                "privacy_scan_clean": privacy_scan_clean(run),
+            },
+        }
+        (run.out / "summary.json").write_text(json.dumps(summary, sort_keys=True) + "\n")
         print(json.dumps(summary, sort_keys=True), flush=True)
     else:
         terminal = wait_for(client_log, lambda row: row.get("event") == "terminal", 45)

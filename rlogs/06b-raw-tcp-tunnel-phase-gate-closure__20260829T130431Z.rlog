@@ -65,3 +65,11 @@
 [commit] pending deterministic deadline race commit.
 [action] Re-ran the aggregate after the final minimal timeout_at implementation: P2X_RUN_ID=20260829T-deadline-race-final ./tests/tunnel/local.sh --case deadline-stages.
 [result] All six stages and the aggregate passed again on the exact candidate diff.
+[audit] Strict parsing of the three resolution closure artifact sets found six summary.json files per run ending in literal \\n bytes; those summaries were not valid standalone JSON despite the runner returning success. The affected privacy scans also joined logs with literal \\n separators.
+[action] Corrected the existing resolution summary/log separators and derived required limit, restart, drain, resource, privacy, and correlation summary fields from successful evidence assertions instead of literal true assignments.
+[validation] bash -n tests/resolution/local.sh; embedded Python compile; focused proxy-limit and idempotent-resolve runs; git diff --check; AST scan for unconditional required assertion values.
+[result] Syntax, focused cases, strict summary JSON parsing, diff check, and source assertion scan passed. The first full strict rerun failed idempotent-resolve because a generic cardinality check rejected its intentional one-client/two-identical-exchange retry evidence; changed correlation to compare exact request hashes and restarted the required count.
+[action] Ran ./tests/resolution/local.sh --case all three consecutive times with P2X_RUN_ID=20260829T-closure-resolution-strict-final-1, 20260829T-closure-resolution-strict-final-2, and 20260829T-closure-resolution-strict-final-3.
+[result] All 20 cases passed in all three consecutive runs. Direct audit parsed all 60 summary files and 213 NDJSON artifacts strictly; run row counts were 3124, 3124, and 3116. No required tunnel/resolution observed assertion is assigned literal true.
+[evidence] target/p2x-resolution/20260829T-closure-resolution-strict-final-{1,2,3}/.
+[commit] pending strict resolution evidence commit.
