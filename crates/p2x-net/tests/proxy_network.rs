@@ -51,24 +51,29 @@ async fn run_proxy_over(quic: bool) {
     client.dial(server_address).unwrap();
     let mut opened: Option<ProxyRequestId> = None;
     let mut inbound = false;
+    let mut client_io = false;
+    let mut completed_io = 0;
+    let mut io_tasks = tokio::task::JoinSet::new();
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             tokio::select! {
                 event = client.select_next_some() => match event {
-                    SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } if peer_id == server_peer => {
+                    SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } if peer_id == server_peer && opened.is_none() => {
                         let request = client.behaviour_mut().proxy_stream.as_mut().unwrap().open_on(peer_id, connection_id, open()).unwrap();
                         opened = Some(request);
                     }
                     SwarmEvent::Behaviour(PeerEvent::Proxy(ProxyOutput::OutboundOpened { request_id, mut stream, .. })) if Some(request_id) == opened => {
-                        proxy_codec::write_open(&mut stream, &open()).await.unwrap();
-                        let response = proxy_codec::read_response(&mut stream).await.unwrap();
-                        assert_eq!(response, ProxyOpenResponseV1::Accepted { request_id: [1; 16], stream_id: [2; 16], selected_upstream_mode: p2x_protocol::UpstreamMode::Tcp });
-                        stream.write_all(b"client").await.unwrap();
-                        let mut echoed = [0; 6];
-                        stream.read_exact(&mut echoed).await.unwrap();
-                        assert_eq!(&echoed, b"server");
-                        return;
+                        client_io = true;
+                        io_tasks.spawn(async move {
+                            proxy_codec::write_open(&mut stream, &open()).await.unwrap();
+                            let response = proxy_codec::read_response(&mut stream).await.unwrap();
+                            assert_eq!(response, ProxyOpenResponseV1::Accepted { request_id: [1; 16], stream_id: [2; 16], selected_upstream_mode: p2x_protocol::UpstreamMode::Tcp });
+                            stream.write_all(b"client").await.unwrap();
+                            let mut echoed = [0; 6];
+                            stream.read_exact(&mut echoed).await.unwrap();
+                            assert_eq!(&echoed, b"server");
+                        });
                     }
                     SwarmEvent::Behaviour(PeerEvent::Proxy(ProxyOutput::OutboundFailed { code, .. })) => panic!("proxy open failed: {code}"),
                     _ => {}
@@ -77,7 +82,7 @@ async fn run_proxy_over(quic: bool) {
                     SwarmEvent::Behaviour(PeerEvent::Proxy(ProxyOutput::InboundOpened { peer_id, connection_id, mut stream })) => {
                         inbound = true;
                         server.behaviour_mut().proxy_stream.as_mut().unwrap().inbound_release_on(peer_id, connection_id);
-                        tokio::spawn(async move {
+                        io_tasks.spawn(async move {
                             let received = proxy_codec::read_open(&mut stream).await.unwrap();
                             assert_eq!(received, open());
                             proxy_codec::write_response(&mut stream, &ProxyOpenResponseV1::Accepted { request_id: [1; 16], stream_id: [2; 16], selected_upstream_mode: p2x_protocol::UpstreamMode::Tcp }).await.unwrap();
@@ -90,10 +95,16 @@ async fn run_proxy_over(quic: bool) {
                     SwarmEvent::ConnectionEstablished { .. } => {}
                     _ => {}
                 },
+                result = io_tasks.join_next(), if !io_tasks.is_empty() => {
+                    result.expect("proxy I/O task missing").expect("proxy I/O task failed");
+                    completed_io += 1;
+                    if client_io && inbound && completed_io == 2 {
+                        return;
+                    }
+                }
             }
         }
     }).await.expect("proxy round trip timeout");
-    assert!(inbound);
 }
 
 #[tokio::test]
