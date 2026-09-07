@@ -115,3 +115,9 @@
 [result] Focused serial and default-parallel TCP/QUIC integration tests, focused Clippy, formatting, and diff checks passed; all 100 repeated two-test runs passed.
 [status] Plan 07 remains temporarily blocked until the exact clean workspace test and Clippy chain that exposed the regression completes successfully on this correction.
 [commit] pending proxy network test-driver correction commit.
+[commit] fe6c12b Drive QUIC swarm during proxy network I/O.
+[action] From clean build output after fe6c12b, ran the reporter exact chain: cargo clean && cargo test --all && cargo clippy --all-targets --all-features.
+[result] Exact chain passed end-to-end. cargo clean removed the prior target output; cargo test --all rebuilt 276 packages and all targets passed, including product_proxy_round_trip_over_tcp and product_proxy_round_trip_over_quic; cargo clippy then ran and finished successfully with all targets/all features. Test build took 1m01s and Clippy took 15.70s. Full output: /tmp/p2x-clean-test-all-clippy.log.
+[validation] cargo fmt --all -- --check and git diff --check passed after the clean chain.
+[status] The clean-build regression is closed. Plan 06b locally automatable Definition of Done and Plan 07 eligibility are restored; owner-executed Plan 06 section 5.5 follow-up remains unchanged and incomplete.
+[commit] pending clean-build regression closure log commit.
