@@ -1,4 +1,6 @@
+use crate::router::{AdapterKind, DomainRouteSpec, DomainRouter, ListenerId};
 use p2x_protocol::{MetadataKey, MetadataValue, ProtocolClass, UnscopedSelector};
+use p2x_proxy::domain::MAX_DOMAIN_INPUT_BYTES;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -21,6 +23,8 @@ struct File {
     network: Network,
     targets: Vec<Target>,
     raw_tcp: Option<Vec<RawTcp>>,
+    ingress: Option<Ingress>,
+    domain_routes: Option<Vec<DomainRoute>>,
     limits: Limits,
 }
 #[derive(Debug, Deserialize)]
@@ -44,6 +48,25 @@ struct RawTcp {
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Ingress {
+    http: Option<Vec<AdapterListener>>,
+    tls_sni: Option<Vec<AdapterListener>>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdapterListener {
+    name: String,
+    bind: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DomainRoute {
+    listener: String,
+    domain: String,
+    route_id: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Selector {
     protocol: String,
     metadata: BTreeMap<String, String>,
@@ -58,6 +81,9 @@ struct Limits {
     max_ingress_connections: Option<usize>,
     max_streams_per_server: Option<usize>,
     copy_buffer_bytes: Option<usize>,
+    ingress_parse_timeout_ms: Option<u64>,
+    max_http_header_bytes: Option<usize>,
+    max_tls_client_hello_bytes: Option<usize>,
 }
 #[derive(Clone, Debug)]
 pub struct Route {
@@ -70,6 +96,13 @@ pub struct RawTcpListener {
     pub bind: SocketAddr,
     pub route_id: String,
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdapterListenerConfig {
+    pub id: ListenerId,
+    pub name: String,
+    pub bind: SocketAddr,
+    pub kind: AdapterKind,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClientLimits {
     pub max_peer_states: usize,
@@ -79,6 +112,9 @@ pub struct ClientLimits {
     pub max_ingress_connections: usize,
     pub max_streams_per_server: usize,
     pub copy_buffer_bytes: usize,
+    pub ingress_parse_timeout_ms: u64,
+    pub max_http_header_bytes: usize,
+    pub max_tls_client_hello_bytes: usize,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClientNetwork {
@@ -90,6 +126,9 @@ pub struct ClientConfig {
     pub network: ClientNetwork,
     pub routes: Vec<Route>,
     pub raw_tcp: Vec<RawTcpListener>,
+    pub adapter_listeners: Vec<AdapterListenerConfig>,
+    pub domain_routes: Vec<DomainRouteSpec>,
+    pub domain_router: DomainRouter,
     pub limits: ClientLimits,
 }
 
@@ -130,6 +169,9 @@ impl ClientConfig {
             max_ingress_connections: file.limits.max_ingress_connections.unwrap_or(512),
             max_streams_per_server: file.limits.max_streams_per_server.unwrap_or(128),
             copy_buffer_bytes: file.limits.copy_buffer_bytes.unwrap_or(32 * 1024),
+            ingress_parse_timeout_ms: file.limits.ingress_parse_timeout_ms.unwrap_or(5_000),
+            max_http_header_bytes: file.limits.max_http_header_bytes.unwrap_or(16 * 1024),
+            max_tls_client_hello_bytes: file.limits.max_tls_client_hello_bytes.unwrap_or(64 * 1024),
         };
         if limits.max_peer_states == 0
             || limits.max_peer_states > 256
@@ -142,10 +184,23 @@ impl ClientConfig {
             || !(1..=MAX_INGRESS_CONNECTIONS).contains(&limits.max_ingress_connections)
             || !(1..=MAX_STREAMS_PER_SERVER).contains(&limits.max_streams_per_server)
             || !(MIN_COPY_BUFFER_BYTES..=MAX_COPY_BUFFER_BYTES).contains(&limits.copy_buffer_bytes)
+            || !(100..=5_000).contains(&limits.ingress_parse_timeout_ms)
+            || !(1..=64 * 1024).contains(&limits.max_http_header_bytes)
+            || !(4 * 1024..=256 * 1024).contains(&limits.max_tls_client_hello_bytes)
             || limits
                 .copy_buffer_bytes
                 .checked_mul(limits.max_ingress_connections)
                 .and_then(|value| value.checked_mul(3))
+                .and_then(|value| {
+                    value.checked_add(
+                        limits.max_tls_client_hello_bytes.max(
+                            limits
+                                .max_http_header_bytes
+                                .checked_mul(2)?
+                                .checked_add(32 * 256)?,
+                        ),
+                    )
+                })
                 .is_none()
         {
             return Err(RouteConfigError::Invalid("invalid client limits".into()));
@@ -241,10 +296,94 @@ impl ClientConfig {
                 })
             })
             .collect::<Result<Vec<_>, RouteConfigError>>()?;
+        let mut adapter_listeners = Vec::new();
+        let ingress = file.ingress.unwrap_or(Ingress {
+            http: None,
+            tls_sni: None,
+        });
+        let mut next_listener_id = 0u16;
+        let mut add_listeners = |entries: Vec<AdapterListener>,
+                                 kind: AdapterKind|
+         -> Result<(), RouteConfigError> {
+            for listener in entries {
+                if listener.name.is_empty()
+                    || listener.name.len() > 64
+                    || !listener
+                        .name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+                    || !listener_names.insert(listener.name.clone())
+                {
+                    return Err(RouteConfigError::Invalid(
+                        "invalid or duplicate adapter listener name".into(),
+                    ));
+                }
+                let bind = listener.bind.parse::<SocketAddr>().map_err(|_| {
+                    RouteConfigError::Invalid("invalid adapter bind address".into())
+                })?;
+                if bind.port() == 0 || !bind.ip().is_loopback() || !listener_binds.insert(bind) {
+                    return Err(RouteConfigError::Invalid(
+                        "adapter binds must be unique loopback addresses with nonzero ports".into(),
+                    ));
+                }
+                next_listener_id = next_listener_id.checked_add(1).ok_or_else(|| {
+                    RouteConfigError::Invalid("too many adapter listeners".into())
+                })?;
+                adapter_listeners.push(AdapterListenerConfig {
+                    id: ListenerId(next_listener_id),
+                    name: listener.name,
+                    bind,
+                    kind,
+                });
+            }
+            Ok(())
+        };
+        add_listeners(ingress.http.unwrap_or_default(), AdapterKind::Http)?;
+        add_listeners(ingress.tls_sni.unwrap_or_default(), AdapterKind::TlsSni)?;
+        if raw_tcp.len() + adapter_listeners.len() > 256 {
+            return Err(RouteConfigError::Invalid(
+                "listener count is out of bounds".into(),
+            ));
+        }
+        let domain_routes = file.domain_routes.unwrap_or_default();
+        if domain_routes.len() > 1_024 {
+            return Err(RouteConfigError::Invalid(
+                "domain route count is out of bounds".into(),
+            ));
+        }
+        if domain_routes
+            .iter()
+            .any(|route| route.domain.len() > MAX_DOMAIN_INPUT_BYTES)
+        {
+            return Err(RouteConfigError::Invalid("domain input is too long".into()));
+        }
+        let domain_routes = domain_routes
+            .into_iter()
+            .map(|route| DomainRouteSpec {
+                listener: route.listener,
+                domain: route.domain,
+                route_id: route.route_id,
+            })
+            .collect::<Vec<_>>();
+        let listener_specs = adapter_listeners
+            .iter()
+            .map(|listener| (listener.id, listener.name.clone(), listener.kind))
+            .collect::<Vec<_>>();
+        let target_specs = routes
+            .iter()
+            .map(|route| (route.route_id.clone(), route.selector.protocol()))
+            .collect::<Vec<_>>();
+        let domain_router = DomainRouter::build(&listener_specs, &domain_routes, &target_specs)
+            .map_err(|error| {
+                RouteConfigError::Invalid(format!("domain route is invalid: {error:?}"))
+            })?;
         Ok(Self {
             network,
             routes,
             raw_tcp,
+            adapter_listeners,
+            domain_routes,
+            domain_router,
             limits,
         })
     }

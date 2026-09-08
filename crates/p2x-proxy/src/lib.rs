@@ -1,5 +1,7 @@
 //! Bounded opaque-byte tunnelling for futures and Tokio I/O streams.
 
+pub mod domain;
+
 use futures::{
     future::poll_fn,
     io::{AsyncRead, AsyncWrite},

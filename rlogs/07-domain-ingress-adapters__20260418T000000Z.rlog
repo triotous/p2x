@@ -1,0 +1,8 @@
+session=20260418T000000Z
+plan=07-domain-ingress-adapters.md
+status=started
+baseline: clean git tree; cargo test --workspace --all-targets --all-features passed
+phase A: implementing shared bounded canonical domains, additive listener configuration, and exact local router
+phase A result: shared CanonicalDomain, authority/SNI normalization, additive limits/listeners/domain_routes, immutable DomainRouter
+validation: cargo fmt --all -- --check; cargo clippy -p p2x-proxy -p p2x-client --all-targets --all-features -- -D warnings; cargo test --workspace --all-targets --all-features; git diff --check — all passed
+phase A status: ready to commit

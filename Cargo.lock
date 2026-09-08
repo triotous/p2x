@@ -2192,6 +2192,8 @@ name = "p2x-proxy"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "httparse",
+ "idna",
  "tokio",
  "tokio-util",
 ]

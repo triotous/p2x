@@ -9,6 +9,8 @@ workspace = true
 
 [dependencies]
 futures.workspace = true
+httparse.workspace = true
+idna.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

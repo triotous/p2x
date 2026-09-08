@@ -10,6 +10,7 @@ mod proxy_open;
 mod resolver;
 #[allow(dead_code)]
 mod route_open;
+mod router;
 
 use clap::{Parser, ValueEnum};
 use connection_manager::{ConnectionManager, ResolvedPeerMetadata, SetupLimits};
