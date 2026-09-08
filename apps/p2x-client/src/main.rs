@@ -137,7 +137,10 @@ async fn reject_ingress(
         return Ok(false);
     };
     owner.cancel.cancel();
-    let _ = owner.command.send(IngressCommand::Reject).await;
+    let _ = owner
+        .command
+        .send(IngressCommand::Reject(code.as_str()))
+        .await;
     emitter.emit(&LifecycleRecord::IngressRejected {
         route_id_hash: stable_hash(&owner.route_id),
         ingress_id: id.0,
@@ -455,7 +458,10 @@ async fn complete_route_actions(
                     && let Some(owner) = ingress_owners.take_setup_for_open(open_id)
                 {
                     owner.cancel.cancel();
-                    let _ = owner.command.send(IngressCommand::Reject).await;
+                    let _ = owner
+                        .command
+                        .send(IngressCommand::Reject(code.as_str()))
+                        .await;
                     emitter.emit(&LifecycleRecord::IngressRejected {
                         route_id_hash: stable_hash(&owner.route_id),
                         ingress_id: ingress_id.0,
@@ -850,7 +856,15 @@ async fn main() -> io::Result<()> {
     let mut swarm = build_peer_swarm(key, &config).map_err(io::Error::other)?;
     let listener_ids = start_peer_listeners(&mut swarm, &config).map_err(io::Error::other)?;
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let (ingress_tx, mut ingress_rx) = mpsc::channel::<IngressEvent>(128);
+    // Every admitted connection can have one queued transition while another
+    // completion is becoming ready. Size the channel from the same admission
+    // budget so terminal delivery cannot deadlock shutdown at higher limits.
+    let ingress_event_capacity = routes
+        .as_ref()
+        .map(|routes| routes.limits.max_ingress_connections.saturating_mul(2))
+        .unwrap_or(0)
+        .max(128);
+    let (ingress_tx, mut ingress_rx) = mpsc::channel::<IngressEvent>(ingress_event_capacity);
     let mut ingress_tasks = if product_ingress {
         let route_config = routes.as_ref().expect("raw ingress has route config");
         let listeners =
@@ -1519,7 +1533,7 @@ async fn main() -> io::Result<()> {
                             reject_ingress(&mut ingress_owners, id, code, &emitter).await?;
                         }
                     }
-                    IngressEvent::TunnelFinished { id, result } => {
+                    IngressEvent::TunnelFinished { id, result, code } => {
                         let Some(active) = ingress_owners.take_active(id) else {
                             continue;
                         };
@@ -1530,7 +1544,7 @@ async fn main() -> io::Result<()> {
                                     &active,
                                     Some(&result),
                                     tunnel_terminal_class(result.terminal),
-                                    None,
+                                    code,
                                 )?;
                             }
                             Err(error) => {
@@ -1539,7 +1553,7 @@ async fn main() -> io::Result<()> {
                                     &active,
                                     None,
                                     p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
-                                    Some("internal.pump_setup"),
+                                    code.or(Some("internal.pump_setup")),
                                 )?;
                                 let _ = error;
                             }
@@ -3128,7 +3142,7 @@ async fn main() -> io::Result<()> {
         }
     }
     while let Ok(event) = ingress_rx.try_recv() {
-        if let IngressEvent::TunnelFinished { id, result } = event
+        if let IngressEvent::TunnelFinished { id, result, code } = event
             && let Some(active) = ingress_owners.take_active(id)
         {
             match result {
@@ -3137,14 +3151,14 @@ async fn main() -> io::Result<()> {
                     &active,
                     Some(&result),
                     tunnel_terminal_class(result.terminal),
-                    None,
+                    code,
                 )?,
                 Err(_) => emit_client_tunnel_terminal(
                     &emitter,
                     &active,
                     None,
                     p2x_net::lifecycle::TunnelTerminalClass::Cancelled,
-                    Some("internal.pump_setup"),
+                    code.or(Some("internal.pump_setup")),
                 )?,
             }
             if let Some(manager) = connection_manager.as_mut()

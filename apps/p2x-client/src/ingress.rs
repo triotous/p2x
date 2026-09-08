@@ -14,7 +14,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{Semaphore, mpsc},
     task::JoinHandle,
@@ -30,7 +30,7 @@ impl<T> TunnelIo for T where T: futures::io::AsyncRead + futures::io::AsyncWrite
 
 pub enum IngressCommand {
     StartTunnel { stream: Box<dyn TunnelIo> },
-    Reject,
+    Reject(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,6 +69,7 @@ pub enum IngressEvent {
     TunnelFinished {
         id: IngressId,
         result: Result<PumpResult, PumpFailure>,
+        code: Option<&'static str>,
     },
 }
 
@@ -168,6 +169,10 @@ async fn accept_loop(
     loop {
         let accepted = tokio::select! {
             _ = shutdown.cancelled() => break,
+            joined = connections.join_next(), if !connections.is_empty() => {
+                let _ = joined;
+                continue;
+            },
             accepted = bound.listener.accept() => accepted,
         };
         let (socket, _) = match accepted {
@@ -250,6 +255,7 @@ async fn accept_loop(
             None,
             None,
             Vec::new(),
+            parse_timeout,
         ));
     }
     while connections.join_next().await.is_some() {}
@@ -260,7 +266,7 @@ async fn run_adapter_connection(
     id: IngressId,
     adapter: AdapterListenerConfig,
     router: DomainRouter,
-    socket: TcpStream,
+    mut socket: TcpStream,
     permit: tokio::sync::OwnedSemaphorePermit,
     copy_buffer_bytes: usize,
     parse_timeout: Duration,
@@ -278,22 +284,24 @@ async fn run_adapter_connection(
     let parsed = tokio::time::timeout(
         parse_budget,
         parse_adapter_preface(
-            adapter,
+            &adapter,
             router,
-            socket,
+            &mut socket,
             max_http_header_bytes,
             max_tls_client_hello_bytes,
-            permit,
         ),
     )
     .await;
-    let (socket, permit, route_id, kind, http_state, prefix) = match parsed {
+    let (route_id, kind, http_state, prefix) = match parsed {
         Err(_) => {
             let code = if parse_expired_as_setup {
                 "peer.setup_timeout"
             } else {
                 "route.parse_timeout"
             };
+            if adapter.kind == AdapterKind::Http {
+                send_http_error(&mut socket, id, code, deadline).await;
+            }
             let _ = failure_events
                 .send(IngressEvent::Rejected {
                     id,
@@ -305,17 +313,24 @@ async fn run_adapter_connection(
         }
         Ok(Ok(parsed)) => parsed,
         Ok(Err(error)) => {
+            let code = adapter_error_code(&error);
+            if adapter.kind == AdapterKind::Http {
+                send_http_error(&mut socket, id, code, deadline).await;
+            }
             let _ = failure_events
                 .send(IngressEvent::Rejected {
                     id,
                     route_id: String::new(),
-                    code: adapter_error_code(&error),
+                    code,
                 })
                 .await;
             return;
         }
     };
     if Instant::now() >= deadline {
+        if adapter.kind == AdapterKind::Http {
+            send_http_error(&mut socket, id, "peer.setup_timeout", deadline).await;
+        }
         let _ = failure_events
             .send(IngressEvent::Rejected {
                 id,
@@ -359,21 +374,19 @@ async fn run_adapter_connection(
         (kind == IngressKind::HttpHost).then_some(max_http_header_bytes),
         http_state,
         prefix,
+        parse_timeout,
     )
     .await;
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn parse_adapter_preface(
-    adapter: AdapterListenerConfig,
+    adapter: &AdapterListenerConfig,
     router: DomainRouter,
-    mut socket: TcpStream,
+    socket: &mut TcpStream,
     max_http_header_bytes: usize,
     max_tls_client_hello_bytes: usize,
-    permit: tokio::sync::OwnedSemaphorePermit,
 ) -> io::Result<(
-    TcpStream,
-    tokio::sync::OwnedSemaphorePermit,
     String,
     IngressKind,
     Option<(p2x_proxy::http::HttpRequestGate, Vec<u8>)>,
@@ -431,8 +444,6 @@ async fn parse_adapter_preface(
                 prefix = tls.take().expect("TLS inspector").into_prefix();
             }
             return Ok((
-                socket,
-                permit,
                 target.route_id.clone(),
                 kind,
                 http_gate.take().map(|gate| (gate, http_ready)),
@@ -469,6 +480,67 @@ fn adapter_error_code(error: &io::Error) -> &'static str {
     }
 }
 
+fn http_status(code: &str) -> u16 {
+    if code == "route.not_found" {
+        404
+    } else if code == "limit.ingress_preface" {
+        431
+    } else if code == "route.parse_timeout" {
+        408
+    } else if code == "peer.setup_timeout" {
+        504
+    } else if code.starts_with("auth.") {
+        403
+    } else if code.starts_with("upstream.") || code.starts_with("protocol.") {
+        502
+    } else if code.starts_with("registry.")
+        || code.starts_with("exchange.")
+        || code.starts_with("relay.")
+        || code.starts_with("limit.")
+        || code == "peer.connection_failed"
+        || code == "peer.draining"
+    {
+        503
+    } else {
+        400
+    }
+}
+
+async fn send_http_error(
+    socket: &mut TcpStream,
+    id: IngressId,
+    code: &'static str,
+    deadline: Instant,
+) {
+    let body = format!("{code}\ntrace={:016x}\n", id.0);
+    let status = http_status(code);
+    let reason = match status {
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        431 => "Request Header Fields Too Large",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "Bad Request",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        let _ = socket.try_write(response.as_bytes());
+        return;
+    }
+    let _ = tokio::time::timeout(remaining.min(Duration::from_millis(100)), async {
+        socket.write_all(response.as_bytes()).await?;
+        socket.shutdown().await
+    })
+    .await;
+}
+
 async fn send_pre_accept(
     events: &mpsc::Sender<IngressEvent>,
     id: IngressId,
@@ -500,6 +572,7 @@ async fn run_connection(
     http_limit: Option<usize>,
     http_state: Option<(p2x_proxy::http::HttpRequestGate, Vec<u8>)>,
     initial_prefix: Vec<u8>,
+    http_parse_timeout: Duration,
 ) {
     let mut prebuffer = vec![0; copy_buffer_bytes.max(initial_prefix.len())];
     prebuffer[..initial_prefix.len()].copy_from_slice(&initial_prefix);
@@ -520,40 +593,55 @@ async fn run_connection(
             command = commands.recv() => match command {
                 Some(IngressCommand::StartTunnel { stream }) => {
                     prebuffer.truncate(filled);
-                    let result = match (initial_kind, http_limit, http_state) {
+                    let (result, code) = match (initial_kind, http_limit, http_state) {
                         (IngressKind::HttpHost, Some(_limit), Some((gate, ready))) => {
                             let local = PrefixedIo::new(prebuffer, socket.compat());
-                            let guarded = HttpGuardedIo::with_state(
-                                local, gate, ready, copy_buffer_bytes,
+                            let guarded = HttpGuardedIo::with_state_and_timeout(
+                                local,
+                                gate,
+                                ready,
+                                copy_buffer_bytes,
+                                http_parse_timeout,
                             );
-                            p2x_proxy::pump_no_idle(
+                            let status = guarded.status();
+                            let result = p2x_proxy::pump_no_idle(
                                 guarded,
                                 stream,
                                 copy_buffer_bytes,
                                 cancel.cancelled(),
                             )
-                            .await
+                            .await;
+                            let code = status.error().as_ref().map(http_guard_error_code);
+                            (result, code)
                         }
                         _ => {
                             let local = PrefixedIo::new(prebuffer, socket.compat());
-                            p2x_proxy::pump_no_idle(
+                            let result = p2x_proxy::pump_no_idle(
                                 local,
                                 stream,
                                 copy_buffer_bytes,
                                 cancel.cancelled(),
                             )
-                            .await
+                            .await;
+                            (result, None)
                         }
                     };
                     let _ = events
                         .send(IngressEvent::TunnelFinished {
                             id,
                             result: result.map_err(PumpFailure::Setup),
+                            code,
                         })
                         .await;
                     return;
                 }
-                Some(IngressCommand::Reject) | None => return,
+                Some(IngressCommand::Reject(code)) => {
+                    if initial_kind == IngressKind::HttpHost {
+                        send_http_error(&mut socket, id, code, deadline_at).await;
+                    }
+                    return;
+                }
+                None => return,
             },
             read = socket.read(&mut prebuffer[filled..]), if filled < prebuffer.len() => match read {
                 Ok(0) => {
@@ -570,11 +658,61 @@ async fn run_connection(
     }
 }
 
+fn http_guard_error_code(error: &p2x_proxy::http::HttpError) -> &'static str {
+    match error {
+        p2x_proxy::http::HttpError::Limit => "limit.ingress_preface",
+        p2x_proxy::http::HttpError::MissingHost => "route.host_required",
+        p2x_proxy::http::HttpError::AuthorityMismatch => "route.mismatch",
+        p2x_proxy::http::HttpError::Unsupported => "route.unsupported_protocol",
+        p2x_proxy::http::HttpError::Timeout => "route.parse_timeout",
+        p2x_proxy::http::HttpError::Malformed | p2x_proxy::http::HttpError::InvalidFraming => {
+            "route.malformed"
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn local_http_error_is_bounded_correlated_and_does_not_reflect_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address);
+        let (client, accepted) = tokio::join!(client, listener.accept());
+        let mut client = client.unwrap();
+        let (mut socket, _) = accepted.unwrap();
+        send_http_error(
+            &mut socket,
+            IngressId(0x2a),
+            "route.not_found",
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        drop(socket);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(response.contains("route.not_found\ntrace=000000000000002a\n"));
+        assert!(!response.contains("Host:"));
+        assert!(response.len() < 512);
+    }
+
+    #[test]
+    fn setup_error_statuses_are_stable() {
+        assert_eq!(http_status("route.malformed"), 400);
+        assert_eq!(http_status("auth.ticket_invalid"), 403);
+        assert_eq!(http_status("route.not_found"), 404);
+        assert_eq!(http_status("route.parse_timeout"), 408);
+        assert_eq!(http_status("limit.ingress_preface"), 431);
+        assert_eq!(http_status("upstream.connect_failed"), 502);
+        assert_eq!(http_status("registry.unavailable"), 503);
+        assert_eq!(http_status("peer.setup_timeout"), 504);
+    }
 
     #[tokio::test]
     async fn adapter_selects_exact_route_before_accepting() {
@@ -700,6 +838,7 @@ mod tests {
             None,
             None,
             Vec::new(),
+            Duration::from_secs(1),
         ));
         let (mut remote_peer, remote) = tokio::io::duplex(64);
         command

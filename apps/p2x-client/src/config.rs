@@ -185,14 +185,13 @@ impl ClientConfig {
             || !(1..=MAX_STREAMS_PER_SERVER).contains(&limits.max_streams_per_server)
             || !(MIN_COPY_BUFFER_BYTES..=MAX_COPY_BUFFER_BYTES).contains(&limits.copy_buffer_bytes)
             || !(100..=5_000).contains(&limits.ingress_parse_timeout_ms)
-            || !(1..=64 * 1024).contains(&limits.max_http_header_bytes)
+            || !(1_024..=64 * 1024).contains(&limits.max_http_header_bytes)
             || !(4 * 1024..=256 * 1024).contains(&limits.max_tls_client_hello_bytes)
             || limits
                 .copy_buffer_bytes
-                .checked_mul(limits.max_ingress_connections)
-                .and_then(|value| value.checked_mul(3))
-                .and_then(|value| {
-                    value.checked_add(
+                .checked_mul(3)
+                .and_then(|buffers| {
+                    buffers.checked_add(
                         limits.max_tls_client_hello_bytes.max(
                             limits
                                 .max_http_header_bytes
@@ -201,6 +200,7 @@ impl ClientConfig {
                         ),
                     )
                 })
+                .and_then(|per_ingress| per_ingress.checked_mul(limits.max_ingress_connections))
                 .is_none()
         {
             return Err(RouteConfigError::Invalid("invalid client limits".into()));

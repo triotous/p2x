@@ -1,5 +1,5 @@
 use crate::domain::{CanonicalDomain, DomainError};
-use std::fmt;
+use std::{collections::BTreeSet, fmt, ops::Range};
 
 pub const MIN_CLIENT_HELLO_BYTES: usize = 4 * 1024;
 pub const MAX_CLIENT_HELLO_BYTES: usize = 256 * 1024;
@@ -36,6 +36,10 @@ impl std::error::Error for TlsError {}
 pub struct ClientHelloInspector {
     max_bytes: usize,
     bytes: Vec<u8>,
+    record_offset: usize,
+    spans: Vec<RecordSpan>,
+    handshake_len: usize,
+    selected: Option<CanonicalDomain>,
 }
 impl ClientHelloInspector {
     pub fn new(max_bytes: usize) -> Result<Self, TlsError> {
@@ -45,6 +49,10 @@ impl ClientHelloInspector {
         Ok(Self {
             max_bytes,
             bytes: Vec::with_capacity(max_bytes.min(16 * 1024)),
+            record_offset: 0,
+            spans: Vec::new(),
+            handshake_len: 0,
+            selected: None,
         })
     }
     pub fn into_prefix(self) -> Vec<u8> {
@@ -65,56 +73,75 @@ impl ClientHelloInspector {
         self.inspect()
     }
 
-    fn inspect(&self) -> Result<ClientHelloResult, TlsError> {
-        let mut offset = 0;
-        let mut handshake = Vec::new();
-        let handshake_limit = self.max_bytes;
-        while offset < self.bytes.len() {
-            if self.bytes.len() - offset < 5 {
+    fn inspect(&mut self) -> Result<ClientHelloResult, TlsError> {
+        if let Some(domain) = &self.selected {
+            return Ok(ClientHelloResult::Selected {
+                domain: domain.clone(),
+                prefix_len: self.record_offset,
+            });
+        }
+        while self.record_offset < self.bytes.len() {
+            if self.bytes.len() - self.record_offset < 5 {
                 return Ok(ClientHelloResult::NeedMore);
             }
-            let content_type = self.bytes[offset];
-            let version = u16::from_be_bytes([self.bytes[offset + 1], self.bytes[offset + 2]]);
-            let length =
-                u16::from_be_bytes([self.bytes[offset + 3], self.bytes[offset + 4]]) as usize;
+            let content_type = self.bytes[self.record_offset];
+            let version = u16::from_be_bytes([
+                self.bytes[self.record_offset + 1],
+                self.bytes[self.record_offset + 2],
+            ]);
+            let length = u16::from_be_bytes([
+                self.bytes[self.record_offset + 3],
+                self.bytes[self.record_offset + 4],
+            ]) as usize;
             if !(0x0301..=0x0303).contains(&version) {
                 return Err(TlsError::Unsupported);
             }
             if content_type != 22 || length == 0 || length > 16_384 {
                 return Err(TlsError::Malformed);
             }
-            let end = offset
+            let end = self
+                .record_offset
                 .checked_add(5)
                 .and_then(|value| value.checked_add(length))
                 .ok_or(TlsError::Limit)?;
             if end > self.bytes.len() {
                 return Ok(ClientHelloResult::NeedMore);
             }
-            if handshake
-                .len()
+            if self
+                .handshake_len
                 .checked_add(length)
-                .filter(|size| *size <= handshake_limit)
+                .filter(|size| *size <= self.max_bytes)
                 .is_none()
             {
                 return Err(TlsError::Limit);
             }
-            handshake.extend_from_slice(&self.bytes[offset + 5..end]);
-            offset = end;
-            if handshake.len() >= 4 {
-                let message_type = handshake[0];
-                let declared = u24(&handshake[1..4])?;
+            self.spans.push(RecordSpan {
+                logical_start: self.handshake_len,
+                wire: self.record_offset + 5..end,
+            });
+            self.handshake_len += length;
+            self.record_offset = end;
+            if self.handshake_len >= 4 {
+                let view = PayloadView {
+                    wire: &self.bytes,
+                    spans: &self.spans,
+                };
+                let mut header = Cursor::new(view, 0, self.handshake_len)?;
+                let message_type = header.u8()?;
+                let declared = header.u24()?;
                 if message_type != 1 {
                     return Err(TlsError::Malformed);
                 }
                 let message_end = 4usize.checked_add(declared).ok_or(TlsError::Limit)?;
-                if message_end > handshake_limit {
+                if message_end > self.max_bytes {
                     return Err(TlsError::Limit);
                 }
-                if handshake.len() >= message_end {
-                    let domain = parse_client_hello(&handshake[4..message_end])?;
+                if self.handshake_len >= message_end {
+                    let domain = parse_client_hello(Cursor::new(view, 4, message_end)?)?;
+                    self.selected = Some(domain.clone());
                     return Ok(ClientHelloResult::Selected {
                         domain,
-                        prefix_len: offset,
+                        prefix_len: self.record_offset,
                     });
                 }
             }
@@ -123,88 +150,145 @@ impl ClientHelloInspector {
     }
 }
 
-fn u24(value: &[u8]) -> Result<usize, TlsError> {
-    if value.len() != 3 {
-        return Err(TlsError::Malformed);
+#[derive(Clone, Debug)]
+struct RecordSpan {
+    logical_start: usize,
+    wire: Range<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct PayloadView<'a> {
+    wire: &'a [u8],
+    spans: &'a [RecordSpan],
+}
+impl PayloadView<'_> {
+    fn byte(self, logical: usize) -> Result<u8, TlsError> {
+        let index = self
+            .spans
+            .partition_point(|span| span.logical_start <= logical);
+        let span = index
+            .checked_sub(1)
+            .and_then(|index| self.spans.get(index))
+            .ok_or(TlsError::Malformed)?;
+        let offset = logical
+            .checked_sub(span.logical_start)
+            .and_then(|offset| span.wire.start.checked_add(offset))
+            .filter(|offset| *offset < span.wire.end)
+            .ok_or(TlsError::Malformed)?;
+        self.wire.get(offset).copied().ok_or(TlsError::Malformed)
     }
-    Ok(((value[0] as usize) << 16) | ((value[1] as usize) << 8) | value[2] as usize)
 }
-fn take<'a>(bytes: &'a [u8], offset: &mut usize, length: usize) -> Result<&'a [u8], TlsError> {
-    let end = offset.checked_add(length).ok_or(TlsError::Malformed)?;
-    let value = bytes.get(*offset..end).ok_or(TlsError::Malformed)?;
-    *offset = end;
-    Ok(value)
+
+#[derive(Clone, Copy)]
+struct Cursor<'a> {
+    view: PayloadView<'a>,
+    position: usize,
+    end: usize,
 }
-fn vector<'a>(bytes: &'a [u8], offset: &mut usize, width: usize) -> Result<&'a [u8], TlsError> {
-    let length = match width {
-        1 => *take(bytes, offset, 1)?.first().ok_or(TlsError::Malformed)? as usize,
-        2 => u16::from_be_bytes(
-            take(bytes, offset, 2)?
-                .try_into()
-                .map_err(|_| TlsError::Malformed)?,
-        ) as usize,
-        _ => return Err(TlsError::Malformed),
-    };
-    take(bytes, offset, length)
+impl<'a> Cursor<'a> {
+    fn new(view: PayloadView<'a>, position: usize, end: usize) -> Result<Self, TlsError> {
+        if position > end {
+            return Err(TlsError::Malformed);
+        }
+        Ok(Self {
+            view,
+            position,
+            end,
+        })
+    }
+    fn remaining(self) -> usize {
+        self.end - self.position
+    }
+    fn take(&mut self, length: usize) -> Result<Self, TlsError> {
+        let end = self
+            .position
+            .checked_add(length)
+            .ok_or(TlsError::Malformed)?;
+        if end > self.end {
+            return Err(TlsError::Malformed);
+        }
+        let value = Self::new(self.view, self.position, end)?;
+        self.position = end;
+        Ok(value)
+    }
+    fn u8(&mut self) -> Result<u8, TlsError> {
+        if self.position >= self.end {
+            return Err(TlsError::Malformed);
+        }
+        let value = self.view.byte(self.position)?;
+        self.position += 1;
+        Ok(value)
+    }
+    fn u16(&mut self) -> Result<u16, TlsError> {
+        Ok(u16::from_be_bytes([self.u8()?, self.u8()?]))
+    }
+    fn u24(&mut self) -> Result<usize, TlsError> {
+        Ok(((self.u8()? as usize) << 16) | ((self.u8()? as usize) << 8) | self.u8()? as usize)
+    }
+    fn vector(&mut self, width: usize) -> Result<Self, TlsError> {
+        let length = match width {
+            1 => self.u8()? as usize,
+            2 => self.u16()? as usize,
+            _ => return Err(TlsError::Malformed),
+        };
+        self.take(length)
+    }
+    fn bytes(mut self) -> Result<Vec<u8>, TlsError> {
+        let mut value = Vec::with_capacity(self.remaining());
+        while self.remaining() != 0 {
+            value.push(self.u8()?);
+        }
+        Ok(value)
+    }
 }
-fn parse_client_hello(bytes: &[u8]) -> Result<CanonicalDomain, TlsError> {
-    let mut offset = 0;
-    let version = u16::from_be_bytes(
-        take(bytes, &mut offset, 2)?
-            .try_into()
-            .map_err(|_| TlsError::Malformed)?,
-    );
+
+fn parse_client_hello(mut bytes: Cursor<'_>) -> Result<CanonicalDomain, TlsError> {
+    let version = bytes.u16()?;
     if !(0x0301..=0x0303).contains(&version) {
         return Err(TlsError::Unsupported);
     }
-    take(bytes, &mut offset, 32)?;
-    let session = vector(bytes, &mut offset, 1)?;
-    if session.len() > 32 {
+    bytes.take(32)?;
+    let session = bytes.vector(1)?;
+    if session.remaining() > 32 {
         return Err(TlsError::Malformed);
     }
-    let suites = vector(bytes, &mut offset, 2)?;
-    if suites.is_empty() || suites.len() % 2 != 0 {
+    let suites = bytes.vector(2)?;
+    if suites.remaining() == 0 || suites.remaining() % 2 != 0 {
         return Err(TlsError::Malformed);
     }
-    let compression = vector(bytes, &mut offset, 1)?;
-    if compression.is_empty() {
+    let compression = bytes.vector(1)?;
+    if compression.remaining() == 0 {
         return Err(TlsError::Malformed);
     }
-    let extensions = vector(bytes, &mut offset, 2)?;
-    if offset != bytes.len() {
+    let mut extensions = bytes.vector(2)?;
+    if bytes.remaining() != 0 {
         return Err(TlsError::Malformed);
     }
-    let mut extension_offset = 0;
-    let mut seen = Vec::new();
+    let mut seen = BTreeSet::new();
     let mut sni = None;
-    while extension_offset < extensions.len() {
-        let kind = u16::from_be_bytes(
-            take(extensions, &mut extension_offset, 2)?
-                .try_into()
-                .map_err(|_| TlsError::Malformed)?,
-        );
-        let value = vector(extensions, &mut extension_offset, 2)?;
-        if seen.contains(&kind) {
+    while extensions.remaining() != 0 {
+        let kind = extensions.u16()?;
+        let mut value = extensions.vector(2)?;
+        if !seen.insert(kind) {
             return Err(TlsError::Malformed);
         }
-        seen.push(kind);
         if kind == 0 {
             if sni.is_some() {
                 return Err(TlsError::Malformed);
             }
-            let names = vector(value, &mut 0, 2)?;
-            let mut name_offset = 0;
+            let mut names = value.vector(2)?;
+            if value.remaining() != 0 {
+                return Err(TlsError::Malformed);
+            }
             let mut found = None;
-            while name_offset < names.len() {
-                let name_type = *take(names, &mut name_offset, 1)?
-                    .first()
-                    .ok_or(TlsError::Malformed)?;
-                let name = vector(names, &mut name_offset, 2)?;
+            while names.remaining() != 0 {
+                let name_type = names.u8()?;
+                let name = names.vector(2)?;
                 if name_type == 0 {
-                    if found.is_some() || name.is_empty() {
+                    if found.is_some() || name.remaining() == 0 || name.remaining() > 253 {
                         return Err(TlsError::Malformed);
                     }
-                    found = Some(name);
+                    found = Some(name.bytes()?);
                 }
             }
             sni = found;
@@ -214,7 +298,7 @@ fn parse_client_hello(bytes: &[u8]) -> Result<CanonicalDomain, TlsError> {
     if !name.is_ascii() {
         return Err(TlsError::InvalidSni);
     }
-    CanonicalDomain::from_sni(std::str::from_utf8(name).map_err(|_| TlsError::InvalidSni)?)
+    CanonicalDomain::from_sni(std::str::from_utf8(&name).map_err(|_| TlsError::InvalidSni)?)
         .map_err(map_domain)
 }
 fn map_domain(error: DomainError) -> TlsError {
@@ -252,6 +336,16 @@ mod tests {
         record.extend(handshake);
         record
     }
+    fn fragment_records(input: &[u8], chunk: usize) -> Vec<u8> {
+        let payload = &input[5..];
+        let mut records = Vec::new();
+        for part in payload.chunks(chunk) {
+            records.extend([22, 3, 3]);
+            records.extend((part.len() as u16).to_be_bytes());
+            records.extend(part);
+        }
+        records
+    }
     #[test]
     fn selects_only_after_complete_structural_hello() {
         let input = hello(b"Example.com");
@@ -284,5 +378,45 @@ mod tests {
             inspector.feed(&hello(b"bad name")),
             Err(TlsError::InvalidSni)
         );
+    }
+
+    #[test]
+    fn fragmented_records_are_processed_once_and_preserved() {
+        let input = fragment_records(&hello(b"example.com"), 3);
+        let mut inspector = ClientHelloInspector::new(4096).unwrap();
+        for split in input.chunks(2) {
+            let result = inspector.feed(split).unwrap();
+            if matches!(result, ClientHelloResult::Selected { .. }) {
+                break;
+            }
+        }
+        assert_eq!(inspector.into_prefix(), input);
+    }
+
+    #[test]
+    fn sni_extension_rejects_trailing_nested_bytes() {
+        let mut input = hello(b"example.com");
+        let record_length = u16::from_be_bytes([input[3], input[4]]) as usize;
+        input.extend_from_slice(&[]);
+        let sni_extension_length_at = 54;
+        input[sni_extension_length_at + 1] += 1;
+        let sni_list_length_at = sni_extension_length_at + 2;
+        input[sni_list_length_at + 1] += 1;
+        input.push(0);
+        let new_record_length = record_length + 1;
+        input[3..5].copy_from_slice(&(new_record_length as u16).to_be_bytes());
+        let body_length =
+            ((input[6] as usize) << 16) | ((input[7] as usize) << 8) | input[8] as usize;
+        let new_body_length = body_length + 1;
+        input[6] = (new_body_length >> 16) as u8;
+        input[7] = (new_body_length >> 8) as u8;
+        input[8] = new_body_length as u8;
+        let extensions_length_at = 50;
+        let extensions_length =
+            u16::from_be_bytes([input[extensions_length_at], input[extensions_length_at + 1]]) + 1;
+        input[extensions_length_at..extensions_length_at + 2]
+            .copy_from_slice(&extensions_length.to_be_bytes());
+        let mut inspector = ClientHelloInspector::new(4096).unwrap();
+        assert_eq!(inspector.feed(&input), Err(TlsError::Malformed));
     }
 }

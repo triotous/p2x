@@ -74,9 +74,6 @@ impl CanonicalDomain {
                 DomainError::TooLong
             });
         }
-        if IpAddr::from_str(input).is_ok() {
-            return Err(DomainError::IpLiteral);
-        }
         let input = if trailing_dot && input.ends_with('.') {
             if input.ends_with("..") {
                 return Err(DomainError::Invalid);
@@ -85,14 +82,14 @@ impl CanonicalDomain {
         } else {
             input
         };
-        let ascii = if unicode {
-            idna::domain_to_ascii_strict(input).map_err(|_| DomainError::Invalid)?
-        } else if input.is_ascii() {
-            input.to_owned()
-        } else {
+        if !unicode && !input.is_ascii() {
             return Err(DomainError::Invalid);
-        };
+        }
+        let ascii = idna::domain_to_ascii_strict(input).map_err(|_| DomainError::Invalid)?;
         let ascii = ascii.to_ascii_lowercase();
+        if IpAddr::from_str(&ascii).is_ok() {
+            return Err(DomainError::IpLiteral);
+        }
         if ascii.is_empty() || ascii.len() > MAX_DOMAIN_BYTES {
             return Err(if ascii.is_empty() {
                 DomainError::Empty
@@ -163,6 +160,8 @@ mod tests {
                 "{value}"
             );
         }
+        assert!(CanonicalDomain::from_config("127.0.0.1.").is_err());
+        assert!(CanonicalDomain::from_sni("xn--").is_err());
         assert!(CanonicalDomain::from_sni("example.com.").is_err());
     }
 }
