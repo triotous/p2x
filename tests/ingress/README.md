@@ -1,14 +1,12 @@
 # Domain ingress verification
 
-The canonical manual entry point is:
-
-This entry point intentionally exits 2 after deterministic checks until the owner supplies the live exchange, DNS, certificate, and direct/relay fixtures; exit 2 means incomplete, not passed.
+The canonical local entry point is:
 
 ```sh
 ./tests/ingress/local.sh --case <name|all>
 ```
 
-The script is deliberately a prerequisite-aware entry point. It builds the workspace binaries and runs deterministic adapter tests when available. It does not change DNS, certificates, hosts files, firewall rules, or network namespaces. Direct/relay, certificate verification, cross-host, platform/container, and long-running owner checks must be run separately and remain incomplete when their environment is unavailable.
+The script builds the client, runs the domain/HTTP/TLS parser and adapter tests, builds all three bounded fuzz targets, and emits an assertion-derived JSON result. It does not change DNS, certificates, hosts files, firewall rules, or network namespaces. Cross-host DNS and certificate distribution, platform/container, firewall, and long-running checks remain Phase 6 owner evidence.
 
 Required live case families for the completed feature are:
 

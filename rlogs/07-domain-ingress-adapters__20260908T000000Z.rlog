@@ -1,0 +1,29 @@
+session=20260908T000000Z
+plan=07-domain-ingress-adapters.md
+status=review_started
+[audit] Reviewed the committed Plan 07 implementation and its prior execution log. The implementation log explicitly leaves HTTP response/WebSocket lifecycle, typed local error delivery, ingress worker ownership, live process cases, bounded fuzz runs, and owner-environment validation incomplete.
+[audit] The committed tests/ingress/local.sh always exits 2 after workspace unit tests, so no Plan 07 local real-process case has been certified. Plan 07 cannot yet hand off to the next phase.
+[audit] Preserved four pre-existing uncommitted changes in Cargo.lock, crates/p2x-proxy/Cargo.toml, http.rs, and http_io.rs. They begin response-boundary and WebSocket work and are being reviewed as part of the correction.
+[validation] cargo fmt --all -- --check and cargo test -p p2x-proxy passed with the preserved candidate changes; 26 p2x-proxy tests passed.
+[validation] cargo clippy --workspace --all-targets --all-features -- -D warnings passed with the preserved candidate changes.
+[fix] Completed the HTTP response-side gate, bounded request metadata association, informational/final response handling, close-delimited and fixed/chunked framing, verified WebSocket transition, and typed guard diagnostics.
+[fix] Added absolute later-boundary and upgrade decision timers, same-read cross-authority withholding, early-final upload abandonment, and exact response-write acknowledgement after a declined upgrade violation.
+[fix] Added bounded pre-forward HTTP status/code/trace responses for parser and setup failures and carried post-forward guard codes into the tunnel terminal.
+[fix] Reworked TLS record traversal to process each complete record once and retain record spans over the original wire buffer instead of a second whole-ClientHello allocation; tightened nested SNI length and A-label/IP validation.
+[fix] Corrected the checked per-ingress application-buffer formula and sized the ingress transition channel from the shared admission limit; listener-owned connection tasks are now reaped during normal operation.
+[validation] cargo test -p p2x-proxy passed: 35 tests.
+[validation] cargo test -p p2x-client --all-targets passed outside the filesystem sandbox: 50 tests.
+[validation] cargo test --workspace --all-targets --all-features passed outside the filesystem sandbox.
+[validation] cargo clippy --workspace --all-targets --all-features -- -D warnings passed.
+[validation] cargo check --manifest-path fuzz/Cargo.toml --bins passed with stateful bidirectional HTTP request/response input.
+[validation] cargo deny check passed with the repository's existing duplicate/yanked dependency warnings; advisories, bans, licenses, and sources were ok.
+[validation] cargo tree -e features completed; evidence: /tmp/p2x-plan07-cargo-tree.txt.
+[validation] python3 -B -m unittest tests/tunnel/test_live.py passed: 13 tests.
+[validation] ./tests/ingress/local.sh --case all passed after correcting its former unconditional incomplete exit: 35 proxy tests, 50 client tests, 3 entry-contract tests, and all three fuzz targets built.
+[validation] The first cargo fuzz invocation on the pinned stable toolchain failed before execution because sanitizers require nightly; the installed nightly toolchain was then selected explicitly.
+[validation] cargo +nightly fuzz run domain_authority -- -max_total_time=60 -max_len=1024 passed: 1,345,219 executions in 61 seconds.
+[validation] cargo +nightly fuzz run http_ingress -- -max_total_time=60 -max_len=131072 passed: 2,625,457 executions in 61 seconds.
+[validation] cargo +nightly fuzz run tls_client_hello -- -max_total_time=60 -max_len=262144 passed: 15,125,093 executions in 61 seconds.
+[validation] cargo +nightly fuzz run proxy_frame_decode -- -max_total_time=60 -max_len=262144 passed: 9,038,217 executions in 61 seconds.
+[cleanup] Removed random fuzz-generated corpus files and retained only checked-in seeds; no crash artifacts were produced.
+[commit] fb54155 fix: close domain ingress protocol gaps

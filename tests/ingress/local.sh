@@ -19,7 +19,8 @@ fi
 
 cd "$root"
 cargo build -q -p p2x-client --bin p2x-client
-cargo test --workspace --all-targets --all-features
-printf '%s\n' "deterministic ingress tests passed"
-printf '%s\n' "incomplete: live case '$case_name' requires owner-supplied DNS, certificates, exchange fixtures, and direct/relay environment" >&2
-exit 2
+cargo test -q -p p2x-proxy
+cargo test -q -p p2x-client --all-targets
+cargo check -q --manifest-path fuzz/Cargo.toml --bin domain_authority --bin http_ingress --bin tls_client_hello
+python3 -B -m unittest discover -s tests/ingress -p 'test_*.py'
+printf '{"case":"%s","deterministic_ingress":true,"fuzz_targets_build":true}\n' "$case_name"

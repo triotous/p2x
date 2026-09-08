@@ -29,7 +29,9 @@ Listener binds must be unique loopback IP-literal addresses with nonzero ports. 
 
 ## HTTP behavior
 
-The adapter accepts a bounded HTTP/1.1 subset: origin-form requests and `OPTIONS *`, one valid Host field, strict framing, fixed-length or chunked bodies, persistent same-authority requests, and bounded trailers. CONNECT, absolute-form URLs, HTTP/1.0, ambiguous framing, unsupported upgrades, malformed requests, and changed authority are rejected or closed. Application bytes are forwarded unchanged after the first request selects an exact route. The current runtime gate validates request framing and authority; response-boundary/WebSocket lifecycle handling remains a follow-up implementation item.
+The adapter accepts a bounded HTTP/1.1 subset: origin-form requests and `OPTIONS *`, one valid Host field, strict framing, fixed-length or chunked bodies, persistent same-authority requests, and bounded trailers. CONNECT, absolute-form URLs, HTTP/1.0, ambiguous framing, unsupported upgrades, malformed requests, and changed authority are rejected or closed. Application bytes are forwarded unchanged after the first request selects an exact route.
+
+Response framing is tracked alongside a bounded queue of request metadata. Informational and final responses, HEAD/204/304, fixed and chunked bodies, close-delimited responses, and `Connection: close` preserve request boundaries. A valid WebSocket request holds early data until its associated `101` response is complete; a declined upgrade returns to HTTP validation. Partial later heads, chunk lines, and trailers use one absolute parse timeout, and a five-second upgrade decision timeout prevents a held transition from remaining active indefinitely.
 
 ## TLS behavior
 
@@ -49,4 +51,4 @@ The URL/bind port is explicit for HTTP and HTTPS. Do not add public DNS, certifi
 
 A permit is acquired before adapter parsing. Parsing uses the absolute accept setup deadline and the configured parse timeout; a valid route is handed to the existing owner, ticket, path, and tunnel lifecycle with `HttpHost` or `TlsSni` preserved. Unknown, malformed, oversized, and timed-out prefices are rejected before resolution or upstream setup. Raw domains, SNI, request lines, headers, payloads, tickets, credentials, and upstream addresses must not be written to lifecycle output.
 
-The single planned live entry point is `./tests/ingress/local.sh --case <name|all>`. Local parser and adapter unit tests do not certify real DNS, certificate, direct/relay, cross-host, platform, container, or long-running owner validation; those checks remain incomplete until run by the environment owner.
+The verification entry point is `./tests/ingress/local.sh --case <name|all>`. Cross-host DNS, certificate distribution, platform/container, firewall, and long-running network validation remain owner-executed Phase 6 evidence; the test runner never modifies DNS, certificate stores, hosts files, or firewall rules.
