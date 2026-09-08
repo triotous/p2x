@@ -1967,6 +1967,7 @@ dependencies = [
  "libp2p",
  "p2x-net",
  "p2x-protocol",
+ "p2x-proxy",
 ]
 
 [[package]]
@@ -1998,6 +1999,16 @@ dependencies = [
  "subtle",
  "thiserror 2.0.20",
  "zeroize",
+]
+
+[[package]]
+name = "p2x-proxy"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "httparse",
+ "idna",
+ "tokio",
 ]
 
 [[package]]

@@ -15,6 +15,7 @@ p2x-protocol = { path = "../crates/p2x-protocol" }
 p2x-net = { path = "../crates/p2x-net" }
 futures = "0.3"
 libp2p = { version = "=0.56.0", default-features = false, features = ["request-response"] }
+p2x-proxy = { path = "../crates/p2x-proxy" }
 
 [[bin]]
 name = "auth_frame_decode"
@@ -61,6 +62,27 @@ bench = false
 [[bin]]
 name = "proxy_frame_decode"
 path = "fuzz_targets/proxy_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "domain_authority"
+path = "fuzz_targets/domain_authority.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_ingress"
+path = "fuzz_targets/http_ingress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_client_hello"
+path = "fuzz_targets/tls_client_hello.rs"
 test = false
 doc = false
 bench = false
