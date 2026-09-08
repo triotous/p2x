@@ -47,8 +47,8 @@ impl ClientHelloInspector {
             bytes: Vec::with_capacity(max_bytes.min(16 * 1024)),
         })
     }
-    pub fn prefix(&self) -> &[u8] {
-        &self.bytes
+    pub fn into_prefix(self) -> Vec<u8> {
+        self.bytes
     }
 
     pub fn feed(&mut self, input: &[u8]) -> Result<ClientHelloResult, TlsError> {

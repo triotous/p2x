@@ -9,3 +9,12 @@ phase A status: ready to commit
 phase B result: explicit IngressKind carried by ingress setup and RouteOpen, make_open/retry paths preserve kind, server validates kind against service protocol before ticket consumption
 validation: cargo fmt --all; cargo clippy -p p2x-client -p p2x-server --all-targets --all-features -- -D warnings; cargo test -p p2x-client -p p2x-server --all-targets — all passed
 phase B status: ready to commit
+phase C result: bounded HTTP request/response gates and the guarded futures I/O wrapper were implemented and tested
+phase C validation: cargo fmt --all; cargo clippy -p p2x-client -p p2x-proxy --all-targets --all-features -- -D warnings; cargo test -p p2x-client -p p2x-proxy --all-targets — all passed
+phase C status: committed as  f6044a and 31932bc
+phase D result: bounded ClientHello/SNI inspector implemented with structural validation and split-input tests
+phase D validation: cargo fmt --all; cargo clippy -p p2x-client -p2x-proxy --all-targets --all-features -- -D warnings; cargo test -p p2x-client -p p2x-proxy --all-targets — all passed
+phase D status: committed as f4c2471
+runtime integration result: adapter listeners now share the ingress permit, parse bounded HTTP/TLS prefaces, perform listener-scoped exact lookup before Accepted, preserve prefixes, and pass explicit kind into the existing owner/pump path; adapter-only route files start ingress
+runtime integration validation: cargo fmt --all; cargo test -p p2x-client -p p2x-proxy --all-targets; cargo clippy -p p2x-client -p p2x-proxy --all-targets --all-features -- -D warnings; cargo test --workspace --all-targets --all-features; git diff --check — all passed
+runtime integration caveat: full HTTP response-boundary/WebSocket lifecycle, typed local error responses, worker JoinSet ownership, fuzzing, live matrix, and environment validation remain incomplete

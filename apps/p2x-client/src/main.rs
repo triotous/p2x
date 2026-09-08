@@ -742,7 +742,7 @@ async fn main() -> io::Result<()> {
         .map_err(io::Error::other)?;
     let product_ingress = routes
         .as_ref()
-        .is_some_and(|config| !config.raw_tcp.is_empty());
+        .is_some_and(|config| !config.raw_tcp.is_empty() || !config.adapter_listeners.is_empty());
     let route_test_hook_used = args.test_proxy_open_count.is_some()
         || args.test_proxy_concurrency.is_some()
         || args.test_delay_after_resolve_ms.is_some()
@@ -853,12 +853,17 @@ async fn main() -> io::Result<()> {
     let (ingress_tx, mut ingress_rx) = mpsc::channel::<IngressEvent>(128);
     let mut ingress_tasks = if product_ingress {
         let route_config = routes.as_ref().expect("raw ingress has route config");
-        let listeners = ingress::bind_all(&route_config.raw_tcp).await?;
+        let listeners =
+            ingress::bind_all(&route_config.raw_tcp, &route_config.adapter_listeners).await?;
         ingress::spawn_all(
             listeners,
             route_config.limits.max_ingress_connections,
             route_config.limits.copy_buffer_bytes,
             std::time::Duration::from_millis(route_config.network.connection_setup_timeout_ms),
+            std::time::Duration::from_millis(route_config.limits.ingress_parse_timeout_ms),
+            route_config.limits.max_http_header_bytes,
+            route_config.limits.max_tls_client_hello_bytes,
+            route_config.domain_router.clone(),
             ingress_tx.clone(),
             shutdown.clone(),
         )

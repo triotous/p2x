@@ -23,6 +23,16 @@ impl<T> HttpGuardedIo<T> {
             error: None,
         })
     }
+    pub fn with_state(inner: T, gate: HttpRequestGate, ready: Vec<u8>, read_size: usize) -> Self {
+        Self {
+            inner,
+            gate,
+            scratch: vec![0; read_size.max(1)],
+            ready,
+            error: None,
+        }
+    }
+
     pub fn guard_error(&self) -> Option<&HttpError> {
         self.error.as_ref()
     }
