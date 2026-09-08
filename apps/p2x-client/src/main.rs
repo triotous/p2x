@@ -1367,11 +1367,12 @@ async fn main() -> io::Result<()> {
             }
             Some(event) = ingress_rx.recv(), if product_ingress => {
                 match event {
-                    IngressEvent::Accepted { id, route_id, started_at, deadline, command, cancel } => {
+                    IngressEvent::Accepted { id, route_id, kind, started_at, deadline, command, cancel } => {
                         ingress_owners
                             .insert_setup(IngressSetupOwner {
                                 ingress_id: id,
                                 route_id: route_id.clone(),
+                                kind,
                                 accepted_at: started_at,
                                 deadline,
                                 command: command.clone(),
@@ -1404,7 +1405,7 @@ async fn main() -> io::Result<()> {
                             reject_ingress(&mut ingress_owners, id, PublicErrorCode::LimitProxyStreams, &emitter).await?;
                             continue;
                         };
-                        match owner.admit(&mut resolver_state, binding, session_id, route.selector.clone(), unix_now(), deadline) {
+                        match owner.admit_with_kind(&mut resolver_state, binding, session_id, route.selector.clone(), kind, unix_now(), deadline) {
                             Ok((open_id, actions)) => {
                                 ingress_owners
                                     .attach_open(id, open_id)
@@ -3322,6 +3323,7 @@ mod tests {
                 .insert_setup(ingress_owner::IngressSetupOwner {
                     ingress_id: ingress::IngressId(ingress_id),
                     route_id: "orders".into(),
+                    kind: p2x_protocol::IngressKind::FixedTcp,
                     accepted_at: std::time::Instant::now(),
                     deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
                     command,
@@ -3368,6 +3370,7 @@ mod tests {
             .insert_setup(ingress_owner::IngressSetupOwner {
                 ingress_id: ingress::IngressId(1),
                 route_id: "orders".into(),
+                kind: p2x_protocol::IngressKind::FixedTcp,
                 accepted_at: std::time::Instant::now(),
                 deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
                 command,

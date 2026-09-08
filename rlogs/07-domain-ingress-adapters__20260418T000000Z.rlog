@@ -6,3 +6,6 @@ phase A: implementing shared bounded canonical domains, additive listener config
 phase A result: shared CanonicalDomain, authority/SNI normalization, additive limits/listeners/domain_routes, immutable DomainRouter
 validation: cargo fmt --all -- --check; cargo clippy -p p2x-proxy -p p2x-client --all-targets --all-features -- -D warnings; cargo test --workspace --all-targets --all-features; git diff --check — all passed
 phase A status: ready to commit
+phase B result: explicit IngressKind carried by ingress setup and RouteOpen, make_open/retry paths preserve kind, server validates kind against service protocol before ticket consumption
+validation: cargo fmt --all; cargo clippy -p p2x-client -p p2x-server --all-targets --all-features -- -D warnings; cargo test -p p2x-client -p p2x-server --all-targets — all passed
+phase B status: ready to commit

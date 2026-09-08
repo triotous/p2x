@@ -64,6 +64,7 @@ pub enum RouteAction {
 #[derive(Debug)]
 struct RouteOpen {
     selector: UnscopedSelector,
+    ingress_kind: IngressKind,
     binding: p2x_net::auth_state::PrincipalBinding,
     session_id: [u8; 16],
     resolve_request: ResolveRequestV1,
@@ -114,6 +115,28 @@ impl RouteOpenSupervisor {
         now: i64,
         deadline: Instant,
     ) -> Result<(OpenId, Vec<RouteAction>), PublicErrorCode> {
+        self.admit_with_kind(
+            resolver,
+            binding,
+            session_id,
+            selector,
+            IngressKind::FixedTcp,
+            now,
+            deadline,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_with_kind(
+        &mut self,
+        resolver: &mut ResolverState,
+        binding: p2x_net::auth_state::PrincipalBinding,
+        session_id: [u8; 16],
+        selector: UnscopedSelector,
+        ingress_kind: IngressKind,
+        now: i64,
+        deadline: Instant,
+    ) -> Result<(OpenId, Vec<RouteAction>), PublicErrorCode> {
         if self.opens.len() >= self.max_opens || deadline <= Instant::now() {
             return Err(PublicErrorCode::LimitProxyStreams);
         }
@@ -148,6 +171,7 @@ impl RouteOpenSupervisor {
             open_id,
             RouteOpen {
                 selector,
+                ingress_kind,
                 binding,
                 session_id,
                 resolve_request: request,
@@ -412,7 +436,11 @@ impl RouteOpenSupervisor {
             open_id,
             proxy_request_id,
             connection: open.selected_connection?,
-            open: make_open(open.resolve_request.resolve_request_id(), grant),
+            open: make_open(
+                open.resolve_request.resolve_request_id(),
+                grant,
+                open.ingress_kind,
+            ),
         })
     }
 
@@ -611,7 +639,11 @@ impl RouteOpenSupervisor {
         let Some(grant) = open.grant.as_ref() else {
             return Vec::new();
         };
-        let open_message = make_open(open.resolve_request.resolve_request_id(), grant);
+        let open_message = make_open(
+            open.resolve_request.resolve_request_id(),
+            grant,
+            open.ingress_kind,
+        );
         let server = open.server_peer_id;
         let selected_connection = open.selected_connection;
         let relay_address = grant.metadata.relay_addresses.first().cloned();
@@ -700,13 +732,17 @@ fn request_id(counter: u64) -> [u8; 16] {
     id
 }
 
-fn make_open(request_id: [u8; 16], grant: &AuthorizationGrant) -> OpenProxyStreamV1 {
+fn make_open(
+    request_id: [u8; 16],
+    grant: &AuthorizationGrant,
+    ingress_kind: IngressKind,
+) -> OpenProxyStreamV1 {
     OpenProxyStreamV1 {
         request_id,
         ticket: grant.ticket.clone(),
         upstream_id: grant.metadata.upstream_id.clone(),
         registration_revision: grant.metadata.registration_revision,
-        ingress_kind: IngressKind::FixedTcp,
+        ingress_kind,
     }
 }
 

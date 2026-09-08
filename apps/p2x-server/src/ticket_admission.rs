@@ -1,8 +1,8 @@
 use libp2p::PeerId;
 use p2x_config::ticket_key::VerificationKeyRing;
 use p2x_protocol::{
-    OpenProxyStreamV1, PublicErrorCode, RegistrationRevision, ServiceAdvertisementV1, Tenant,
-    TicketValidation,
+    IngressKind, OpenProxyStreamV1, ProtocolClass, PublicErrorCode, RegistrationRevision,
+    ServiceAdvertisementV1, Tenant, TicketValidation,
 };
 use std::collections::HashMap;
 
@@ -226,6 +226,15 @@ impl TicketAdmissionLedger {
         };
         if registration_expires_at <= now || service.health() != p2x_protocol::Health::Ready {
             return Err(PublicErrorCode::RegistryStaleRevision);
+        }
+        let kind_matches = matches!(
+            (open.ingress_kind, service.selector().protocol()),
+            (IngressKind::FixedTcp, ProtocolClass::Tcp)
+                | (IngressKind::HttpHost, ProtocolClass::Http)
+                | (IngressKind::TlsSni, ProtocolClass::TlsPassthrough)
+        );
+        if !kind_matches {
+            return Err(PublicErrorCode::ProtocolMalformed);
         }
         if open.registration_revision != registration_revision
             || candidate.claims.registration_revision() != registration_revision.get()
@@ -517,7 +526,7 @@ mod tests {
             ticket: p2x_protocol::RawTicket::new(envelope.as_bytes().to_vec()).unwrap(),
             upstream_id: p2x_protocol::UpstreamId::new("orders").unwrap(),
             registration_revision: RegistrationRevision::new(1).unwrap(),
-            ingress_kind: p2x_protocol::IngressKind::FixedTcp,
+            ingress_kind: p2x_protocol::IngressKind::HttpHost,
         };
         let mut admission = TicketAdmissionLedger::new(1, 0).unwrap();
         assert_eq!(

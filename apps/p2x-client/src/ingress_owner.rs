@@ -3,6 +3,7 @@ use crate::{
     route_open::{OpenId, TunnelHandoff},
 };
 use p2x_net::{ConnectionId, probe::ProbePath};
+use p2x_protocol::IngressKind;
 use std::{
     collections::HashMap,
     time::{Duration, Instant},
@@ -13,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 pub struct IngressSetupOwner {
     pub ingress_id: IngressId,
     pub route_id: String,
+    #[allow(dead_code)]
+    pub kind: IngressKind,
     pub accepted_at: Instant,
     pub deadline: Instant,
     pub command: mpsc::Sender<IngressCommand>,
@@ -243,6 +246,7 @@ mod tests {
         IngressSetupOwner {
             ingress_id: IngressId(id),
             route_id: "orders".into(),
+            kind: IngressKind::FixedTcp,
             accepted_at: Instant::now(),
             deadline: Instant::now() + Duration::from_secs(1),
             command,

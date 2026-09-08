@@ -1,4 +1,5 @@
 use crate::config::RawTcpListener;
+use p2x_protocol::IngressKind;
 use p2x_proxy::{PrefixedIo, PumpResult};
 use std::{
     io,
@@ -47,6 +48,7 @@ pub enum IngressEvent {
     Accepted {
         id: IngressId,
         route_id: String,
+        kind: IngressKind,
         started_at: Instant,
         deadline: Instant,
         command: mpsc::Sender<IngressCommand>,
@@ -161,6 +163,7 @@ async fn accept_loop(
             .send(IngressEvent::Accepted {
                 id,
                 route_id: route_id.clone(),
+                kind: IngressKind::FixedTcp,
                 started_at,
                 deadline,
                 command,

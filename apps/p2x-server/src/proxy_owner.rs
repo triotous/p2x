@@ -211,12 +211,6 @@ impl ServerProxyOwner {
         ) {
             return reject(Some(open.request_id), code);
         }
-        if service.selector().protocol() != p2x_protocol::ProtocolClass::Tcp {
-            return reject(
-                Some(open.request_id),
-                PublicErrorCode::ProtocolCapabilityMismatch,
-            );
-        }
         if upstream.advertisement.health() != p2x_protocol::Health::Ready {
             return reject(Some(open.request_id), PublicErrorCode::RegistryOffline);
         }
