@@ -122,17 +122,20 @@ impl HttpRequestGate {
     }
 
     fn parse_head(&mut self, output: &mut Vec<u8>) -> Result<bool, HttpError> {
-        if self.buffer.len() > self.max_head {
-            return Err(HttpError::Limit);
-        }
         let mut headers = [httparse::EMPTY_HEADER; MAX_HTTP_FIELDS];
         let mut request = Request::new(&mut headers);
         let status = request
             .parse(&self.buffer)
             .map_err(|_| HttpError::Malformed)?;
         let httparse::Status::Complete(head_len) = status else {
+            if self.buffer.len() > self.max_head {
+                return Err(HttpError::Limit);
+            }
             return Ok(false);
         };
+        if head_len > self.max_head {
+            return Err(HttpError::Limit);
+        }
         let method = request.method.ok_or(HttpError::Malformed)?;
         let path = request.path.ok_or(HttpError::Malformed)?;
         if request.version != Some(1) || !valid_method(method) || !valid_target(path) {
