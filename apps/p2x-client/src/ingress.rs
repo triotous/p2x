@@ -608,7 +608,12 @@ async fn run_connection(
                                 guarded,
                                 stream,
                                 copy_buffer_bytes,
-                                cancel.cancelled(),
+                                async {
+                                    tokio::select! {
+                                        _ = cancel.cancelled() => {}
+                                        _ = shutdown.cancelled() => {}
+                                    }
+                                },
                             )
                             .await;
                             let code = status.error().as_ref().map(http_guard_error_code);
@@ -620,7 +625,12 @@ async fn run_connection(
                                 local,
                                 stream,
                                 copy_buffer_bytes,
-                                cancel.cancelled(),
+                                async {
+                                    tokio::select! {
+                                        _ = cancel.cancelled() => {}
+                                        _ = shutdown.cancelled() => {}
+                                    }
+                                },
                             )
                             .await;
                             (result, None)

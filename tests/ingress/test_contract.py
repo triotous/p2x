@@ -28,6 +28,24 @@ class IngressEntryPointContract(unittest.TestCase):
             self.assertIn(f"--bin {target}", script)
         self.assertNotIn("incomplete: live case", script)
 
+    def test_every_named_case_runs_the_real_process_driver(self) -> None:
+        script = (ROOT / "tests/ingress/local.sh").read_text()
+        self.assertIn('python3 tests/ingress/live.py "$root" "$ingress_case"', script)
+        self.assertIn('python3 tests/ingress/live.py "$root" "$case_name"', script)
+
+    def test_live_driver_has_specific_high_risk_assertions(self) -> None:
+        driver = (ROOT / "tests/ingress/live.py").read_text()
+        for evidence in (
+            "route.unsupported_protocol",
+            "limit.ingress_preface",
+            "TLSVersion.TLSv1_2",
+            "TLSVersion.TLSv1_3",
+            "mixed-concurrency/",
+            "assert_final_resources",
+            "assert_privacy",
+        ):
+            self.assertIn(evidence, driver)
+
     def test_operations_doc_describes_completed_http_lifecycle(self) -> None:
         document = (ROOT / "docs/operations/domain-ingress.md").read_text()
         self.assertIn("Response framing is tracked", document)

@@ -18,9 +18,16 @@ if [[ "$case_name" != all ]] && [[ ! " ${cases[*]} " =~ " $case_name " ]]; then
 fi
 
 cd "$root"
-cargo build -q -p p2x-client --bin p2x-client
+cargo build -q --workspace --bins
+cargo build -q -p p2x-config --example identity-id --example ticket-verification
 cargo test -q -p p2x-proxy
 cargo test -q -p p2x-client --all-targets
 cargo check -q --manifest-path fuzz/Cargo.toml --bin domain_authority --bin http_ingress --bin tls_client_hello
 python3 -B -m unittest discover -s tests/ingress -p 'test_*.py'
-printf '{"case":"%s","deterministic_ingress":true,"fuzz_targets_build":true}\n' "$case_name"
+if [[ "$case_name" == all ]]; then
+  for ingress_case in "${cases[@]}"; do
+    python3 tests/ingress/live.py "$root" "$ingress_case"
+  done
+else
+  python3 tests/ingress/live.py "$root" "$case_name"
+fi
