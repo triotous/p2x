@@ -6,7 +6,7 @@ The canonical local entry point is:
 ./tests/ingress/local.sh --case <name|all>
 ```
 
-The script builds the client, runs the domain/HTTP/TLS parser and adapter tests, builds all three bounded fuzz targets, and emits an assertion-derived JSON result. It does not change DNS, certificates, hosts files, firewall rules, or network namespaces. Cross-host DNS and certificate distribution, platform/container, firewall, and long-running checks remain Phase 6 owner evidence.
+The script builds all three product binaries, runs the domain/HTTP/TLS parser and adapter tests, builds all three bounded fuzz targets, and starts authenticated loopback exchange/server/client processes for every requested named case. TLS cases generate a run-scoped certificate and trust it only in the test caller. It does not change DNS, certificate stores, hosts files, firewall rules, or network namespaces. Cross-host DNS and certificate distribution, platform/container, firewall, and long-running checks remain Phase 6 owner evidence.
 
 Required live case families for the completed feature are:
 

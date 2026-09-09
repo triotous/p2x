@@ -27,3 +27,24 @@ status=review_started
 [validation] cargo +nightly fuzz run proxy_frame_decode -- -max_total_time=60 -max_len=262144 passed: 9,038,217 executions in 61 seconds.
 [cleanup] Removed random fuzz-generated corpus files and retained only checked-in seeds; no crash artifacts were produced.
 [commit] fb54155 fix: close domain ingress protocol gaps
+[audit] The deterministic-only ingress entry point still did not satisfy the Plan 07 named real-process matrix. Replaced the generic success summary with an authenticated exchange/server/client driver and independently asserted behavior for all 19 declared cases.
+[fix] Added real HTTP fixtures for exact two-route selection, same-connection keepalive, same-read pipeline route locking, 1 MiB fixed upload/download, chunked upload with trailers, 100-continue, WebSocket after an ordinary request, same-read early data, opaque bidirectional payload, and h2c rejection.
+[fix] Added exact initial HTTP 400/404/431 error/code assertions for malformed, missing Host, unknown Host, unsupported absolute-form/h2c, and oversized heads; asserted no upstream connection and no fabricated authentication challenge.
+[fix] Added run-scoped certificate-verifying TLS 1.2 and TLS 1.3 round trips to both exact SNI routes, plus MemoryBIO ClientHello delivery in three-byte fragments and malformed/missing/unknown SNI isolation.
+[fix] Added original parse/setup deadline recovery, shared N/N+1 ingress admission, parsing and active shutdown, and actual 64/128 sustained mixed raw/HTTP/TLS concurrency with accepted, worker, and active-owner high-water assertions.
+[fix] Found an active-shutdown deadlock: an ingress pump listened only to its owner cancellation token after Accepted, while shutdown waited for the ingress task before cancelling the owner. The pump now also listens to the global shutdown token. The previously failing shutdown-active process case now closes the local socket and emits final zero resources.
+[fix] Every named process case now checks exact process terminals, final client/server/exchange logical resources, and run-random privacy markers before its summary can report success. Test processes stop in dependency order so terminal evidence is deterministic.
+[validation] ./tests/ingress/local.sh --case all passed three consecutive times after the final fixes. Each run passed 35 p2x-proxy tests, 50 p2x-client tests, 5 ingress entry-contract tests, all 19 named real-process cases, 64/128 mixed-adapter high-water assertions, one terminal per process, privacy scans, and zero final resources.
+[validation] cargo fmt --all -- --check passed.
+[validation] cargo clippy --workspace --all-targets --all-features -- -D warnings passed.
+[validation] cargo test --workspace --all-targets --all-features passed.
+[validation] cargo deny check passed with the existing duplicate/yanked dependency warnings; advisories, bans, licenses, and sources were ok.
+[validation] cargo tree -e features completed; final evidence: /tmp/p2x-plan07-final-cargo-tree.txt.
+[validation] python3 -B -m unittest tests/tunnel/test_live.py passed: 13 tests.
+[validation] ./tests/tunnel/local.sh --case all passed the complete 33-case Plan 06 matrix, including all six deadline stages, setup/active shutdown, 64 sustained streams, 128 headroom, and final resource profiles.
+[validation] ./tests/resolution/local.sh --case all passed all 20 Plan 05 cases.
+[validation] ./tests/auth/local.sh --case all passed the complete Plan 03 local authentication matrix.
+[validation] ./tests/registry/local.sh --case all passed the complete Plan 04 registry matrix with zero final exchange resources.
+[validation] ./tests/connectivity/local.sh --case all passed C01, C05-C13, including 64/128 concurrency and 100-cycle churn.
+[status] Plan 07 local implementation and regression gates are complete. Cross-host DNS/certificate distribution, Linux namespace/firewall, platform/container, and long-running owner evidence remain assigned to the subsequent Phase 6 launch gate by the plan and are not represented as local Plan 07 passes.
+[commit] b2ba611 test: enforce domain ingress process matrix
