@@ -482,6 +482,12 @@ def run_case(root: pathlib.Path, case: str) -> dict:
                 head, body = http_exchange(run.local_port, request)
                 if not head.startswith(b"HTTP/1.1 " + status) or code not in body or b"WWW-Authenticate" in head:
                     raise tunnel.Failure(f"HTTP local mapping failed for {code!r}: {head!r} {body!r}")
+            if case == "http-error-mapping":
+                first.close()
+                request = f"GET / HTTP/1.1\r\nHost: {run.domain}\r\n\r\n".encode()
+                head, body = http_exchange(run.local_port, request)
+                if not head.startswith(b"HTTP/1.1 502") or b"upstream.connect_failed" not in body:
+                    raise tunnel.Failure(f"authenticated upstream failure mapping was not 502: {head!r} {body!r}")
         elif case in {"parse-deadlines", "setup-budget"}:
             with socket.create_connection(("127.0.0.1", run.local_port), timeout=20) as peer:
                 peer.settimeout(5)

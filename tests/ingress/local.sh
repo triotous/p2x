@@ -26,8 +26,8 @@ cargo check -q --manifest-path fuzz/Cargo.toml --bin domain_authority --bin http
 python3 -B -m unittest discover -s tests/ingress -p 'test_*.py'
 if [[ "$case_name" == all ]]; then
   for ingress_case in "${cases[@]}"; do
-    python3 tests/ingress/live.py "$root" "$ingress_case"
+    python3 -B tests/ingress/live.py "$root" "$ingress_case"
   done
 else
-  python3 tests/ingress/live.py "$root" "$case_name"
+  python3 -B tests/ingress/live.py "$root" "$case_name"
 fi

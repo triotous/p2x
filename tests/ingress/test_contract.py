@@ -30,8 +30,8 @@ class IngressEntryPointContract(unittest.TestCase):
 
     def test_every_named_case_runs_the_real_process_driver(self) -> None:
         script = (ROOT / "tests/ingress/local.sh").read_text()
-        self.assertIn('python3 tests/ingress/live.py "$root" "$ingress_case"', script)
-        self.assertIn('python3 tests/ingress/live.py "$root" "$case_name"', script)
+        self.assertIn('python3 -B tests/ingress/live.py "$root" "$ingress_case"', script)
+        self.assertIn('python3 -B tests/ingress/live.py "$root" "$case_name"', script)
 
     def test_live_driver_has_specific_high_risk_assertions(self) -> None:
         driver = (ROOT / "tests/ingress/live.py").read_text()

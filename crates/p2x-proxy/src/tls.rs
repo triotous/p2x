@@ -346,6 +346,28 @@ mod tests {
         }
         records
     }
+    fn insert_extension(input: &mut Vec<u8>, extension_type: u16, value: &[u8]) {
+        let extension_length_at = 50;
+        let extension_at = extension_length_at + 2;
+        let mut extension = Vec::new();
+        extension.extend(extension_type.to_be_bytes());
+        extension.extend((value.len() as u16).to_be_bytes());
+        extension.extend(value);
+        input.splice(extension_at..extension_at, extension.iter().copied());
+        let extensions_length =
+            u16::from_be_bytes([input[extension_length_at], input[extension_length_at + 1]])
+                + extension.len() as u16;
+        input[extension_length_at..extension_length_at + 2]
+            .copy_from_slice(&extensions_length.to_be_bytes());
+        let record_length = u16::from_be_bytes([input[3], input[4]]) + extension.len() as u16;
+        input[3..5].copy_from_slice(&record_length.to_be_bytes());
+        let body_length =
+            ((input[6] as usize) << 16) | ((input[7] as usize) << 8) | input[8] as usize;
+        let new_body_length = body_length + extension.len();
+        input[6] = (new_body_length >> 16) as u8;
+        input[7] = (new_body_length >> 8) as u8;
+        input[8] = new_body_length as u8;
+    }
     #[test]
     fn selects_only_after_complete_structural_hello() {
         let input = hello(b"Example.com");
@@ -390,6 +412,21 @@ mod tests {
                 break;
             }
         }
+        assert_eq!(inspector.into_prefix(), input);
+    }
+
+    #[test]
+    fn grease_and_ech_extensions_preserve_visible_outer_sni() {
+        let mut input = hello(b"outer.example.com");
+        insert_extension(&mut input, 0x0a0a, &[0]);
+        insert_extension(&mut input, 0xfe0d, &[1, 2, 3, 4]);
+        let mut inspector = ClientHelloInspector::new(4096).unwrap();
+        assert!(matches!(
+            inspector.feed(&input),
+            Ok(ClientHelloResult::Selected { domain, prefix_len })
+                if domain == CanonicalDomain::from_sni("outer.example.com").unwrap()
+                    && prefix_len == input.len()
+        ));
         assert_eq!(inspector.into_prefix(), input);
     }
 
