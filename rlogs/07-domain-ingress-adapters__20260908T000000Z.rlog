@@ -48,3 +48,9 @@ status=review_started
 [validation] ./tests/connectivity/local.sh --case all passed C01, C05-C13, including 64/128 concurrency and 100-cycle churn.
 [status] Plan 07 local implementation and regression gates are complete. Cross-host DNS/certificate distribution, Linux namespace/firewall, platform/container, and long-running owner evidence remain assigned to the subsequent Phase 6 launch gate by the plan and are not represented as local Plan 07 passes.
 [commit] b2ba611 test: enforce domain ingress process matrix
+[fix] Added an explicit GREASE plus ECH-extension ClientHello parser case proving that only the visible outer SNI selects the route and that the full original prefix is retained unchanged.
+[fix] Extended the live HTTP error-mapping case through authenticated setup: an intentionally unavailable configured upstream returns the fixed 502/upstream.connect_failed response and still drains all resources.
+[validation] cargo test -p p2x-proxy passed: 36 tests, including the new GREASE/ECH visible-outer-SNI case.
+[validation] The focused authenticated HTTP 502 process case passed with one terminal per process, clean privacy evidence, and zero final resources.
+[validation] ./tests/ingress/local.sh --case all passed again after those additions: all 19 named real-process cases and all final assertions passed.
+[commit] cd98385 test: cover ingress ECH and setup failures
